@@ -1,0 +1,424 @@
+/*
+ * Themes are variables, so a light theme is one block away. The brand runs
+ * cyan → blue → violet, taken from the logo.
+ */
+:root {
+  color-scheme: dark;
+
+  --brand-cyan: #22d3ee;
+  --brand-blue: #3b82f6;
+  --brand-violet: #8b5cf6;
+  --brand-gradient: linear-gradient(135deg, var(--brand-cyan), var(--brand-blue) 55%, var(--brand-violet));
+
+  --bg: #0b0d12;
+  --bg-raised: #11141b;
+  --bg-overlay: #161a23;
+  --bg-input: #12161e;
+  --border: #232936;
+  --border-soft: #1b2029;
+
+  --text: #e6e9ef;
+  --text-dim: #9aa3b2;
+  --text-faint: #6b7484;
+
+  --radius-lg: 14px;
+  --radius-md: 10px;
+  --radius-sm: 7px;
+
+  --font-ui: -apple-system, "Segoe UI Variable Text", "Segoe UI", "PingFang SC",
+    "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13.5px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+/* --- Shell ---------------------------------------------------------------- */
+
+.shell {
+  display: grid;
+  grid-template-rows: 40px 1fr 26px;
+  height: 100%;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in oklab, var(--bg-raised) 86%, transparent);
+  user-select: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mark {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--brand-gradient);
+  box-shadow: 0 0 14px color-mix(in oklab, var(--brand-blue) 55%, transparent);
+}
+
+.brand-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.brand-latin {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.titlebar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.pill {
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: 232px 1fr;
+  min-height: 0;
+}
+
+/* --- Sidebar -------------------------------------------------------------- */
+
+.sidebar {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  border-right: 1px solid var(--border-soft);
+  background: color-mix(in oklab, var(--bg-raised) 70%, transparent);
+  min-height: 0;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 8px;
+}
+
+.sidebar-title {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.icon-button:hover {
+  background: var(--bg-overlay);
+  color: var(--text);
+}
+
+.projects {
+  padding: 4px 8px;
+  overflow: auto;
+}
+
+.project {
+  display: grid;
+  gap: 2px;
+  padding: 9px 10px;
+  border-radius: var(--radius-md);
+}
+
+.project:hover {
+  background: var(--bg-overlay);
+}
+
+.project-name {
+  color: var(--text-dim);
+}
+
+.project-hint {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+.sidebar-foot {
+  padding: 8px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.ghost-button {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  text-align: left;
+}
+
+.ghost-button:hover {
+  background: var(--bg-overlay);
+  color: var(--text);
+}
+
+/* --- Main ----------------------------------------------------------------- */
+
+.main {
+  display: grid;
+  grid-template-rows: 1fr auto auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.conversation {
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 32px 24px;
+}
+
+.empty {
+  position: relative;
+  max-width: 560px;
+  text-align: center;
+}
+
+.halo {
+  position: absolute;
+  inset: -120px -80px auto;
+  height: 260px;
+  border-radius: 50%;
+  background: var(--brand-gradient);
+  opacity: 0.13;
+  filter: blur(72px);
+  pointer-events: none;
+}
+
+.empty h1 {
+  position: relative;
+  margin: 0 0 10px;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.accent {
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.empty p {
+  position: relative;
+  margin: 0 auto 22px;
+  max-width: 460px;
+  color: var(--text-faint);
+}
+
+.suggestions {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.suggestion {
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.suggestion:hover {
+  border-color: color-mix(in oklab, var(--brand-blue) 50%, var(--border));
+  color: var(--text);
+}
+
+/* --- Panel ---------------------------------------------------------------- */
+
+.panel {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 210px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg-raised);
+  min-height: 0;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.panel-body {
+  padding: 10px 12px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.prompt-line {
+  color: var(--text-faint);
+}
+
+.prompt-sign {
+  color: var(--brand-cyan);
+  margin-right: 6px;
+}
+
+/* --- Composer ------------------------------------------------------------- */
+
+.composer {
+  padding: 12px 20px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.composer-box {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-input);
+  padding: 10px 12px 8px;
+  transition: border-color 120ms ease;
+}
+
+.composer-box:focus-within {
+  border-color: color-mix(in oklab, var(--brand-blue) 55%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand-blue) 12%, transparent);
+}
+
+.composer-input {
+  width: 100%;
+  min-height: 24px;
+  max-height: 180px;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+
+.composer-input::placeholder {
+  color: var(--text-faint);
+}
+
+.composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+}
+
+.composer-chips {
+  display: flex;
+  gap: 6px;
+}
+
+.chip {
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+.chip-brand {
+  border-color: transparent;
+  background: color-mix(in oklab, var(--brand-blue) 16%, transparent);
+  color: #c7d7ff;
+}
+
+.send {
+  padding: 5px 16px;
+  border-radius: 8px;
+  background: var(--brand-gradient);
+  color: #fff;
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.send:disabled {
+  background: var(--bg-overlay);
+  color: var(--text-faint);
+  cursor: default;
+}
+
+/* --- Status bar ----------------------------------------------------------- */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  border-top: 1px solid var(--border-soft);
+  background: color-mix(in oklab, var(--brand-blue) 10%, var(--bg-raised));
+  font-size: 11.5px;
+}
+
+.status-item {
+  padding: 1px 7px;
+  border-radius: 4px;
+  color: var(--text-dim);
+}
+
+.status-item:hover {
+  background: var(--bg-overlay);
+}
+
+.spacer {
+  flex: 1;
+}

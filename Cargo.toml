@@ -7,6 +7,7 @@ members = [
   "crates/session-host",
   "crates/file-review",
   "crates/pty-host",
+  "src-tauri",
 ]
 
 [workspace.package]

@@ -62,3 +62,56 @@ ANTHROPIC_API_KEY=
 
 - `crates/model-proxy` **不在阶段一实现**，仅保留 `EndpointSpec::{Direct, Proxied}` 的类型入口。
 - M3 的「兼容性探针」保留，但预期全绿；它的价值是给**其它**供应商做能力判定。
+
+---
+
+## ADR-0002 · 用真实 CLI 验证协议（2026-11-10）
+
+本机已装 Claude Code **2.1.145**（原生 exe，229 MB，在
+`node_modules/@anthropic-ai/claude-code/bin/claude.exe`）。
+
+### 一次真实往返的帧序
+
+```
+system/session_state_changed (running)
+system/init                    ← 28 个工具、session_id、model、permissionMode
+assistant (thinking 块)
+assistant (text 块 "PONG")
+result                         ← usage、cost、modelUsage
+system/session_state_changed (idle)
+```
+
+### 三个必须照做的事实
+
+1. **`system/init` 里有 `memory_paths`、`skills`、`agents`、`plugins`、
+   `slash_commands`、`claude_code_version`。** 这些决定了 UI 能显示什么，
+   不必自己扫描磁盘。
+2. **目录名编码不是简单替换**：`C:\Users\天哥\agilegeek-probe` →
+   `C--Users----agilegeek-probe`（中文被换成 `-`，每次连续替换折叠）。
+   **不要自己实现这个编码**——改为遍历 `projects/*`，从每行 JSONL 的
+   `cwd` 字段读真实路径。这与 ADR-0001 的设计一致。
+3. **会话 JSONL 里除对话条目外，还有 `queue-operation`、
+   `file-history-snapshot`、`last-prompt`、`attachment` 等旁注行。**
+   解析时必须跳过未知 `type`，否则会话打不开。
+
+### 用户环境的一项实证
+
+本机 `~/.claude/settings.json` 已经配置为走 DeepSeek：
+
+```
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+ANTHROPIC_MODEL=deepseek-v4-pro
+ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro
+ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro
+ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
+```
+
+且 `init` 里 `apiKeySource: "none"`——说明 **Claude Code 用户已经在用零代理
+方案跑 DeepSeek**，我们只是把它做成图形界面。这印证了 ADR-0001 的结论。
+
+### 对实现的补充要求
+
+- `result` 帧里有 `ttft_ms`、`server_tool_use`、`speed`、`terminal_reason`，
+  可用来做「首字延迟」「工具耗时」这类展示。
+- `init` 的工具名里有 `PowerShell`（Windows 上 Bash 的替代），
+  折叠规则要按「命令类工具」而不是硬编码 `Bash` 来判断。
