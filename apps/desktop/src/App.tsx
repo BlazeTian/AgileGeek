@@ -19,7 +19,7 @@ export default function App() {
 
   return (
     <div className="shell">
-      <MenuBar />
+      <TitleBar />
       <div className="columns">
         <Sidebar info={info} folder={folder} onOpenFolder={setFolder} />
         <main className="center">
@@ -37,15 +37,17 @@ export default function App() {
 }
 
 /**
- * One row: the mark and the product's name, the window's menus, and what
- * the window is set to. The reference app has them on a single line too —
- * a second header bar only costs vertical space.
+ * The title bar, drawn by us because the window has no frame of its own.
+ *
+ * It carries everything the operating system's would and more: the mark,
+ * the menus, what the window is set to, and the window's own buttons — all
+ * on one row, which is what makes the top of the window a single line.
  */
-function MenuBar() {
+function TitleBar() {
   return (
     <header className="menubar" data-tauri-drag-region>
-      <span className="brand" data-tauri-drag-region>
-        <span className="mark" aria-hidden="true" />
+      <span className="brand">
+        <img className="mark" src="/mark.svg" alt="" draggable={false} />
         <span className="brand-name">灵动极客</span>
         <span className="brand-latin">AGILEGEEK</span>
       </span>
@@ -60,7 +62,37 @@ function MenuBar() {
 
       <span className="menubar-spacer" />
       <span className="fast-ide">⚡ Fast Ide</span>
+      <WindowButtons />
     </header>
+  );
+}
+
+/** Minimise, maximise, close: what the frame would have drawn. */
+function WindowButtons() {
+  const call = (name: string) => {
+    import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+      const window = getCurrentWindow();
+      const action = {
+        minimize: () => window.minimize(),
+        toggleMaximize: () => window.toggleMaximize(),
+        close: () => window.close(),
+      }[name];
+      action?.().catch(() => {});
+    });
+  };
+
+  return (
+    <div className="window-buttons">
+      <button className="window-button" onClick={() => call('minimize')} title="最小化">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 5h6" stroke="currentColor" strokeWidth="1" /></svg>
+      </button>
+      <button className="window-button" onClick={() => call('toggleMaximize')} title="最大化">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="2.5" y="2.5" width="5" height="5" fill="none" stroke="currentColor" strokeWidth="1" /></svg>
+      </button>
+      <button className="window-button close" onClick={() => call('close')} title="关闭">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5" stroke="currentColor" strokeWidth="1" /></svg>
+      </button>
+    </div>
   );
 }
 

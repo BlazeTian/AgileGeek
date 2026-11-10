@@ -22,10 +22,12 @@
         "center": true,
         "theme": "Light",
         "backgroundColor": "#F8F8F8",
-        "decorations": true,
+        "decorations": false,
         "maximized": false,
         "x": 60,
-        "y": 40
+        "y": 40,
+        "shadow": true,
+        "titleBarStyle": "Overlay"
       }
     ],
     "security": {

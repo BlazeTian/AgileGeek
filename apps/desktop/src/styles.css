@@ -116,11 +116,21 @@ textarea {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 40px;
-  padding: 0 10px 0 14px;
+  height: 38px;
+  /* Room on the right for the window's own buttons. */
+  padding: 0 0 0 14px;
   border-bottom: 1px solid var(--line);
   flex: none;
   background: var(--bg-sub);
+  /* The bar is the window's handle: a drag anywhere on it moves it. */
+  -webkit-app-region: drag;
+}
+
+/* Everything on the bar takes clicks itself. */
+.menubar button,
+.menubar .fast-ide,
+.menubar .brand {
+  -webkit-app-region: no-drag;
 }
 
 /* The mark and the name sit on the menu's own line, as one row. */
@@ -132,10 +142,11 @@ textarea {
 }
 
 .mark {
-  width: 17px;
-  height: 17px;
-  background: url('/mark.svg') center / contain no-repeat;
+  width: 18px;
+  height: 18px;
   flex: none;
+  object-fit: contain;
+  pointer-events: none;
 }
 
 .brand-name {
@@ -179,7 +190,7 @@ textarea {
   gap: 5px;
   height: 24px;
   padding: 0 10px;
-  margin-right: 10px;
+  margin-right: 12px;
   border-radius: 999px;
   background: var(--accent);
   color: #282624;
@@ -1157,4 +1168,31 @@ textarea {
 
 .status-item.warn {
   color: var(--accent-ink);
+}
+
+
+/* --- Window buttons ------------------------------------------------------- */
+
+.window-buttons {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  flex: none;
+}
+
+.window-button {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  color: var(--text-dim);
+}
+
+.window-button:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.window-button.close:hover {
+  background: #c42b1c;
+  color: #fff;
 }
