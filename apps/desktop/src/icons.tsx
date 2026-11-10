@@ -66,5 +66,9 @@ export const Codicons = {
   organization: 0xea7e,
   chip: 0xec19,
   comment: 0xea6b,
+  layoutSidebarLeft: 0xebf3,
+  layoutSidebarRight: 0xebf4,
+  layoutSidebarLeftOff: 0xec02,
+  layoutSidebarRightOff: 0xec00,
   mention: 0xea6b,
 } as const;

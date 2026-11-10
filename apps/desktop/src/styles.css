@@ -230,8 +230,7 @@ textarea {
 }
 
 .sidebar {
-  width: var(--sidebar-w);
-  flex: 0 0 var(--sidebar-w);
+  flex: none;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -251,8 +250,7 @@ textarea {
 }
 
 .work {
-  width: var(--work-w);
-  flex: 0 0 var(--work-w);
+  flex: none;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -1229,4 +1227,56 @@ textarea {
 .window-button.close:hover {
   background: #c42b1c;
   color: #fff;
+}
+
+
+/* --- Sashes --------------------------------------------------------------- */
+
+/* A line between parts: nothing at rest, a hairline under the pointer, and
+   the same while dragged. Its hit area is wider than the hairline. */
+.sash {
+  flex: none;
+  width: 1px;
+  margin-left: -1px;
+  position: relative;
+  z-index: 5;
+  align-self: stretch;
+  touch-action: none;
+}
+
+.sash::after {
+  content: '';
+  position: absolute;
+  inset: 0 -3px;
+}
+
+.sash:hover,
+.sash.dragging {
+  background: var(--accent-strong);
+}
+
+.sash.dragging {
+  box-shadow: 0 0 0 1px var(--accent-strong);
+}
+
+/* --- Layout toggles ------------------------------------------------------- */
+
+.layout-button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r);
+  color: var(--text-faint);
+  margin-right: 2px;
+  flex: none;
+}
+
+.layout-button:hover {
+  background: var(--hover);
+  color: var(--text-body);
+}
+
+.layout-button.on {
+  color: var(--text-body);
 }

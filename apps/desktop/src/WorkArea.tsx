@@ -21,7 +21,7 @@ const TABS: Tab[] = [
  * Reading the tree goes through the shell, so it is the same call whether
  * the files are local or (later) on another machine.
  */
-export function WorkArea({ folder }: { folder: string | null }) {
+export function WorkArea({ folder, width }: { folder: string | null; width: number }) {
   const [tab, setTab] = useState<Tab['id']>('files');
   const [tree, setTree] = useState<Entry[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -37,7 +37,7 @@ export function WorkArea({ folder }: { folder: string | null }) {
   }, [folder]);
 
   return (
-    <aside className="work">
+    <aside className="work" style={{ width }}>
       <div className="tabs">
         {TABS.map((entry) => (
           <button

@@ -4,6 +4,7 @@ import { useSession, describeTool, permissionPreview, type SessionView } from '.
 import type { ChatItem, ToolCallItem } from '@agilegeek/kernel';
 import { WorkArea } from './WorkArea.js';
 import { Codicons, Icon } from './icons.js';
+import { Sash, COLUMNS, clampWidth } from './Sash.js';
 
 /**
  * The window: a side bar of projects, the conversation, and the work area
@@ -14,15 +15,86 @@ export default function App() {
   const [folder, setFolder] = useState<string | null>(null);
   const session = useSession(folder);
 
+  // The three parts, each sized by its own sash. A part at 0 is collapsed;
+  // its width before that is kept, so dragging it back restores it.
+  const [sidebar, setSidebar] = useState<number>(COLUMNS.defaultSidebar);
+  const [work, setWork] = useState<number>(COLUMNS.defaultChat);
+  const [sidebarBefore, setSidebarBefore] = useState<number>(COLUMNS.defaultSidebar);
+  const [workBefore, setWorkBefore] = useState<number>(COLUMNS.defaultChat);
+  const shellRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     invoke('app_info').then(setInfo).catch(() => setInfo(null));
   }, []);
 
+  /** What is left for the conversation once both sides are drawn. */
+  const room = () => (shellRef.current?.clientWidth ?? 1200) - sidebar - work;
+
+  /** A sash dragged: the part moves, and snaps shut past its minimum. */
+  const dragSidebar = (delta: number) => {
+    const next = sidebarBefore + delta;
+    if (next < COLUMNS.minSidebar - COLUMNS.snap(COLUMNS.minSidebar)) {
+      setSidebar(0);
+      return;
+    }
+    // The conversation keeps its minimum: the side bar takes what is over.
+    const max = (shellRef.current?.clientWidth ?? 1200) - work - COLUMNS.minEditor;
+    setSidebar(clampWidth(Math.max(next, COLUMNS.minSidebar), COLUMNS.minSidebar, Math.max(COLUMNS.minSidebar, max)));
+  };
+
+  const dragWork = (delta: number) => {
+    const next = workBefore - delta;
+    if (next < COLUMNS.minChat - COLUMNS.snap(COLUMNS.minChat)) {
+      setWork(0);
+      return;
+    }
+    const max = (shellRef.current?.clientWidth ?? 1200) - sidebar - COLUMNS.minEditor;
+    setWork(clampWidth(Math.max(next, COLUMNS.minChat), COLUMNS.minChat, Math.max(COLUMNS.minChat, max)));
+  };
+
   return (
-    <div className="shell">
-      <TitleBar />
+    <div className="shell" ref={shellRef}>
+      <TitleBar
+        sidebarOpen={sidebar > 0}
+        workOpen={work > 0}
+        onToggleSidebar={() => {
+          if (sidebar > 0) {
+            setSidebarBefore(sidebar);
+            setSidebar(0);
+          } else {
+            setSidebar(sidebarBefore || COLUMNS.defaultSidebar);
+          }
+        }}
+        onToggleWork={() => {
+          if (work > 0) {
+            setWorkBefore(work);
+            setWork(0);
+          } else {
+            setWork(workBefore || COLUMNS.defaultChat);
+          }
+        }}
+      />
       <div className="columns">
-        <Sidebar info={info} folder={folder} onOpenFolder={setFolder} />
+        {sidebar > 0 ? (
+          <>
+            <Sidebar
+              info={info}
+              folder={folder}
+              onOpenFolder={setFolder}
+              width={sidebar}
+            />
+            <Sash
+              label="调整侧栏宽度"
+              onStart={() => {}}
+              onEnd={() => {}}
+              onDrag={dragSidebar}
+              onReset={() => setSidebar(COLUMNS.defaultSidebar)}
+              canMoveBack={sidebar > COLUMNS.minSidebar}
+              canMoveForward={room() > COLUMNS.minEditor}
+            />
+          </>
+        ) : null}
+
         <main className="center">
           <CenterHead session={session} folder={folder} />
           <Conversation session={session} folder={folder} />
@@ -30,7 +102,21 @@ export default function App() {
           <Composer session={session} />
           <ComposerFoot session={session} />
         </main>
-        <WorkArea folder={folder} />
+
+        {work > 0 ? (
+          <>
+            <Sash
+              label="调整工作区宽度"
+              onStart={() => {}}
+              onEnd={() => {}}
+              onDrag={dragWork}
+              onReset={() => setWork(COLUMNS.defaultChat)}
+              canMoveBack={room() > COLUMNS.minEditor}
+              canMoveForward={work > COLUMNS.minChat}
+            />
+            <WorkArea folder={folder} width={work} />
+          </>
+        ) : null}
       </div>
       <StatusBar info={info} session={session} onChanged={() => invoke('app_info').then(setInfo).catch(() => {})} />
     </div>
@@ -44,7 +130,17 @@ export default function App() {
  * the menus, what the window is set to, and the window's own buttons — all
  * on one row, which is what makes the top of the window a single line.
  */
-function TitleBar() {
+function TitleBar({
+  sidebarOpen,
+  workOpen,
+  onToggleSidebar,
+  onToggleWork,
+}: {
+  sidebarOpen: boolean;
+  workOpen: boolean;
+  onToggleSidebar: () => void;
+  onToggleWork: () => void;
+}) {
   return (
     <header className="menubar" data-tauri-drag-region>
       <span className="brand">
@@ -62,6 +158,22 @@ function TitleBar() {
       ))}
 
       <span className="menubar-spacer" />
+
+      <button
+        className={`layout-button ${sidebarOpen ? 'on' : ''}`}
+        onClick={onToggleSidebar}
+        title={sidebarOpen ? '收起侧栏' : '展开侧栏'}
+      >
+        <Icon codepoint={Codicons.layoutSidebarLeft} size={14} />
+      </button>
+      <button
+        className={`layout-button ${workOpen ? 'on' : ''}`}
+        onClick={onToggleWork}
+        title={workOpen ? '收起工作区' : '展开工作区'}
+      >
+        <Icon codepoint={Codicons.layoutSidebarRight} size={14} />
+      </button>
+
       <span className="fast-ide">⚡ Fast Ide</span>
       <WindowButtons />
     </header>
@@ -101,10 +213,12 @@ function Sidebar({
   info,
   folder,
   onOpenFolder,
+  width,
 }: {
   info: AppInfo | null;
   folder: string | null;
   onOpenFolder: (folder: string) => void;
+  width: number;
 }) {
   const [query, setQuery] = useState('');
 
@@ -116,7 +230,7 @@ function Sidebar({
   };
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" style={{ width }}>
       <div className="side-actions">
         <button className="side-action primary" onClick={open}>
           <Icon codepoint={Codicons.add} size={15} className="icon" />
