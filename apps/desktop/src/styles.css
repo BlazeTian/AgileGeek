@@ -1,3 +1,24 @@
+@font-face {
+  font-family: 'codicon';
+  src: url('/fonts/codicon.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+.codicon {
+  font-family: 'codicon';
+  font-style: normal;
+  font-weight: normal;
+  display: inline-block;
+  text-align: center;
+  text-decoration: none;
+  text-transform: none;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  flex: none;
+}
+
 /*
  * The colors are the reference app's own light theme (Bao light), by its
  * VS Code color ids: a warm off-white page, a paper-grey chrome, and one
@@ -252,12 +273,12 @@ textarea {
 .side-action {
   display: flex;
   align-items: center;
-  gap: 9px;
-  height: 32px;
-  padding: 0 9px;
-  border-radius: var(--r);
+  gap: 8px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
   color: var(--text);
-  font-size: 13.5px;
+  font-size: 12.5px;
   text-align: left;
 }
 
@@ -275,11 +296,7 @@ textarea {
 }
 
 .side-action .icon {
-  width: 15px;
   color: var(--text-dim);
-  font-size: 13px;
-  text-align: center;
-  flex: none;
 }
 
 .group-head {
@@ -727,25 +744,43 @@ textarea {
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 8px;
-  border-radius: var(--r);
-  color: var(--text-body);
-  font-size: 12.5px;
+  gap: 4px;
+  height: 22px;
+  padding: 0 3px 0 6px;
+  border-radius: 11px;
+  color: var(--text-dim);
+  font-size: 12px;
+  max-width: 100%;
+  white-space: nowrap;
 }
 
 .chip:hover {
   background: var(--hover);
 }
 
-.chip .caret-down {
-  color: var(--text-faint);
-  font-size: 8px;
+/* The mode picker is a secondary button, as the reference emphasises it. */
+.chip.emphasized {
+  background: #e8e8e5;
 }
 
-.chip .accent {
-  color: var(--accent-ink);
+.chip.emphasized:hover {
+  background: #edece9;
+}
+
+.chip .chip-icon {
+  color: var(--text-dim);
+}
+
+.chip .chip-logo {
+  width: 12px;
+  height: 12px;
+  object-fit: contain;
+  flex: none;
+}
+
+.chip .chevron {
+  color: var(--text-faint);
+  margin-left: -1px;
 }
 
 .composer-spacer {
@@ -755,13 +790,12 @@ textarea {
 .send {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--r);
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
   background: var(--accent);
   color: #282624;
   flex: none;
-  font-size: 14px;
 }
 
 .send:disabled {

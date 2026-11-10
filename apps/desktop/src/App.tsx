@@ -3,6 +3,7 @@ import { invoke, onCliProgress, type AppInfo, type CliProgress } from './ipc.js'
 import { useSession, describeTool, permissionPreview, type SessionView } from './useSession.js';
 import type { ChatItem, ToolCallItem } from '@agilegeek/kernel';
 import { WorkArea } from './WorkArea.js';
+import { Codicons, Icon } from './icons.js';
 
 /**
  * The window: a side bar of projects, the conversation, and the work area
@@ -47,7 +48,7 @@ function TitleBar() {
   return (
     <header className="menubar" data-tauri-drag-region>
       <span className="brand">
-        <img className="mark" src="/mark.svg" alt="" draggable={false} />
+        <img className="mark" src="/mark.png" alt="" draggable={false} />
         <span className="brand-name">灵动极客</span>
         <span className="brand-latin">AGILEGEEK</span>
       </span>
@@ -118,30 +119,33 @@ function Sidebar({
     <aside className="sidebar">
       <div className="side-actions">
         <button className="side-action primary" onClick={open}>
-          <span className="icon">＋</span>
+          <Icon codepoint={Codicons.add} size={15} className="icon" />
           新对话
         </button>
         <button className="side-action" onClick={open}>
-          <span className="icon">▤</span>
+          <Icon codepoint={Codicons.folderOpened} size={15} className="icon" />
           打开项目
         </button>
         <button className="side-action" onClick={() => setQuery(query === '' ? ' ' : '')}>
-          <span className="icon">⌕</span>
+          <Icon codepoint={Codicons.search} size={15} className="icon" />
           搜索
         </button>
         <button className="side-action">
-          <span className="icon">✦</span>
+          <Icon codepoint={Codicons.plug} size={15} className="icon" />
           技能
         </button>
         <button className="side-action">
-          <span className="icon">▣</span>
+          <Icon codepoint={Codicons.note} size={15} className="icon" />
           Stash
         </button>
       </div>
 
       <div className="group-head">
         <span>智能体</span>
-        <button>按项目 ▾</button>
+        <button>
+          按项目
+          <Icon codepoint={Codicons.chevronDown} size={12} />
+        </button>
       </div>
 
       <div className="threads">
@@ -167,8 +171,14 @@ function Sidebar({
       </div>
 
       <div className="side-foot">
-        <button>⚙ 设置</button>
-        <button>已归档：0</button>
+        <button>
+          <Icon codepoint={Codicons.settingsGear} size={13} />
+          设置
+        </button>
+        <button>
+          <Icon codepoint={Codicons.archive} size={13} />
+          已归档：0
+        </button>
       </div>
     </aside>
   );
@@ -475,13 +485,19 @@ function Composer({ session }: { session: SessionView }) {
         />
         <div className="composer-row">
           <button className="chip">
-            ∞ 智能体 <span className="caret-down">▾</span>
+            <Icon codepoint={Codicons.robot} size={13} className="chip-icon" />
+            智能体
+            <Icon codepoint={Codicons.chevronDown} size={13} className="chevron" />
+          </button>
+          <button className="chip emphasized">
+            <Icon codepoint={Codicons.lock} size={13} className="chip-icon" />
+            完全访问
+            <Icon codepoint={Codicons.chevronDown} size={13} className="chevron" />
           </button>
           <button className="chip">
-            <span className="accent">⚿</span> 完全访问 <span className="caret-down">▾</span>
-          </button>
-          <button className="chip">
-            ⚡ DeepSeek <span className="caret-down">▾</span>
+            <img className="chip-logo" src="/models/deepseek.svg" alt="" />
+            DeepSeek
+            <Icon codepoint={Codicons.chevronDown} size={13} className="chevron" />
           </button>
           <span className="composer-spacer" />
           {busy ? (
@@ -495,7 +511,7 @@ function Composer({ session }: { session: SessionView }) {
             onClick={submit}
             title="发送"
           >
-            ↑
+            <Icon codepoint={Codicons.arrowUp} size={14} />
           </button>
         </div>
       </div>
