@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/app-core",
+  "crates/claude-transport",
+  "crates/claude-launcher",
+  "crates/session-host",
+  "crates/file-review",
+  "crates/pty-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/BlazeTian/AgileGeek"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
+strip = true

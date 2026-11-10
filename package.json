@@ -1,0 +1,20 @@
+{
+  "name": "agilegeek",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AgileGeek — a fast desktop coding agent, built on the Claude Code CLI.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @agilegeek/desktop",
+    "build": "npm run build -w @agilegeek/desktop",
+    "test": "npm run test -w @agilegeek/kernel && npm run test -w @agilegeek/protocol",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "tauri": "tauri"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

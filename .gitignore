@@ -1,0 +1,53 @@
+# --- Reference material: GPL-3.0, read-only, never part of this repo ---
+/baocode-main/
+/baocode-main.zip
+/_agent_report.md
+/BaoCode-架构分析.md
+/SKILL.md
+/API_CAPABILITIES.md
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Rust ---
+/target/
+**/target/
+*.rs.bk
+
+# --- Node / frontend ---
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+*.local
+
+# --- Tauri build output ---
+src-tauri/target/
+src-tauri/gen/
+
+# --- Installers / binaries ---
+*.exe
+*.msi
+*.dmg
+*.deb
+*.AppImage
+*.msix
+!src-tauri/icons/**/*.exe
+
+# --- Editors / OS ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs / temp ---
+*.log
+/tmp/
+/.cache/
