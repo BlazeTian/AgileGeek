@@ -13,6 +13,8 @@ name = "agilegeek"
 version = "0.1.0"
 dependencies = [
  "agilegeek-core",
+ "agilegeek-launcher",
+ "agilegeek-session",
  "agilegeek-transport",
  "serde",
  "serde_json",
@@ -60,8 +62,18 @@ name = "agilegeek-pty-host"
 version = "0.1.0"
 
 [[package]]
-name = "agilegeek-session-host"
+name = "agilegeek-session"
 version = "0.1.0"
+dependencies = [
+ "agilegeek-core",
+ "agilegeek-launcher",
+ "agilegeek-transport",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "agilegeek-transport"

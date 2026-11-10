@@ -21,3 +21,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 agilegeek-core = { path = "../crates/app-core" }
 agilegeek-transport = { path = "../crates/claude-transport" }
+agilegeek-session = { path = "../crates/session-host" }
+agilegeek-launcher = { path = "../crates/claude-launcher" }

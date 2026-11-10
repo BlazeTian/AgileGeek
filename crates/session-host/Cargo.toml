@@ -1,7 +1,15 @@
 [package]
-name = "agilegeek-session-host"
+name = "agilegeek-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+agilegeek-core = { path = "../app-core" }
+agilegeek-launcher = { path = "../claude-launcher" }
+agilegeek-transport = { path = "../claude-transport" }

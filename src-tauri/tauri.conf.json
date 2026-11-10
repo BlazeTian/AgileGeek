@@ -13,15 +13,19 @@
     "windows": [
       {
         "title": "灵动极客 AgileGeek",
-        "width": 1280,
-        "height": 840,
+        "width": 1264,
+        "height": 760,
         "minWidth": 900,
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
         "center": true,
-        "theme": "Dark",
-        "backgroundColor": "#0B0D12"
+        "theme": "Light",
+        "backgroundColor": "#F8F8F8",
+        "decorations": true,
+        "maximized": false,
+        "x": 60,
+        "y": 40
       }
     ],
     "security": {
@@ -30,7 +34,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,7 +46,10 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"]
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
       }
     }
   }
