@@ -115,3 +115,43 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
   可用来做「首字延迟」「工具耗时」这类展示。
 - `init` 的工具名里有 `PowerShell`（Windows 上 Bash 的替代），
   折叠规则要按「命令类工具」而不是硬编码 `Bash` 来判断。
+
+---
+
+## ADR-0003 · CLI 的获取方式（2026-11-10）
+
+### 决定
+
+应用**自己下载**一份 Claude Code 到 `%LOCALAPPDATA%\AgileGeek\cli\<version>\claude.exe`，
+但**优先使用用户已安装的**。
+
+### 查找顺序
+
+1. 设置里显式指定的路径
+2. 应用下载的版本（按语义版本号取最新）
+3. 用户自己的安装（PATH → `~/.claude/local` → npm 全局 → Volta）
+
+**原生 exe 永远排在 `.cmd` shim 之前**：`claude.cmd` 把调用交给 `cmd.exe`，
+而 `cmd.exe` 会重新解析参数，把 `--settings` 的 JSON 在 `<` `>` 处切断。
+
+### 下载源
+
+npm 的平台包（`@anthropic-ai/claude-code-win32-x64`），**不是** npm 主包——
+主包只是个转发壳。tarball 里就一个 `claude.exe`，解压即用。
+
+- 镜像优先：`registry.npmmirror.com`，失败回退 `registry.npmjs.org`
+- 校验：优先用 npm 的 `integrity`（`sha512-<base64>`，SRI 格式），
+  没有才用 `shasum`（SHA-1 十六进制）
+- 先解压到 `.<version>.partial`，完整后 rename，中断不会留下"看起来能跑"的目录
+
+实测：161 MB 下载 + 校验 + 解压，版本 `2.1.322`，能正常跑会话。
+
+### 三个只有实跑才知道的约束
+
+1. **`--output-format stream-json` 必须同时给 `--verbose`**，否则 CLI 直接退出并报
+   `When using --print, --output-format=stream-json requires --verbose`。
+2. **stdout 会混入非 JSON 行**，例如
+   `[claude-code:unrecognized_model] {"model":"deepseek-v4-pro",...}`——
+   第三方模型名不被识别时就会打这一行。解码器必须跳过而不是当成帧。
+3. **模型跟随用户配置**：下载的 CLI 仍读 `~/.claude/settings.json`，
+   所以同一个 exe 既能用官方 Claude，也能用 DeepSeek。应用不覆盖这个文件。

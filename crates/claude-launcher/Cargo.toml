@@ -1,7 +1,22 @@
 [package]
-name = "agilegeek-claude-launcher"
+name = "agilegeek-launcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+sha1 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+hex = "0.4"
+agilegeek-core = { path = "../app-core" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
