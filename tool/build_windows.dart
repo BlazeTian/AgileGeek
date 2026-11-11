@@ -134,6 +134,10 @@ Future<void> main(List<String> arguments) async {
     _fail('--skip-build and --build-only leave nothing to do.');
   }
   final remoteBuilt = arguments.contains('--remote-built');
+  // OpenSSH is what an SSH remote project starts: a build without a
+  // connection to the network that fetches it (or one that does not need
+  // the feature) leaves it out. Windows 10's own ssh is used instead.
+  final noOpenSsh = arguments.contains('--no-openssh');
   final releaseAt = arguments.indexOf('--remote-release');
   final remoteRelease = releaseAt < 0
       ? null
@@ -241,9 +245,17 @@ Future<void> main(List<String> arguments) async {
       .readAsStringSync()
       .trim();
 
-  _step('Putting in OpenSSH for Windows $_openSshRelease ($arch)');
-  await _putOpenSsh(root, bundle, arch);
-  _checkBundle(bundle, [for (final name in _openSshFiles) 'openssh\\$name']);
+  if (noOpenSsh) {
+    // Left out where the connection that fetches it is not there, or the
+    // feature is not needed: Windows 10's own ssh is used instead.
+    _step('Leaving out OpenSSH for Windows (--no-openssh)');
+    final carried = Directory('${bundle.path}\\openssh');
+    if (carried.existsSync()) carried.deleteSync(recursive: true);
+  } else {
+    _step('Putting in OpenSSH for Windows $_openSshRelease ($arch)');
+    await _putOpenSsh(root, bundle, arch);
+    _checkBundle(bundle, [for (final name in _openSshFiles) 'openssh\\$name']);
+  }
 
   _step('Compiling the installer');
   final iscc = _findIscc();
@@ -436,15 +448,22 @@ Future<void> _putOpenSsh(Directory root, Directory bundle, String arch) async {
   }
 }
 
-/// The Inno Setup compiler: where winget puts it, then where a manual
-/// install does, then wherever the PATH has it.
+/// The Inno Setup compiler, 7 or 6: where winget puts it, then where a
+/// manual install does, then a folder named in AGILEGEEK_ISCC.
 String _findIscc() {
   final local = Platform.environment['LOCALAPPDATA'];
   final candidates = [
-    if (local != null) '$local\\Programs\\Inno Setup 6\\ISCC.exe',
+    if (local != null)
+      for (final version in ['7', '6'])
+        '$local\\Programs\\Inno Setup $version\\ISCC.exe',
     for (final variable in ['ProgramFiles(x86)', 'ProgramFiles'])
       if (Platform.environment[variable] case final root?)
-        '$root\\Inno Setup 6\\ISCC.exe',
+        for (final version in ['7', '6'])
+          '$root\\Inno Setup $version\\ISCC.exe',
+    // A folder of its own, anywhere: D:\Inno Setup 7, say.
+    if (Platform.environment['AGILEGEEK_ISCC'] case final folder?
+        when folder.isNotEmpty)
+      '${folder.replaceAll('/', r'\')}\\ISCC.exe',
   ];
   for (final candidate in candidates) {
     if (File(candidate).existsSync()) return candidate;
@@ -454,7 +473,9 @@ String _findIscc() {
     '\n'
     '  winget install --id JRSoftware.InnoSetup\n'
     '\n'
-    'or download it from https://jrsoftware.org/isdl.php',
+    'or download it from https://jrsoftware.org/isdl.php, and set\n'
+    'AGILEGEEK_ISCC to the folder it went in if it is not one of the\n'
+    'usual ones.',
   );
 }
 
