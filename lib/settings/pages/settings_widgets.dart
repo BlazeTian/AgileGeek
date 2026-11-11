@@ -1,0 +1,698 @@
+import 'package:flutter/material.dart';
+
+import '../../base/smooth_scroll.dart';
+import '../../chat/chat_width.dart';
+import '../../chat/widgets/scroll_edge_fade.dart';
+import '../../ide/ide_step_slider.dart';
+import '../../ide/ide_switch.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/codicons.dart';
+import '../../theme/workbench_theme.dart' show themeColors;
+
+/// The settings pages' colors, as Cursor's settings have them: the editor's
+/// foreground at a strength for each part, over the editor's background
+/// (the page). Its `--cursor-text-*`, `--cursor-icon-*`, `--cursor-bg-*`
+/// and `--cursor-stroke-*` (workbench.desktop.main.css); stronger text and
+/// the inputs' border for the lines in high contrast themes.
+abstract final class SettingsColors {
+  static Color get _foreground => themeColors['editor.foreground'];
+
+  static Color _at(double strength) =>
+      _foreground.withValues(alpha: _foreground.a * strength);
+
+  /// Titles, labels: the foreground.
+  static Color get textPrimary => _foreground;
+
+  /// Descriptions, group headings.
+  static Color get textSecondary => _at(themeColors.highContrast ? 0.84 : 0.74);
+
+  /// A group's description.
+  static Color get textTertiary => _at(themeColors.highContrast ? 0.72 : 0.6);
+
+  /// What is faint: a host by its name, a dash for no result yet.
+  static Color get textQuaternary => _at(themeColors.highContrast ? 0.6 : 0.36);
+
+  /// An icon not selected.
+  static Color get iconTertiary => _at(0.52);
+
+  /// What is selected or under the pointer in a list.
+  static Color get hover => _at(0.06);
+
+  /// Around a field.
+  static Color get stroke =>
+      themeColors.highContrast ? themeColors['input.border'] : _at(0.08);
+
+  /// A card, over the page.
+  static Color get card => Color.alphaBlend(_at(0.04), AppColors.code);
+
+  /// Between a card's rows.
+  static Color get divider =>
+      themeColors.highContrast ? themeColors['input.border'] : _at(0.04);
+}
+
+/// The settings pages' text: one size and weight for each part.
+abstract final class SettingsText {
+  static TextStyle get title => TextStyle(
+    color: SettingsColors.textPrimary,
+    fontSize: 18,
+    fontWeight: FontWeight.w600,
+  );
+
+  /// Under the page's title.
+  static TextStyle get lead => description;
+
+  /// A group's heading, over its card.
+  static TextStyle get heading => TextStyle(
+    color: SettingsColors.textSecondary,
+    fontSize: 12.5,
+    fontWeight: FontWeight.w500,
+  );
+
+  /// Under a group's heading.
+  static TextStyle get headingDescription =>
+      description.copyWith(color: SettingsColors.textTertiary);
+
+  static TextStyle get label =>
+      TextStyle(color: SettingsColors.textPrimary, fontSize: 13, height: 1.4);
+
+  static TextStyle get description =>
+      TextStyle(color: SettingsColors.textSecondary, fontSize: 12, height: 1.5);
+
+  static TextStyle get path => TextStyle(
+    color: SettingsColors.textPrimary,
+    fontSize: 12,
+    height: 1.5,
+    fontFamily: AppFonts.mono,
+    fontFamilyFallback: AppFonts.monoFallbacks,
+  );
+}
+
+/// A settings page: its title, a description under it, then its cards
+/// (and [SettingsGroup]s), in a column as wide as reads well.
+class SettingsPage extends StatelessWidget {
+  const SettingsPage({
+    super.key,
+    required this.title,
+    this.description,
+    this.lead,
+    this.pinned,
+    required this.children,
+  });
+
+  static const inset = 32.0;
+
+  /// The inset of a page narrower than [narrowWidth] (the narrow window's,
+  /// or one beside the list in a small one): the cards keep the room.
+  static const narrowInset = 20.0;
+  static const narrowWidth = 720.0;
+
+  final String title;
+  final String? description;
+
+  /// Under the title, as far out as the cards: in place of [description].
+  /// Its own space above it, so that it takes none while it shows nothing.
+  final Widget? lead;
+
+  /// Under the title (a toolbar: the usage page's filters): it and the
+  /// title stay at the top as the rest scrolls under them.
+  final Widget? pinned;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final lead = this.lead;
+    final pinned = this.pinned;
+    final top = [
+      // Its title and description in as far as the groups' headings.
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: SettingsText.title),
+            if (description case final description?) ...[
+              const SizedBox(height: 4),
+              Text(description, style: SettingsText.lead),
+            ],
+          ],
+        ),
+      ),
+      ?lead,
+    ];
+    if (pinned == null) {
+      return SettingsColumn(
+        children: [
+          ...top,
+          for (final child in children) ...[const SizedBox(height: 20), child],
+        ],
+      );
+    }
+    return SettingsColumn(
+      header: [...top, const SizedBox(height: 20), pinned],
+      children: [
+        for (final (i, child) in children.indexed) ...[
+          if (i > 0) const SizedBox(height: 20),
+          child,
+        ],
+      ],
+    );
+  }
+}
+
+/// A page's scrolling column, as wide at most as the conversation's
+/// ([ChatWidth]), in the middle of what is left of the window.
+class SettingsColumn extends StatelessWidget {
+  const SettingsColumn({super.key, this.header, required this.children});
+
+  /// Over the column, as wide, not scrolled: what scrolls fades out under
+  /// it.
+  final List<Widget>? header;
+  final List<Widget> children;
+
+  /// Between [header] and the column, at rest.
+  static const _headerGap = 12.0;
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<double>(
+    valueListenable: ChatWidth.current,
+    builder: (context, maxWidth, _) => LayoutBuilder(
+      builder: (context, constraints) {
+        final inset = constraints.maxWidth < SettingsPage.narrowWidth
+            ? SettingsPage.narrowInset
+            : SettingsPage.inset;
+        final side = maxWidth.isInfinite
+            ? inset
+            : ((constraints.maxWidth - maxWidth) / 2).clamp(
+                inset,
+                double.infinity,
+              );
+        final header = this.header;
+        // Fading out towards an edge it is scrolled past, over about two
+        // lines of a description.
+        Widget list(ScrollController controller, {required double top}) =>
+            ScrollEdgeFade(
+              fadeLength: header == null ? 56 : 32,
+              child: ListView(
+                controller: controller,
+                padding: EdgeInsets.fromLTRB(side, top, side, 48),
+                // A section expanded or collapsed fades as it now ends.
+                children: [
+                  for (final child in children)
+                    ScrollEdgeFadeContent(child: child),
+                ],
+              ),
+            );
+        // Under the window's draggable strip already: the title near the
+        // nav's back button.
+        if (header == null) {
+          return SmoothScrolling(
+            builder: (context, controller) => list(controller, top: 16),
+          );
+        }
+        return SmoothScrolling(
+          builder: (context, controller) => Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: EdgeInsets.fromLTRB(side, 16, side, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: header,
+                ),
+              ),
+              Expanded(child: list(controller, top: _headerGap)),
+            ],
+          ),
+        );
+      },
+    ),
+  );
+}
+
+/// Settings under a heading: the heading over their card, as a page's
+/// part (Startup, Notifications…).
+class SettingsGroup extends StatelessWidget {
+  const SettingsGroup({
+    super.key,
+    required this.title,
+    required this.children,
+    this.description,
+  });
+
+  final String title;
+  final String? description;
+
+  /// Its rows, in one card.
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    // 28 between groups, as Cursor's sections.
+    padding: const EdgeInsets.only(top: 8),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 0, 4, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: SettingsText.heading),
+              if (description case final description?) ...[
+                const SizedBox(height: 2),
+                Text(description, style: SettingsText.headingDescription),
+              ],
+            ],
+          ),
+        ),
+        SettingsCard(children: children),
+      ],
+    ),
+  );
+}
+
+/// Settings under a heading that folds: the heading a chevron before it,
+/// the card shown only while open; [summary] beside the heading while it
+/// is folded, for what is chosen to show without opening it.
+class SettingsFolding extends StatelessWidget {
+  const SettingsFolding({
+    super.key,
+    required this.title,
+    required this.open,
+    required this.onToggle,
+    required this.children,
+    this.description,
+    this.summary,
+  });
+
+  final String title;
+  final String? description;
+  final String? summary;
+  final bool open;
+  final VoidCallback onToggle;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Semantics(
+        button: true,
+        expanded: open,
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: onToggle,
+            child: Padding(
+              padding: const EdgeInsets.only(left: 8, top: 8, bottom: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        open ? Codicons.chevronDown : Codicons.chevronRight,
+                        size: 13,
+                        color: SettingsColors.textSecondary,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(title, style: SettingsText.heading),
+                      if (summary case final summary? when !open) ...[
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: Text(
+                            summary,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: SettingsText.headingDescription,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  if (description case final description? when open) ...[
+                    const SizedBox(height: 2),
+                    Padding(
+                      padding: const EdgeInsets.only(left: 17),
+                      child: Text(
+                        description,
+                        style: SettingsText.headingDescription,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+      if (open) SettingsCard(children: children),
+    ],
+  );
+}
+
+/// Settings that belong together: a card a shade off the page, a line
+/// between rows (bordered in high contrast themes).
+class SettingsCard extends StatelessWidget {
+  const SettingsCard({super.key, required this.children});
+
+  final List<Widget> children;
+
+  /// The card: the text's color over the page's, faintly.
+  static Color get background => SettingsColors.card;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    decoration: BoxDecoration(
+      color: background,
+      borderRadius: BorderRadius.circular(12),
+      border: switch (themeColors.get('contrastBorder')) {
+        final border? => Border.all(color: border),
+        null => null,
+      },
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final (i, child) in children.indexed) ...[
+          if (i > 0)
+            Container(
+              height: 1,
+              margin: const EdgeInsets.symmetric(horizontal: 12),
+              color: SettingsColors.divider,
+            ),
+          child,
+        ],
+      ],
+    ),
+  );
+}
+
+/// One setting: its label and description at the left, its control at
+/// the right; [below] under the description. Narrower than [stackBelow],
+/// the control goes under them.
+class SettingsRow extends StatelessWidget {
+  const SettingsRow({
+    super.key,
+    required this.label,
+    this.description,
+    this.below = const [],
+    this.trailing,
+    this.onTap,
+  });
+
+  final String label;
+  final String? description;
+  final List<Widget> below;
+  final Widget? trailing;
+
+  /// What a click anywhere on the row does: a switch's row toggles it.
+  final VoidCallback? onTap;
+
+  static const stackBelow = 480.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: SettingsText.label),
+        if (description case final description?) ...[
+          const SizedBox(height: 1),
+          Text(description, style: SettingsText.description),
+        ],
+        for (final widget in below) ...[const SizedBox(height: 8), widget],
+      ],
+    );
+    final trailing = this.trailing;
+    final row = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      child: trailing == null
+          ? text
+          : LayoutBuilder(
+              builder: (context, constraints) =>
+                  constraints.maxWidth < stackBelow
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        text,
+                        const SizedBox(height: 12),
+                        Align(
+                          alignment: AlignmentDirectional.centerEnd,
+                          child: trailing,
+                        ),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        Expanded(child: text),
+                        const SizedBox(width: 20),
+                        trailing,
+                      ],
+                    ),
+            ),
+    );
+    final onTap = this.onTap;
+    if (onTap == null) return row;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: row,
+      ),
+    );
+  }
+}
+
+/// A setting that is on or off, as a row's control: [IdeSwitch], as tall as
+/// the row's label (see [SettingsText.label]).
+class SettingsSwitch extends StatelessWidget {
+  const SettingsSwitch({
+    super.key,
+    required this.value,
+    required this.onChanged,
+    required this.semanticLabel,
+    this.enabled = true,
+  });
+
+  final bool value;
+  final ValueChanged<bool> onChanged;
+  final String semanticLabel;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) => IdeSwitch(
+    value: value,
+    onChanged: onChanged,
+    semanticLabel: semanticLabel,
+    enabled: enabled,
+    height: MediaQuery.textScalerOf(context)
+        .scale(SettingsText.label.fontSize! * 1.2)
+        .roundToDouble(),
+  );
+}
+
+/// A [SettingsRow] with a [SettingsSwitch]: a click on the row toggles it.
+class SettingsSwitchRow extends StatelessWidget {
+  const SettingsSwitchRow({
+    super.key,
+    required this.label,
+    required this.value,
+    required this.onChanged,
+    this.description,
+    this.enabled = true,
+  });
+
+  final String label;
+  final String? description;
+  final bool value;
+  final bool enabled;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) => Opacity(
+    opacity: enabled ? 1 : 0.6,
+    child: SettingsRow(
+      label: label,
+      description: description,
+      onTap: enabled ? () => onChanged(!value) : null,
+      trailing: SettingsSwitch(
+        value: value,
+        enabled: enabled,
+        semanticLabel: label,
+        onChanged: onChanged,
+      ),
+    ),
+  );
+}
+
+/// One of [count] steps, as a row's control: a slider that stops at each,
+/// [label] (the step's name) beside it.
+class SettingsSlider extends StatelessWidget {
+  const SettingsSlider({
+    super.key,
+    required this.step,
+    required this.count,
+    required this.label,
+    required this.semanticLabel,
+    required this.onChanged,
+    this.tapOnly = false,
+  });
+
+  final int step;
+  final int count;
+  final String label;
+  final String semanticLabel;
+  final ValueChanged<int> onChanged;
+
+  /// A step is picked by a click, not by dragging the thumb: for one whose
+  /// every step relayouts the window, which a drag would do on each.
+  final bool tapOnly;
+
+  @override
+  Widget build(BuildContext context) {
+    // One semantics node per slider, its label with it: several in a card
+    // otherwise fail the engine's semantics check.
+    return MergeSemantics(
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label, style: SettingsText.description),
+          const SizedBox(width: 8),
+          IdeStepSlider(
+            step: step,
+            count: count,
+            semanticLabel: semanticLabel,
+            tapOnly: tapOnly,
+            onChanged: onChanged,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A line of text, as a row's control: [value] as it is kept, and what is
+/// typed goes to [onSubmitted] once it is entered or the field loses focus,
+/// when that changed it. [hint] shows where it is empty.
+class SettingsTextField extends StatefulWidget {
+  const SettingsTextField({
+    super.key,
+    required this.value,
+    required this.semanticLabel,
+    required this.onSubmitted,
+    this.hint,
+    this.width = 220,
+    this.autofocus = false,
+  });
+
+  final String value;
+  final String semanticLabel;
+  final ValueChanged<String> onSubmitted;
+  final String? hint;
+  final double width;
+
+  final bool autofocus;
+
+  @override
+  State<SettingsTextField> createState() => _SettingsTextFieldState();
+}
+
+class _SettingsTextFieldState extends State<SettingsTextField> {
+  late final _controller = TextEditingController(text: widget.value);
+  final _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _focus.addListener(_focusChanged);
+  }
+
+  @override
+  void didUpdateWidget(SettingsTextField old) {
+    super.didUpdateWidget(old);
+    // Shows the kept value when it changes elsewhere, never over a typing.
+    if (!_focus.hasFocus && _controller.text != widget.value) {
+      _controller.text = widget.value;
+    }
+  }
+
+  @override
+  void dispose() {
+    _focus.removeListener(_focusChanged);
+    _focus.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _focusChanged() {
+    if (!_focus.hasFocus) _submit(_controller.text);
+  }
+
+  void _submit(String text) {
+    final typed = text.trim();
+    if (typed == widget.value) return;
+    widget.onSubmitted(typed);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final border = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(5),
+      borderSide: BorderSide(color: AppColors.borderStrong),
+    );
+    final mono = TextStyle(
+      fontFamily: AppFonts.mono,
+      fontFamilyFallback: AppFonts.monoFallbacks,
+      fontSize: 12,
+    );
+    return Semantics(
+      textField: true,
+      label: widget.semanticLabel,
+      child: SizedBox(
+        width: widget.width,
+        child: TextField(
+          controller: _controller,
+          focusNode: _focus,
+          autofocus: widget.autofocus,
+          onSubmitted: _submit,
+          style: mono.copyWith(color: AppColors.text),
+          decoration: InputDecoration(
+            isDense: true,
+            hintText: widget.hint,
+            hintStyle: mono.copyWith(color: AppColors.textFaint),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 8,
+              vertical: 6,
+            ),
+            border: border,
+            enabledBorder: border,
+            focusedBorder: border.copyWith(
+              borderSide: BorderSide(color: AppColors.accent),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Buttons side by side, as a row's control.
+class SettingsButtons extends StatelessWidget {
+  const SettingsButtons({super.key, required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      for (final (i, child) in children.indexed) ...[
+        if (i > 0) const SizedBox(width: 6),
+        child,
+      ],
+    ],
+  );
+}

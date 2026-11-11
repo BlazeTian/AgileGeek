@@ -1,0 +1,521 @@
+import 'dart:async';
+
+import 'package:flutter/widgets.dart';
+
+import 'kernel_event.dart';
+import 'queued_messages.dart';
+import 'kernel_types.dart';
+
+/// An agent runtime (Claude Code, Codex, …) behind one interface: the
+/// Target of its adapter. What else it can do, it declares by implementing
+/// the capability interfaces below; the UI shows only what is declared.
+abstract interface class AgentKernel {
+  KernelDescriptor get descriptor;
+
+  /// Everything it reports, in order, for as long as it lives.
+  Stream<KernelEvent> get events;
+
+  /// Whether it can run: starting, ready, or failed and why.
+  KernelHealth get health;
+
+  /// The id its [KernelDescriptor.catalog] keeps the conversation under,
+  /// once known (e.g. after the first message); null for kernels that keep
+  /// none.
+  String? get sessionId;
+
+  /// Runs [turn]; a turn id already sent is ignored.
+  void send(KernelTurn turn);
+
+  /// Answers the pending request [requestId] (once; later answers are
+  /// ignored).
+  void answer(String requestId, InteractionAnswer answer);
+
+  /// Stops the running turn, if any.
+  void cancel();
+
+  /// Tries again after [KernelHealthStatus.failed].
+  void restart();
+
+  /// Gets ready ahead of use, e.g. when its conversation is shown: a
+  /// runtime may start and report its options.
+  void prepare();
+
+  /// Frees what it holds while idle and out of view; it starts again when
+  /// next used.
+  void release();
+
+  void dispose();
+
+  /// Completes once what it ran has stopped (e.g. its process, after
+  /// [dispose]): nothing of it writes to its session any more.
+  Future<void> get stopped;
+}
+
+/// Where a kernel works and what it picks up from.
+class KernelContext {
+  const KernelContext({
+    this.cwd,
+    this.resume,
+    this.settings = const {},
+    this.workspace,
+  });
+
+  /// The project directory.
+  final String? cwd;
+
+  /// The multi-folder workspace [cwd] is the folder of, as it is now (its
+  /// folders may change between launches); none for a folder's project.
+  final KernelWorkspace? Function()? workspace;
+
+  /// An earlier session to continue, as its catalog listed it.
+  final SessionRecord? resume;
+
+  /// Initial choices by [KernelChoiceKind] name, e.g. the permission mode
+  /// new agents start in.
+  final Map<String, String> settings;
+}
+
+// --- Capabilities -----------------------------------------------------------
+
+/// The folders an agent works in besides its directory, those of a
+/// multi-folder workspace, and what it is told of them.
+class KernelWorkspace {
+  const KernelWorkspace({
+    required this.folders,
+    this.instructions = '',
+    this.ownPrompt = false,
+    this.tools,
+    this.userServers = false,
+    this.allowedTools = const [],
+    this.approvesAll = false,
+    this.reaches = const [],
+    this.queuedMessages,
+    this.queuedInPlace = false,
+  });
+
+  final List<String> folders;
+
+  /// Added to the agent's system prompt; or, when [ownPrompt], all of it.
+  final String instructions;
+
+  /// Whether [instructions] are its whole system prompt, in place of the
+  /// agent's own (a coding agent's): for one that is not one.
+  final bool ownPrompt;
+
+  /// When the messages sent while it works are taken up, over the user's
+  /// setting; theirs when null.
+  final QueuedMessages? queuedMessages;
+
+  /// The only built-in tools it has (none for an empty list), the app's
+  /// own aside; all when null. Set, the app's MCP servers are its only
+  /// ones: none of the user's, but with [userServers].
+  final List<String>? tools;
+
+  /// Whether, with [tools] set, the user's own MCP servers are its all the
+  /// same: [tools] there only to keep some of Claude Code's own from it.
+  final bool userServers;
+
+  /// Built-in tools it uses without asking, whatever its permission mode
+  /// (permission rules: `WebFetch`, say).
+  final List<String> allowedTools;
+
+  /// Whether in full access it is let do all it would do, what Claude
+  /// Code asks about all the same too (its safety checks): no one is
+  /// there to ask. A bot's.
+  final bool approvesAll;
+
+  /// Folders it works in besides, not of a workspace of its own: working
+  /// directories (`--add-dir`), their `CLAUDE.md` not read, nor their
+  /// changes reviewed. A bot's reach into the user's projects.
+  final List<String> reaches;
+
+  /// Whether what the user writes while it works shows where they wrote
+  /// it, as a chat app's messages do, from the moment it is sent: not
+  /// apart, until taken up.
+  final bool queuedInPlace;
+}
+
+/// A setting the kernel offers a choice for. What is in effect is what the
+/// kernel reports, not what was last asked for.
+abstract interface class KernelChoiceSource {
+  List<KernelOption> get options;
+  String? get selected;
+  void select(String id);
+}
+
+enum KernelChoiceKind { model, mode, permission, effort, context, fast }
+
+abstract interface class SelectsModel {
+  KernelChoiceSource get model;
+}
+
+/// A model whose pick restarts the agent to go on with its conversation,
+/// e.g. one served by another provider: the user is asked first.
+abstract interface class ConfirmsModelSwitch {
+  /// Whether picking [model] (an option of [SelectsModel.model]) now
+  /// restarts the agent on its conversation.
+  bool switchRestarts(String model);
+}
+
+/// What the agent does with a message: e.g. act on it, only discuss it,
+/// or plan first.
+abstract interface class SelectsMode {
+  KernelChoiceSource get mode;
+}
+
+/// Puts its plans to the user without waiting on them: a plan's card
+/// shows it awaiting, the turn over, for the user to start when they like
+/// or to say in a message what should change.
+abstract interface class StartsPlans {
+  /// Out of planning, into building with the approvals picked: the next
+  /// message carries out the plan awaiting.
+  void startBuilding();
+}
+
+/// How the agent's actions are approved: e.g. ask each time, accept
+/// edits, or no checks. Apart from [SelectsMode]: a plan, once approved,
+/// is carried out with these approvals.
+abstract interface class SelectsPermission {
+  KernelChoiceSource get permission;
+}
+
+/// A setting that goes with the model, picked beside it: what it offers
+/// depends on the model, e.g. its effort levels.
+abstract interface class ModelSetting {
+  /// What it offers with [model] (an option of [SelectsModel.model]) in
+  /// use; none when there is nothing to choose.
+  List<KernelOption> optionsFor(String model);
+
+  /// What is in effect with the model in use, as the kernel reports it;
+  /// null while not known.
+  String? get selected;
+
+  /// What [model] would be on, switched to: [selected] for the model in
+  /// use; for another, what was last picked with it (each model keeps its
+  /// own), else what it would take on.
+  String? selectedFor(String model);
+
+  /// Picks [id], with [model] in use: switched to first, if another is.
+  void select(String model, String id);
+
+  /// Whether this setting is on or off rather than one of several: shown
+  /// and picked as a switch, and picked without the menu closing.
+  bool get toggle => false;
+}
+
+/// The key a setting of [kind] picked with [model] is kept under, beside
+/// the one last picked with any (its name): `effort@<model>`.
+String modelSettingKey(KernelChoiceKind kind, String model) =>
+    '${kind.name}@$model';
+
+/// How much the model thinks before it answers.
+abstract interface class SelectsEffort {
+  ModelSetting get effort;
+}
+
+/// How much of the conversation the model holds, e.g. 200K or 1M tokens.
+abstract interface class SelectsContextSize {
+  ModelSetting get contextSize;
+}
+
+/// Whether supported upstream models use the Fast service tier for this chat.
+abstract interface class SelectsFast {
+  ModelSetting get fast;
+}
+
+abstract interface class ProvidesCommands {
+  List<KernelCommand> get commands;
+}
+
+abstract interface class SuggestsFiles {
+  Future<List<FileSuggestion>> suggestFiles(String query);
+}
+
+abstract interface class ReportsContext {
+  int get contextWindow;
+}
+
+/// Reports cost and account limits (see [StatsReported]).
+abstract interface class ReportsUsage {
+  /// The account's limits as last known, from any session: what a session
+  /// shows before it reports its own.
+  List<RateLimitWindow> get accountLimits;
+
+  /// Asks for the account's usage now, rather than wait for a reply to
+  /// report it; the limits come as [StatsReported], in every session.
+  Future<void> refreshUsage();
+}
+
+/// Tells when the account's usage limit, hit, resets: the agent stopped
+/// for it, and can go on then.
+abstract interface class ReportsUsageLimit {
+  /// When the limit the last turn hit resets; null while none was hit
+  /// (or a turn went through since), and when it was not said when.
+  DateTime? get usageLimitResetsAt;
+
+  /// Whether the next message is held to that limit: not once switched
+  /// to another provider's model, say, whose limits are its own.
+  bool get usageLimitApplies;
+
+  /// Whether [model] (an option of [SelectsModel.model]) is held to the
+  /// account's limit: not another provider's.
+  bool usageLimitAppliesTo(String model);
+}
+
+/// Runs tasks beside the conversation (see [TasksReported]).
+abstract interface class RunsBackgroundTasks {
+  void stopTask(String taskId);
+
+  /// Moves the running command or subagent started by [toolUseId] to the
+  /// background, so the turn goes on.
+  void moveToBackground(String toolUseId);
+}
+
+/// Takes messages while busy, and runs them in turn.
+abstract interface class QueuesMessages {
+  /// Takes back a queued message not yet started; completes with whether
+  /// it was (it may have started meanwhile).
+  Future<bool> cancelQueued(String turnId);
+
+  /// Takes up the queued message [turnId] at once, before any queued ahead
+  /// of it: the turn running is stopped for it.
+  void sendQueuedNow(String turnId);
+
+  /// Puts the queued message [turnId] at [index] among those queued, the
+  /// next first: the ones before it wait for it.
+  void moveQueued(String turnId, int index);
+}
+
+abstract interface class RevertsChanges {
+  /// Puts back the files changed since turn [turnId] began.
+  void revertChanges({required String sinceTurn});
+}
+
+/// Told of each file the agent (or one of its subagents) edits as it edits
+/// it: what the review of its changes keeps.
+abstract interface class EditWatch {
+  /// The agent is about to write [path] (absolute): it writes once this
+  /// completes.
+  Future<void> beforeEdit(String path);
+
+  /// It wrote [path], or gave up writing it.
+  Future<void> afterEdit(String path);
+}
+
+/// A kernel that tells an [EditWatch] of its edits, before and after each:
+/// set before it starts.
+abstract interface class WatchesEdits {
+  set editWatch(EditWatch? watch);
+}
+
+abstract interface class RewindsConversation {
+  /// Drops the conversation from the user message [itemId] (item [index],
+  /// with [turns] turns after it) on, to go on from there. [lastSeen] is
+  /// the latest user message shown, for the agent to tell nothing came
+  /// after it unseen.
+  ///
+  /// Completes with whether it did: turned down, the conversation is left
+  /// as it was.
+  Future<bool> rewind({
+    required String itemId,
+    required int index,
+    required int turns,
+    String? lastSeen,
+  });
+}
+
+/// Copies the conversation into a new session, to go on from there apart
+/// from it: the workspace's files are left as they are.
+abstract interface class ForksConversation {
+  /// Whether there is a conversation to copy yet (e.g. none before the
+  /// first message).
+  bool get canFork;
+
+  /// Copies the conversation into a new session of the kernel's catalog,
+  /// without the user message [before] (an item id) and what follows when
+  /// given, titled [title]: its record, to continue it by; null when it
+  /// could not (the kernel says why in the conversation).
+  Future<SessionRecord?> fork({String? before, required String title});
+}
+
+abstract interface class RenamesSession {
+  void rename(String title);
+}
+
+/// Takes pictures with a message ([KernelTurn.images]).
+abstract interface class AcceptsImages {}
+
+/// Reads the conversation it continues ([KernelContext.resume]) before
+/// showing it.
+abstract interface class LoadsHistory {
+  /// Whether that conversation is still being read: it may take a while,
+  /// e.g. from a remote project's host.
+  bool get loadingHistory;
+
+  /// Whether there is more of it before what was read: a long one is read
+  /// from its end, the rest on asking (see [loadEarlier]).
+  bool get hasEarlierHistory;
+
+  /// Whether that is being read.
+  bool get loadingEarlier;
+
+  /// Reads some more of it, before what was ([HistoryPrepended]). Asked
+  /// again meanwhile, it is the same reading.
+  Future<void> loadEarlier();
+}
+
+/// Offers what the user would likely send next, after a turn.
+abstract interface class SuggestsPrompts {
+  /// Null while there is none, e.g. once the user sends something.
+  String? get promptSuggestion;
+}
+
+/// Uses MCP servers, and lets the user see and manage them.
+abstract interface class ManagesMcpServers {
+  /// As last reported; null until first asked for.
+  List<McpServer>? get mcpServers;
+
+  /// Asks for their current state.
+  void refreshMcpServers();
+
+  void setMcpServerEnabled(String name, bool enabled);
+
+  /// Connects a failed or disconnected server again.
+  void reconnectMcpServer(String name);
+
+  /// Signs in to a server that needs it: the page where the user does,
+  /// or null when there is nothing for them to do.
+  Future<Uri?> authenticateMcpServer(String name);
+}
+
+// --- Sessions ------------------------------------------------------------------
+
+/// A conversation a kernel kept, to list and continue.
+class SessionRecord {
+  const SessionRecord({
+    required this.id,
+    required this.title,
+    required this.updatedAt,
+    required this.cwd,
+    this.path,
+  });
+
+  final String id;
+
+  /// Empty when it was first asked something with images alone, and not
+  /// named since.
+  final String title;
+  final DateTime updatedAt;
+
+  /// The project directory it ran in.
+  final String cwd;
+
+  /// Where the kernel keeps it.
+  final String? path;
+}
+
+/// A project directory and its sessions, newest first.
+class ProjectRecord {
+  const ProjectRecord({required this.path, required this.sessions});
+
+  final String path;
+  final List<SessionRecord> sessions;
+
+  String get name {
+    final parts = path.split('/')..removeWhere((part) => part.isEmpty);
+    return parts.isEmpty ? path : parts.last;
+  }
+
+  DateTime? get updatedAt => sessions.isEmpty ? null : sessions.first.updatedAt;
+}
+
+/// The sessions a kernel has kept, by project.
+abstract interface class SessionCatalog {
+  Future<List<ProjectRecord>> projects();
+
+  /// The sessions of one directory (e.g. one just opened).
+  Future<List<SessionRecord>> sessionsIn(String cwd);
+
+  /// Deletes the session [id] and everything kept with it, for good.
+  /// Deleting one that is gone (or never was) does nothing.
+  Future<void> delete(String id);
+}
+
+/// A [SessionCatalog] that can have a directory's sessions belong to
+/// another (a project's folder moved): listed, and continued, there.
+abstract interface class MovesSessions {
+  /// Moves the sessions kept for [from] to [to]; how many moved. Throws
+  /// where it cannot (a remote host's, say).
+  Future<int> moveSessions(String from, String to);
+}
+
+// --- Registration -----------------------------------------------------------
+
+/// A kernel the user can pick, and how to make one.
+class KernelDescriptor {
+  const KernelDescriptor({
+    required this.id,
+    required this.label,
+    required this.icon,
+    required this.description,
+    required this.create,
+    this.catalog,
+  });
+
+  final String id;
+  final String label;
+  final IconData icon;
+  final String description;
+  final AgentKernel Function(KernelContext context) create;
+
+  /// Its kept sessions, when it keeps any.
+  final SessionCatalog? catalog;
+
+  KernelOption get option => KernelOption(id, label, icon, description);
+}
+
+/// The event plumbing adapters share: sequence numbers and a synchronous
+/// stream, so what a call causes is applied before it returns.
+mixin KernelEventSource {
+  final StreamController<KernelEvent> _events = StreamController.broadcast(
+    sync: true,
+  );
+  int _seq = 0;
+
+  Stream<KernelEvent> get events => _events.stream;
+
+  int get nextSeq => ++_seq;
+
+  void emit(KernelEvent event) {
+    if (!_events.isClosed) _events.add(event);
+  }
+
+  /// Tells listeners the kernel's own state changed.
+  void emitInfoChanged() => emit(KernelInfoChanged(nextSeq));
+
+  void closeEvents() => _events.close();
+}
+
+/// A [KernelChoiceSource] over a list the kernel keeps, for kernels that
+/// hold the choice themselves.
+class LocalChoice implements KernelChoiceSource {
+  LocalChoice(this.options, {this._selected, this.onChanged});
+
+  @override
+  List<KernelOption> options;
+  String? _selected;
+  final void Function(String id)? onChanged;
+
+  @override
+  String? get selected => _selected ?? options.firstOrNull?.id;
+
+  @override
+  void select(String id) {
+    if (id == selected) return;
+    _selected = id;
+    onChanged?.call(id);
+  }
+
+  /// What the kernel reports in effect, without asking for a change.
+  set reported(String? id) => _selected = id;
+}

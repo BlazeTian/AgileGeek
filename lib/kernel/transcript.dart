@@ -1,0 +1,414 @@
+import 'dart:math' as math;
+
+import '../chat/chat_models.dart';
+import 'kernel_event.dart';
+import 'kernel_types.dart';
+
+/// Local copy of a kernel's conversation, changed only by applying its
+/// events. Idempotent: an event at or below [lastSeq] is ignored, items are
+/// replaced by id and deltas land at their offset, so replaying events
+/// leaves it as it was.
+///
+/// It holds what was reported, nothing derived: statuses, tasks and pending
+/// changes are projections of it (see `ChatSession`).
+class Transcript {
+  Transcript({
+    int historyCount = 0,
+    this.history,
+    List<FileChange> changes = const [],
+    this.usage,
+    this.queuedInPlace = false,
+  }) : _historyCount = history == null ? 0 : historyCount,
+       edits = [
+         for (final change in changes) (seq: 0, change: change, turnId: null),
+       ];
+
+  /// Leading items of an earlier conversation, built on demand (it may be
+  /// huge). Their ids are their indexes.
+  final ChatItem Function(int index)? history;
+  int _historyCount;
+
+  final List<String> _ids = [];
+  final List<ChatItem> _items = [];
+  final Map<String, int> _indexOf = {};
+  final Set<String> _streaming = {};
+
+  /// Messages sent while the agent works, waiting their turn: not in the
+  /// conversation until taken up, where they go after all before them.
+  /// Unless [queuedInPlace].
+  final Map<String, UserMessageItem> _queued = {};
+
+  /// Whether a message sent while the agent works is in the conversation
+  /// at once, where it was sent (as a chat app has it), and stays there
+  /// when taken up: not apart until then.
+  final bool queuedInPlace;
+
+  /// Highest event sequence applied.
+  int lastSeq = 0;
+
+  /// Bumped on every change, to cache projections.
+  int version = 0;
+
+  /// How many items were put before the others ([HistoryPrepended]) in all:
+  /// what the indexes of those there were moved by.
+  int prepended = 0;
+
+  String? activeTurn;
+
+  /// When the turn under way began, as it was told.
+  DateTime? turnStartedAt;
+
+  /// What the agent is busy with out of sight, while a turn runs.
+  KernelActivity? activity;
+
+  /// What the model has written in the turn under way, and how fast.
+  TurnOutput? output;
+  final Set<String> _endedTurns = {};
+
+  /// Sequence of the last turn end; 0 before any.
+  int lastTurnEndSeq = 0;
+
+  /// Whether the last turn to end was stopped rather than done.
+  bool lastTurnInterrupted = false;
+
+  /// Whether the last turn to end was one the agent took up on its own
+  /// (see [TurnStarted.unprompted]).
+  bool lastTurnUnprompted = false;
+  bool _activeUnprompted = false;
+
+  /// Whether the turn under way is one the agent took up on its own.
+  bool get activeTurnUnprompted => activeTurn != null && _activeUnprompted;
+
+  final Map<String, InteractionRequest> _pending = {};
+
+  /// Every file change reported, with its sequence and turn, oldest
+  /// first.
+  final List<({int seq, FileChange change, String? turnId})> edits;
+
+  /// Changes at or below this sequence were reverted.
+  int revertedSeq = -1;
+
+  /// The plan the agent last wrote, and the sequence it was reported at
+  /// (higher with each writing).
+  ({String path, int seq})? plan;
+
+  ContextUsage? usage;
+  UsageStats? stats;
+  List<KernelTask> tasks = const [];
+
+  /// The session's goal, if it has one (or just met one).
+  KernelGoal? goal;
+
+  int get length => _historyCount + _items.length;
+
+  ChatItem itemAt(int index) =>
+      index < _historyCount ? history!(index) : _items[index - _historyCount];
+
+  bool get hasStreamingItem => _streaming.isNotEmpty;
+
+  /// Whether the item at [index] is still coming in.
+  bool isStreamingAt(int index) => _streaming.contains(idAt(index));
+
+  InteractionRequest? get pendingInteraction =>
+      _pending.isEmpty ? null : _pending.values.first;
+
+  /// The messages waiting their turn (see [UserMessageItem.queued]), with
+  /// their ids, the next first.
+  List<(String, UserMessageItem)> get queued => [
+    for (final MapEntry(:key, :value) in _queued.entries) (key, value),
+  ];
+
+  /// Puts the queued messages in the order [ids] gives; returns whether
+  /// that changed it.
+  bool _reorderQueued(List<String> ids) {
+    final order = <String, UserMessageItem>{
+      for (final id in ids) id: ?_queued[id],
+    };
+    // Those not named keep their places after them.
+    for (final MapEntry(:key, :value) in _queued.entries) {
+      order.putIfAbsent(key, () => value);
+    }
+    if (_sameOrder(order.keys, _queued.keys)) return false;
+    _queued
+      ..clear()
+      ..addAll(order);
+    return true;
+  }
+
+  static bool _sameOrder(Iterable<String> a, Iterable<String> b) {
+    final left = a.iterator;
+    final right = b.iterator;
+    while (true) {
+      final hasLeft = left.moveNext();
+      if (hasLeft != right.moveNext()) return false;
+      if (!hasLeft) return true;
+      if (left.current != right.current) return false;
+    }
+  }
+
+  /// The items of this session (not the earlier history), with their ids.
+  Iterable<(String, ChatItem)> get liveItems sync* {
+    for (var i = 0; i < _items.length; i++) {
+      yield (_ids[i], _items[i]);
+    }
+  }
+
+  /// Applies [event]; returns whether anything changed.
+  bool apply(KernelEvent event) {
+    if (event.seq <= lastSeq) return false;
+    lastSeq = event.seq;
+    switch (event) {
+      case TurnStarted(:final turnId, :final unprompted):
+        if (_endedTurns.contains(turnId)) return false;
+        activeTurn = turnId;
+        turnStartedAt = DateTime.now();
+        _activeUnprompted = unprompted;
+        output = null;
+      case TurnEnded(
+        :final turnId,
+        :final interrupted,
+        :final worked,
+        :final usage,
+      ):
+        if (!_endedTurns.add(turnId)) return false;
+        lastTurnUnprompted = activeTurn == turnId && _activeUnprompted;
+        if (activeTurn == turnId) {
+          activeTurn = null;
+          turnStartedAt = null;
+        }
+        activity = null;
+        output = null;
+        lastTurnEndSeq = event.seq;
+        lastTurnInterrupted = interrupted;
+        _pending.clear();
+        _settleStreaming();
+        if (worked != null) {
+          _timeTurn(turnId, worked, usage, stopped: interrupted);
+        }
+      case ItemUpserted(:final id, :final item, :final streaming):
+        _put(id, item);
+        streaming ? _streaming.add(id) : _streaming.remove(id);
+      case TextDelta(:final id, :final offset, :final text, :final tokens):
+        if (!_appendAt(id, offset, text, tokens)) return false;
+      case ItemCompleted(:final id, :final item):
+        if (item != null) _put(id, item);
+        if (!_streaming.remove(id) && item == null) return false;
+      case ItemRemoved(:final id):
+        if (!_remove(id)) return false;
+      case QueueReordered(:final ids):
+        if (!_reorderQueued(ids)) return false;
+      case HistoryPrepended(:final items):
+        if (!_prepend(items)) return false;
+      case InteractionRequested(:final request):
+        _pending[request.id] = request;
+      case InteractionResolved(:final requestId):
+        if (_pending.remove(requestId) == null) return false;
+      case FileEdited(:final change, :final turnId):
+        edits.add((seq: event.seq, change: change, turnId: turnId));
+      case PlanWritten(:final path):
+        plan = (path: path, seq: event.seq);
+      case ChangesReverted():
+        revertedSeq = event.seq;
+      case Rewound(:final index, :final itemId):
+        final at = switch (itemId == null ? null : _indexOf[itemId]) {
+          final live? => _historyCount + live,
+          null => index,
+        };
+        if (at == null) return false;
+        _truncate(at);
+      case ActivityReported(activity: final reported):
+        activity = reported;
+      case OutputReported(output: final reported):
+        output = reported;
+      case UsageReported(usage: final reported):
+        usage = reported;
+      case TasksReported(tasks: final reported):
+        tasks = reported;
+      case GoalReported(goal: final reported):
+        goal = reported;
+      case StatsReported(stats: final reported):
+        stats = reported;
+      // The session's, not the conversation's (see ChatSession.takeRenamed).
+      case KernelInfoChanged() || SessionRenamed():
+        return false;
+    }
+    version++;
+    return true;
+  }
+
+  void _put(String id, ChatItem item) {
+    final index = _indexOf[id];
+    if (index != null) {
+      _items[index] = switch ((_items[index], item)) {
+        // Taken up where it was sent: when it was.
+        (
+          UserMessageItem(queued: true, sentAt: final sent?),
+          final UserMessageItem taken,
+        )
+            when !taken.queued =>
+          UserMessageItem(
+            text: taken.text,
+            images: taken.images,
+            worked: taken.worked,
+            usage: taken.usage,
+            stopped: taken.stopped,
+            sentAt: sent,
+            fromAgent: taken.fromAgent,
+          ),
+        _ => item,
+      };
+      return;
+    }
+    if (item case UserMessageItem(queued: true) when !queuedInPlace) {
+      _queued[id] = item;
+      return;
+    }
+    // Taken up: after what came while it waited.
+    _queued.remove(id);
+    _indexOf[id] = _items.length;
+    _ids.add(id);
+    _items.add(item);
+  }
+
+  bool _prepend(List<(String, ChatItem)> items) {
+    final fresh = [
+      for (final (id, item) in items)
+        if (!_indexOf.containsKey(id)) (id, item),
+    ];
+    if (fresh.isEmpty) return false;
+    prepended += fresh.length;
+    _ids.insertAll(0, [for (final (id, _) in fresh) id]);
+    _items.insertAll(0, [for (final (_, item) in fresh) item]);
+    for (var i = 0; i < _ids.length; i++) {
+      _indexOf[_ids[i]] = i;
+    }
+    return true;
+  }
+
+  bool _remove(String id) {
+    if (_queued.remove(id) != null) return true;
+    final index = _indexOf.remove(id);
+    if (index == null) return false;
+    _items.removeAt(index);
+    _ids.removeAt(index);
+    _streaming.remove(id);
+    for (var i = index; i < _ids.length; i++) {
+      _indexOf[_ids[i]] = i;
+    }
+    return true;
+  }
+
+  /// Id of the item at [index]; null for the earlier history.
+  String? idAt(int index) =>
+      index < _historyCount ? null : _ids[index - _historyCount];
+
+  /// Item index of the item [id], if it is here.
+  int? indexOf(String id) => switch (_indexOf[id]) {
+    final index? => _historyCount + index,
+    null => null,
+  };
+
+  bool _appendAt(String id, int offset, String delta, int? deltaTokens) {
+    final index = _indexOf[id];
+    if (index == null) return false;
+    final item = _items[index];
+    final current = switch (item) {
+      AssistantTextItem(:final text) => text,
+      ThinkingItem(:final text) => text,
+      _ => null,
+    };
+    // A gap would lose text: the delta is out of order, so wait for the
+    // item to be completed whole.
+    if (current == null || offset > current.length) return false;
+    final fresh = offset + delta.length - current.length;
+    if (fresh <= 0) return false;
+    final merged = current + delta.substring(delta.length - fresh);
+    _items[index] = switch (item) {
+      ThinkingItem(:final tokens, :final seconds, :final startedAt) =>
+        ThinkingItem(
+          text: merged,
+          tokens: math.max(tokens, deltaTokens ?? 0),
+          seconds: seconds,
+          startedAt: startedAt,
+        ),
+      _ => AssistantTextItem(merged),
+    };
+    return true;
+  }
+
+  /// Keeps how long turn [id] took, and what it spent, on the message that
+  /// began it.
+  /// The message that started turn [turnId] (its item's id); null when it
+  /// is not listed.
+  UserMessageItem? turnMessage(String turnId) => switch (_indexOf[turnId]) {
+    final index? => switch (_items[index]) {
+      final UserMessageItem message => message,
+      _ => null,
+    },
+    null => null,
+  };
+
+  void _timeTurn(
+    String id,
+    Duration worked,
+    TurnUsage? usage, {
+    required bool stopped,
+  }) {
+    final index = _indexOf[id];
+    if (index == null) return;
+    if (_items[index] case final UserMessageItem message) {
+      _items[index] = message.copyWith(
+        worked: worked,
+        usage: usage,
+        stopped: stopped,
+      );
+    }
+  }
+
+  /// Settles whatever was left streaming when its turn ended: a thought
+  /// that never finished is shown as done.
+  void _settleStreaming() {
+    for (final id in _streaming) {
+      final index = _indexOf[id];
+      if (index == null) continue;
+      if (_items[index] case ThinkingItem(
+        :final text,
+        :final tokens,
+        :final startedAt,
+        seconds: null,
+      )) {
+        final took = switch (startedAt) {
+          final start? => DateTime.now().difference(start).inSeconds,
+          null => 0,
+        };
+        _items[index] = ThinkingItem(
+          text: text,
+          tokens: tokens,
+          seconds: math.max(1, took),
+        );
+      }
+    }
+    _streaming.clear();
+  }
+
+  void _truncate(int index) {
+    if (index < _historyCount) {
+      _historyCount = index;
+      _items.clear();
+      _ids.clear();
+      _indexOf.clear();
+    } else {
+      final from = index - _historyCount;
+      if (from >= _items.length) return;
+      for (final id in _ids.sublist(from)) {
+        _indexOf.remove(id);
+      }
+      _items.removeRange(from, _items.length);
+      _ids.removeRange(from, _ids.length);
+    }
+    _streaming.removeWhere((id) => !_indexOf.containsKey(id));
+    _pending.clear();
+    // What the dropped turns changed goes with them.
+    edits.clear();
+  }
+}

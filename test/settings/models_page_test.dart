@@ -1,0 +1,1752 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:agilegeek/icons/brand_logos.dart';
+import 'package:agilegeek/icons/project_icon.dart';
+import 'package:agilegeek/ide/ide_hover.dart';
+import 'package:agilegeek/ide/ide_button.dart';
+import 'package:agilegeek/ide/ide_back_button.dart';
+import 'package:agilegeek/ide/ide_spinning.dart';
+import 'package:agilegeek/kernel/claude_code/claude_core_setting.dart';
+import 'package:agilegeek/kernel/claude_code/claude_haiku.dart';
+import 'package:agilegeek/models/claude_resets.dart';
+import 'package:agilegeek/models/codex/codex_service.dart';
+import 'package:agilegeek/models/codex/codex_usage.dart';
+import 'package:agilegeek/models/magpie.dart';
+import 'package:agilegeek/models/magpie_follow.dart';
+import 'package:agilegeek/models/model_provider.dart';
+import 'package:agilegeek/models/model_providers.dart';
+import 'package:agilegeek/models/secret_store.dart';
+import 'package:agilegeek/models/upstream.dart';
+import 'package:agilegeek/settings/pages/model_dialogs.dart';
+import 'package:agilegeek/settings/pages/models_page.dart';
+import 'package:agilegeek/settings/pages/settings_widgets.dart';
+import 'package:agilegeek/workspace/workspace.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/chat/widgets/pixel_loader.dart';
+
+import '../models/claude_resets_test.dart';
+
+/// Accounts signed in to by hand: [finish] ends the sign-in under way.
+class _FakeCodex extends CodexService {
+  _FakeCodex(this.providers);
+
+  final ModelProviders providers;
+  final Map<String, CodexUsage> usages = {};
+  final List<String> removed = [];
+  int refreshed = 0;
+  final List<List<String>> quotaRequests = [];
+  Future<void> Function(ModelProvider)? onRefresh;
+  final imports = <(String, String, bool)>[];
+  List<CodexImportResult> importResults = const [];
+  Object? importFailure;
+  final importFinished = Completer<void>();
+  Completer<ProviderAccount>? _pending;
+
+  /// Whether sign-in finds its port free.
+  bool listening = true;
+  _FakeLogin? last;
+
+  void finish(ProviderAccount account) => _pending!.complete(account);
+
+  @override
+  Future<CodexLogin> login(String providerId) async {
+    final pending = _pending = Completer();
+    return last = _FakeLogin(
+      pending.future.then((account) async {
+        await providers.save(
+          providers.provider(providerId)!.withAccount(account),
+        );
+        notifyListeners();
+        return account;
+      }),
+      () {
+        if (!pending.isCompleted) pending.completeError(const CodexCancelled());
+      },
+    )..listening = listening;
+  }
+
+  @override
+  Future<List<CodexImportResult>> importAccountsJson(
+    String providerId,
+    String contents, {
+    required bool confirmed,
+  }) async {
+    imports.add((providerId, contents, confirmed));
+    try {
+      if (importFailure case final error?) throw error;
+      for (final result in importResults) {
+        if (result.account case final account?) {
+          await providers.save(
+            providers.provider(providerId)!.withAccount(account),
+          );
+        }
+      }
+      notifyListeners();
+      return importResults;
+    } finally {
+      importFinished.complete();
+    }
+  }
+
+  @override
+  Future<void> refreshUsage(ModelProvider provider, {bool force = true}) async {
+    refreshed++;
+    quotaRequests.add([for (final account in provider.accounts) account.id]);
+    await onRefresh?.call(provider);
+  }
+
+  @override
+  CodexUsage? usage(String providerId, String accountId) => usages[accountId];
+
+  @override
+  String? error(String providerId, String accountId) =>
+      accountId == 'b' ? 'Signed out: sign in again.' : null;
+
+  @override
+  DateTime? limitedUntil(String providerId, String accountId) => null;
+
+  @override
+  bool signedOut(String providerId, String accountId) => accountId == 'b';
+
+  @override
+  ProviderAccount? accountFor(ModelProvider provider, {String? session}) =>
+      null;
+
+  @override
+  DateTime? backAt(ModelProvider provider) => null;
+
+  @override
+  Future<void> removeAccount(String providerId, String accountId) async {
+    removed.add(accountId);
+    final provider = providers.provider(providerId)!;
+    await providers.save(
+      provider.copyWith(
+        accounts: [
+          for (final account in provider.accounts)
+            if (account.id != accountId) account,
+        ],
+      ),
+    );
+  }
+}
+
+class _FakeLogin implements CodexLogin {
+  _FakeLogin(this.result, this._cancel);
+
+  @override
+  final Uri url = Uri.parse('https://auth.openai.com/oauth/authorize?x=1');
+  @override
+  final Future<ProviderAccount> result;
+  final void Function() _cancel;
+  final submitted = <String>[];
+
+  @override
+  bool listening = true;
+
+  @override
+  void submit(String callback) => submitted.add(callback);
+
+  @override
+  void cancel() => _cancel();
+}
+
+void main() {
+  late ModelProviders providers;
+  late MemorySecretStore secrets;
+  late List<(String, String?)> listed;
+
+  setUp(() {
+    secrets = MemorySecretStore();
+    providers = ModelProviders.memory(secrets: secrets);
+    listed = [];
+  });
+
+  Future<List<RemoteModel>> list(ModelProvider provider, String? key) async {
+    listed.add((provider.id, key));
+    return const [
+      RemoteModel('gpt-5', contextWindow: 400000),
+      RemoteModel('gpt-5-mini'),
+      RemoteModel('o3'),
+    ];
+  }
+
+  Future<void> pump(
+    WidgetTester tester, {
+    CodexService? codex,
+    ModelTester testModel = testModelThroughClaudeCode,
+    Workspace? workspace,
+    MagpieFollow? magpie,
+    ClaudeResetsService? claudeResets,
+  }) async {
+    tester.view.physicalSize = const Size(1000, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ModelsSettingsPage(
+            providers: providers,
+            listModels: list,
+            testModel: testModel,
+            codex: codex,
+            workspace: workspace,
+            magpie: magpie,
+            claudeResets: claudeResets,
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+  }
+
+  Future<void> type(WidgetTester tester, String field, String text) async {
+    final input = find.descendant(
+      of: find.bySemanticsLabel(field),
+      matching: find.byType(EditableText),
+    );
+    await tester.tap(input.first);
+    await tester.enterText(input.first, text);
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+  }
+
+  testWidgets('the built-in provider is listed, hidden but not removed', (
+    tester,
+  ) async {
+    await pump(tester);
+    expect(find.text('Models'), findsWidgets);
+    expect(find.text("Claude Code (this machine's setup)"), findsOneWidget);
+    expect(find.text('Built-in'), findsOneWidget);
+    await tester.tap(find.byType(SettingsSwitch));
+    await tester.pump();
+    expect(providers.builtinHidden, isTrue);
+    await tester.tap(find.text("Claude Code (this machine's setup)"));
+    await tester.pump();
+    // No page of its own to open, nor delete.
+    expect(find.text('Connection'), findsNothing);
+  });
+
+  testWidgets('the built-in provider shows its limit resets; one is used '
+      'only once confirmed', (tester) async {
+    final api = FakeClaudeResetsApi(claudeUsageWithResets());
+    final service = ClaudeResetsService(
+      api,
+      now: () => DateTime.utc(2026, 11, 11, 2),
+    );
+    await pump(tester, claudeResets: service);
+    await tester.pump();
+    expect(find.text('2 resets'), findsOneWidget);
+
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    addTearDown(mouse.removePointer);
+    Future<void> hover() async {
+      await mouse.addPointer(location: Offset.zero);
+      await mouse.moveTo(tester.getCenter(find.text('2 resets')));
+      await tester.pump();
+      await tester.pump(ideHoverDelay + const Duration(milliseconds: 150));
+    }
+
+    await hover();
+    expect(find.text('Claude limit resets'), findsOneWidget);
+    expect(
+      find.text(
+        'Clears 5h (6% used), Weekly (43% used), Fable weekly (0% used)',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Usable now'), findsOneWidget);
+    // The other one, queued after it, has no button of its own.
+    expect(
+      find.textContaining('Waits its turn: usable once the one above is used'),
+      findsOneWidget,
+    );
+    expect(find.text('Use This One…'), findsOneWidget);
+
+    // Cancelled: nothing sent.
+    await tester.tap(find.text('Use This One…'));
+    await tester.pumpAndSettle();
+    expect(find.text('Use a Claude limit reset?'), findsOneWidget);
+    expect(
+      find.textContaining('One full limit reset (November 2026)'),
+      findsWidgets,
+    );
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(api.claims, isEmpty);
+
+    await mouse.removePointer();
+    await hover();
+    await tester.tap(find.text('Use This One…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Reset Now'));
+    await tester.pumpAndSettle();
+    expect(api.claims.single.$1, 'full-reset-2611');
+    expect(find.text('Reset: 5h, Weekly'), findsOneWidget);
+    await tester.tap(find.text('OK'));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('the usable reset is listed first; the server refusing it '
+      'as not the next one is told in plain words', (tester) async {
+    // The later expiring one is the server's next: it comes first.
+    final api = FakeClaudeResetsApi(
+      claudeUsageWithResets(next: 'launch-2610-fable'),
+    )..claimAnswer = {'result': 'ineligible', 'reason': 'not_next_grant'};
+    final service = ClaudeResetsService(
+      api,
+      now: () => DateTime.utc(2026, 11, 11, 2),
+    );
+    await pump(tester, claudeResets: service);
+    await tester.pump();
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    addTearDown(mouse.removePointer);
+    await mouse.addPointer(location: Offset.zero);
+    await mouse.moveTo(tester.getCenter(find.text('2 resets')));
+    await tester.pump();
+    await tester.pump(ideHoverDelay + const Duration(milliseconds: 150));
+    expect(
+      tester.getTopLeft(find.text('New model launch: one Fable reset')).dy,
+      lessThan(
+        tester.getTopLeft(find.text('One full limit reset (November 2026)')).dy,
+      ),
+    );
+    expect(find.text('Use This One…'), findsOneWidget);
+
+    await tester.tap(find.text('Use This One…'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Reset Now'));
+    await tester.pumpAndSettle();
+    expect(api.claims.single.$1, 'launch-2610-fable');
+    expect(
+      find.text(
+        'Another reset is the one usable now; nothing was used. '
+        'Refresh and try again.',
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('OK'));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('on AgileGeek\'s own core there is no built-in provider: '
+      'neither listed nor offered as the default', (tester) async {
+    ClaudeCore.current = () => ClaudeCore.builtin;
+    // Picked on the CLI: Claude Code's own default, and its Haiku.
+    await providers.setDefaultModel('default');
+    await providers.setAuxiliaryModel(builtinProviderId);
+    await pump(tester);
+    expect(find.text("Claude Code (this machine's setup)"), findsNothing);
+    expect(find.text('Built-in'), findsNothing);
+    // As for none: the last one picked, automatic.
+    expect(find.text('Last picked'), findsOneWidget);
+    expect(find.text('Automatic'), findsOneWidget);
+    await tester.tap(find.text('Last picked'));
+    await tester.pumpAndSettle();
+    expect(find.text('Claude Code default'), findsNothing);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Automatic'));
+    await tester.pumpAndSettle();
+    expect(find.text("Claude Code Haiku (this machine's setup)"), findsNothing);
+  });
+
+  testWidgets('a long model id shows whole, its context window after it '
+      '(#246)', (tester) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    const id = 'meta/muse-spark-1.3-contributor-preview-0915';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: FetchModelsDialog(
+            provider: const ModelProvider(
+              id: 'up',
+              name: 'Upstream',
+              baseUrl: 'https://up.dev',
+              auth: ProviderAuth.apiKey,
+              models: [],
+            ),
+            keyOf: () async => 'sk',
+            list: (_, _) async => const [
+              RemoteModel(id, contextWindow: 1000000),
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final row = find.textContaining(id, findRichText: true);
+    expect(row, findsOneWidget);
+    final paragraph = tester.renderObject<RenderParagraph>(row);
+    expect(paragraph.didExceedMaxLines, isFalse);
+    // Wider than the other dialogs: room for such ids.
+    expect(tester.getSize(find.byType(FetchModelsDialog)).width, 1400);
+    expect(
+      tester.getSize(find.byType(ModelDialogFrame)).width,
+      greaterThan(560),
+    );
+  });
+
+  testWidgets('an upstream is added, set up, its models fetched and its '
+      'roles picked', (tester) async {
+    await pump(tester);
+    await tester.tap(find.text('Add Upstream').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Connection'), findsOneWidget);
+    final id = providers.providers.single.id;
+    expect(providers.providers.single.disableNonessentialTraffic, isTrue);
+
+    await type(tester, 'Name', 'Gateway');
+    expect(providers.provider(id)!.name, 'Gateway');
+
+    // OpenAI's Chat Completions, through the proxy.
+    await tester.tap(find.text('Anthropic-compatible'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('OpenAI Chat Completions').last);
+    await tester.pumpAndSettle();
+    expect(providers.provider(id)!.protocol, ProviderProtocol.openaiChat);
+
+    await type(tester, 'Base URL', 'https://gw.example.com/v1');
+    expect(providers.provider(id)!.baseUrl, 'https://gw.example.com/v1');
+
+    // The key goes to the keychain, not the settings.
+    await type(tester, 'API Key', 'sk-secret');
+    await tester.pump();
+    expect(await secrets.read('provider.$id'), 'sk-secret');
+    expect(
+      providers.provider(id)!.toJson().toString(),
+      isNot(contains('sk-secret')),
+    );
+
+    await tester.tap(find.text('Test Connection').last);
+    await tester.pumpAndSettle();
+    expect(listed.last, (id, 'sk-secret'));
+    expect(find.text('Connected: the upstream lists 3 models.'), findsOne);
+
+    // Fetched, two of them checked.
+    await tester.tap(find.text('Fetch from Upstream…'));
+    await tester.pumpAndSettle();
+    expect(find.byType(FetchModelsDialog), findsOneWidget);
+    expect(find.text('0 of 3 checked'), findsOneWidget);
+    await tester.enterText(find.byType(EditableText).last, 'gpt');
+    await tester.pumpAndSettle();
+    expect(find.text('o3'), findsNothing);
+    await tester.tap(find.text('Select All'));
+    await tester.pumpAndSettle();
+    expect(find.text('2 of 3 checked'), findsOneWidget);
+    await tester.tap(find.text('Apply'));
+    await tester.pumpAndSettle();
+    final provider = providers.provider(id)!;
+    expect(provider.models.map((m) => (m.id, m.enabled)), [
+      ('gpt-5', true),
+      ('gpt-5-mini', true),
+      ('o3', false),
+    ]);
+    expect(provider.models.first.contextWindow, 400000);
+    expect(find.text('400K'), findsOneWidget);
+
+    // Only those checked are listed, unless all are shown.
+    expect(find.text('o3'), findsNothing);
+    await tester.tap(find.text('Show All (3)'));
+    await tester.pumpAndSettle();
+    expect(find.text('o3'), findsOneWidget);
+    await tester.tap(find.text('Show Checked Only'));
+    await tester.pumpAndSettle();
+    expect(find.text('o3'), findsNothing);
+
+    // Haiku unset: warned.
+    expect(
+      find.textContaining('Unset, background work runs on the model picked'),
+      findsOneWidget,
+    );
+    final haiku = find.ancestor(
+      of: find.text('Haiku Tier'),
+      matching: find.byType(Row),
+    );
+    await tester.tap(
+      find.descendant(of: haiku.first, matching: find.text('Unset')),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('gpt-5-mini').last);
+    await tester.pumpAndSettle();
+    expect(providers.provider(id)!.roles.haiku, 'gpt-5-mini');
+    expect(
+      find.textContaining('Unset, background work runs on the model picked'),
+      findsNothing,
+    );
+  });
+
+  testWidgets('an upstream shows its maker\'s logo until another icon is '
+      'picked for it', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'ds',
+        name: 'DS',
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        models: [ProviderModel(id: 'deepseek-chat')],
+      ),
+    );
+    final workspace = Workspace();
+    await pump(tester, workspace: workspace);
+    Finder logo(String name) => find.byWidgetPredicate(
+      (widget) => widget is BrandLogo && widget.name == name,
+    );
+    expect(logo('deepseek'), findsOneWidget);
+    expect(logo('anthropic'), findsOneWidget);
+
+    await tester.tap(find.text('DS'));
+    await tester.pump();
+    await tester.tap(find.bySemanticsLabel('Change Icon'));
+    await tester.pump();
+    // The makers' logos first, the site's icon among the pictures.
+    // The tab, and its section.
+    expect(find.text('Logos'), findsNWidgets(2));
+    await tester.tap(find.bySemanticsLabel('Kimi'));
+    await tester.pump();
+    expect(providers.provider('ds')!.icon, const BrandIcon('kimi'));
+    expect(workspace.recentIcons, [const BrandIcon('kimi')]);
+    expect(logo('kimi'), findsOneWidget);
+
+    await tester.tap(find.bySemanticsLabel('Change Icon'));
+    await tester.pump();
+    await tester.tap(find.text('Custom'));
+    await tester.pump();
+    expect(find.bySemanticsLabel("Use the site's icon"), findsOneWidget);
+    await tester.tap(find.text('Remove'));
+    await tester.pump();
+    expect(providers.provider('ds')!.icon, isNull);
+  });
+
+  testWidgets('an auxiliary model is picked', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        baseUrl: 'https://gw.example.com',
+        models: [ProviderModel(id: 'flash', label: 'Flash')],
+      ),
+    );
+    await pump(tester);
+    expect(find.text('Auxiliary Model'), findsOneWidget);
+    await tester.tap(find.text('Automatic'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Gateway').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Flash').last);
+    await tester.pumpAndSettle();
+    expect(providers.auxiliaryModel, '@gw/flash');
+    expect(find.text('Gateway · Flash'), findsOneWidget);
+  });
+
+  testWidgets('a model is added by hand, and edited', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        protocol: ProviderProtocol.openaiResponses,
+        baseUrl: 'https://gw.example.com/v1',
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('No models yet'), findsOneWidget);
+
+    await tester.tap(find.text('Add Model…'));
+    await tester.pumpAndSettle();
+    expect(find.byType(ModelEditDialog), findsOneWidget);
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    // An id is needed.
+    expect(find.byType(ModelEditDialog), findsOneWidget);
+
+    final fields = find.descendant(
+      of: find.byType(ModelEditDialog),
+      matching: find.byType(EditableText),
+    );
+    await tester.enterText(fields.at(0), 'my-model');
+    await tester.enterText(fields.at(1), 'Mine');
+    // Its endpoint URL (2) left to its upstream's.
+    await tester.enterText(fields.at(3), '128k');
+    // An effort taken off, a context added: its own lists.
+    await tester.tap(
+      find.byWidgetPredicate(
+        (widget) => widget is IdeActionButton && widget.tooltip == 'Remove Max',
+      ),
+    );
+    await tester.pump();
+    await tester.enterText(fields.at(5), '64k');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+    await tester.ensureVisible(find.text('Does not take images'));
+    await tester.tap(find.text('Does not take images'));
+    await tester.pump();
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    expect(
+      providers.provider('gw')!.models.single,
+      const ProviderModel(
+        id: 'my-model',
+        label: 'Mine',
+        contextWindow: 128000,
+        efforts: ['none', 'low', 'medium', 'high', 'xhigh'],
+        contexts: [
+          64000,
+          200000,
+          256000,
+          300000,
+          400000,
+          500000,
+          800000,
+          1000000,
+        ],
+        images: false,
+        custom: true,
+      ),
+    );
+    expect(find.text('Manual'), findsOneWidget);
+    expect(find.text('Does not take images'), findsOneWidget);
+    expect(find.text('128K'), findsOneWidget);
+  });
+
+  testWidgets('a model is tested from its menu, those listed all at once', (
+    tester,
+  ) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        baseUrl: 'https://gw.example.com',
+        // Listed by name: down first.
+        models: [
+          ProviderModel(id: 'up'),
+          ProviderModel(id: 'down'),
+        ],
+      ),
+    );
+    final asked = <String>[];
+    final replies = <String, Completer<ClaudeTimedAnswer>>{};
+    var cancelled = false;
+    Future<ClaudeTimedAnswer> testModel(
+      ModelProvider provider,
+      ProviderModel model, {
+      Future<void>? cancel,
+    }) {
+      asked.add('${provider.id}/${model.id}');
+      unawaited(cancel?.then((_) => cancelled = true));
+      return (replies[model.id] = Completer()).future;
+    }
+
+    // First text at 0.8s, the rest at 50 tokens a second.
+    const answer = ClaudeTimedAnswer(
+      '1 2 3',
+      firstText: Duration(milliseconds: 800),
+      lastText: Duration(milliseconds: 2800),
+      outputTokens: 100,
+    );
+    final timed = find.text('First token 0.8s · 50 tok/s');
+    await pump(tester, testModel: testModel);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find
+          .byWidgetPredicate(
+            (widget) =>
+                widget is IdeActionButton && widget.tooltip == 'More Actions',
+          )
+          .first,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Test'));
+    // Run as the menu has closed.
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump();
+    expect(asked, ['gw/down']);
+    expect(find.byType(PixelLoader), findsOneWidget);
+    replies['down']!.complete(answer);
+    await tester.pumpAndSettle();
+    expect(find.byType(PixelLoader), findsNothing);
+    expect(timed, findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (w) => w is IdeHover && w.message == 'Total 2.8s\n\n1 2 3',
+      ),
+      findsOneWidget,
+    );
+
+    // All of them; one fails, and says why.
+    await tester.tap(find.text('Test All'));
+    await tester.pump();
+    expect(asked, ['gw/down', 'gw/down', 'gw/up']);
+    expect(find.byType(PixelLoader), findsNWidgets(2));
+    replies['down']!.complete(answer);
+    replies['up']!.completeError(Exception('401 Unauthorized'));
+    await tester.pumpAndSettle();
+    expect(timed, findsOneWidget);
+    expect(find.text('Failed'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (w) => w is IdeHover && '${w.message}'.contains('401 Unauthorized'),
+      ),
+      findsOneWidget,
+    );
+
+    // A test under way stops as the page closes.
+    await tester.tap(find.text('Test All'));
+    await tester.pump();
+    expect(cancelled, isFalse);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+    expect(cancelled, isTrue);
+  });
+
+  testWidgets('subagents may run on another upstream\'s model, and are '
+      'warned once it is gone', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'an',
+        name: 'Claude',
+        baseUrl: 'https://api.anthropic.com',
+        models: [ProviderModel(id: 'claude-opus-4-5')],
+      ),
+    );
+    await providers.save(
+      const ModelProvider(
+        id: 'ds',
+        name: 'DeepSeek',
+        protocol: ProviderProtocol.openaiChat,
+        baseUrl: 'https://api.deepseek.com',
+        models: [ProviderModel(id: 'deepseek-chat')],
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Claude').last);
+    await tester.pumpAndSettle();
+
+    Finder subagents() => find
+        .ancestor(of: find.text('Subagents'), matching: find.byType(Row))
+        .first;
+    await tester.ensureVisible(subagents());
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.descendant(of: subagents(), matching: find.text('Unset')),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('DeepSeek').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('deepseek-chat').last);
+    await tester.pumpAndSettle();
+    expect(providers.provider('an')!.roles.subagent, '@ds/deepseek-chat');
+    expect(providers.provider('an')!.throughProxy, isTrue);
+    expect(find.text('DeepSeek · deepseek-chat'), findsOneWidget);
+    expect(find.textContaining('no longer one of'), findsNothing);
+
+    // The model gone from its upstream: warned, kept as it was picked.
+    await providers.save(providers.provider('ds')!.copyWith(models: const []));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('no longer one of'), findsOneWidget);
+    expect(providers.provider('an')!.roles.subagent, '@ds/deepseek-chat');
+  });
+
+  testWidgets('every role but the main model may pick another upstream\'s '
+      'model, unset once that model is removed there', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'an',
+        name: 'Claude',
+        baseUrl: 'https://api.anthropic.com',
+        models: [ProviderModel(id: 'claude-opus-4-5')],
+      ),
+    );
+    await providers.save(
+      const ModelProvider(
+        id: 'ds',
+        name: 'DeepSeek',
+        protocol: ProviderProtocol.openaiChat,
+        baseUrl: 'https://api.deepseek.com',
+        models: [
+          ProviderModel(id: 'deepseek-chat'),
+          ProviderModel(id: 'deepseek-reasoner'),
+        ],
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Claude').last);
+    await tester.pumpAndSettle();
+
+    Finder row(String label) =>
+        find.ancestor(of: find.text(label), matching: find.byType(Row)).first;
+    Future<void> pick(String role, String upstream, String model) async {
+      await tester.ensureVisible(row(role));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.descendant(of: row(role), matching: find.text('Unset')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(upstream).last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(model).last);
+      await tester.pumpAndSettle();
+    }
+
+    await pick('Opus Tier', 'DeepSeek', 'deepseek-reasoner');
+    await pick('Sonnet Tier', 'DeepSeek', 'deepseek-chat');
+    await pick('Haiku Tier', 'DeepSeek', 'deepseek-chat');
+    var roles = providers.provider('an')!.roles;
+    expect(
+      (roles.opus, roles.sonnet, roles.haiku),
+      ('@ds/deepseek-reasoner', '@ds/deepseek-chat', '@ds/deepseek-chat'),
+    );
+    expect(providers.provider('an')!.throughProxy, isTrue);
+    expect(find.text('DeepSeek · deepseek-reasoner'), findsOneWidget);
+    expect(find.text('DeepSeek · deepseek-chat'), findsNWidgets(2));
+    // The Haiku warning is for one unset.
+    expect(
+      find.textContaining('Unset, background work runs on the model picked'),
+      findsNothing,
+    );
+
+    // The main model stands in on this upstream: its own models only.
+    await tester.ensureVisible(row('Main Model'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.descendant(of: row('Main Model'), matching: find.text('Unset')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('claude-opus-4-5'), findsWidgets);
+    expect(find.text('DeepSeek'), findsNothing);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    // A model removed on its upstream's page: the roles on it unset.
+    await tester.tap(find.byType(IdeBackButton));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('DeepSeek').last);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find
+          .byWidgetPredicate(
+            (widget) =>
+                widget is IdeActionButton && widget.tooltip == 'More Actions',
+          )
+          .first,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove').last);
+    await tester.pumpAndSettle();
+    expect(providers.provider('ds')!.models.map((m) => m.id), [
+      'deepseek-reasoner',
+    ]);
+    roles = providers.provider('an')!.roles;
+    expect(
+      (roles.opus, roles.sonnet, roles.haiku),
+      ('@ds/deepseek-reasoner', null, null),
+    );
+  });
+
+  testWidgets('a model is spoken to at an endpoint of its own, or its '
+      'upstream\'s again', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Relay',
+        protocol: ProviderProtocol.openaiChat,
+        baseUrl: 'https://relay.example/v1',
+        models: [ProviderModel(id: 'claude-sonnet-4-5')],
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Relay'));
+    await tester.pumpAndSettle();
+    expect(find.text('Anthropic'), findsNothing);
+
+    Future<void> edit(String from, String to) async {
+      await tester.tap(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is IdeActionButton && widget.tooltip == 'More Actions',
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Edit…'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ModelEditDialog), findsOneWidget);
+      await tester.tap(
+        find.descendant(
+          of: find.byType(ModelEditDialog),
+          matching: find.text(from),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(to).last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+    }
+
+    await edit(
+      'As the upstream (OpenAI Chat Completions)',
+      'Anthropic-compatible',
+    );
+    var provider = providers.provider('gw')!;
+    expect(provider.models.single.protocol, ProviderProtocol.anthropic);
+    expect(
+      provider.protocolOf(provider.models.single),
+      ProviderProtocol.anthropic,
+    );
+    expect(find.text('Anthropic'), findsOneWidget);
+    // Its auth set for it, under Advanced.
+    await tester.ensureVisible(find.text('Advanced'));
+    await tester.tap(find.text('Advanced'));
+    await tester.pumpAndSettle();
+    expect(find.text('Authentication'), findsOneWidget);
+    expect(find.text('Send Reasoning Back'), findsOneWidget);
+
+    await edit(
+      'Anthropic-compatible',
+      'As the upstream (OpenAI Chat Completions)',
+    );
+    provider = providers.provider('gw')!;
+    expect(provider.models.single.protocol, isNull);
+    expect(find.text('Anthropic'), findsNothing);
+    expect(find.text('Authentication'), findsNothing);
+  });
+
+  testWidgets('a ChatGPT upstream\'s models have no endpoint of their own', (
+    tester,
+  ) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'cx',
+        name: 'ChatGPT',
+        protocol: ProviderProtocol.codex,
+        models: [ProviderModel(id: 'gpt-5.5')],
+      ),
+    );
+    await pump(tester, codex: _FakeCodex(providers));
+    await tester.tap(find.text('ChatGPT').last);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is IdeActionButton && widget.tooltip == 'More Actions',
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Edit…'));
+    await tester.pumpAndSettle();
+    expect(find.byType(ModelEditDialog), findsOneWidget);
+    expect(find.text('Endpoint'), findsNothing);
+  });
+
+  testWidgets('Fast is not a provider-wide setting', (tester) async {
+    for (final (id, name, protocol) in [
+      ('gw', 'Gateway', ProviderProtocol.openaiResponses),
+      ('cx', 'ChatGPT', ProviderProtocol.codex),
+    ]) {
+      await providers.save(
+        ModelProvider(id: id, name: name, protocol: protocol),
+      );
+    }
+    await pump(tester);
+
+    for (final name in ['Gateway', 'ChatGPT']) {
+      await tester.tap(find.text(name).last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Advanced'));
+      await tester.pumpAndSettle();
+      expect(find.bySemanticsLabel('Fast Mode'), findsNothing);
+      await tester.tap(find.byType(IdeBackButton).last);
+      await tester.pumpAndSettle();
+    }
+  });
+
+  testWidgets('custom request headers are set, and a variable expression '
+      'kept', (tester) async {
+    await providers.save(
+      const ModelProvider(id: 'gw', name: 'Gateway', baseUrl: 'https://gw'),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Advanced'));
+    await tester.pumpAndSettle();
+    expect(find.text('Custom Headers'), findsOneWidget);
+    await tester.ensureVisible(find.bySemanticsLabel('Custom Headers'));
+    await tester.pumpAndSettle();
+    await type(
+      tester,
+      'Custom Headers',
+      'x-session-id: {{CLAUDE_SESSION_ID}}\nAuthorization: Bearer nope',
+    );
+    // The auth header a custom one may not be: left out.
+    expect(providers.provider('gw')!.headers, {
+      'x-session-id': '{{CLAUDE_SESSION_ID}}',
+    });
+  });
+
+  testWidgets('an upstream\'s own addresses, folded under its connection, '
+      'and a model\'s own apart from its endpoint type', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        protocol: ProviderProtocol.openaiChat,
+        baseUrl: 'http://10.0.0.1/api/v1/openai/v1',
+        models: [ProviderModel(id: 'm')],
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    expect(find.text('Models URL'), findsNothing);
+    await tester.ensureVisible(find.text('Custom URLs'));
+    await tester.tap(find.text('Custom URLs'));
+    await tester.pumpAndSettle();
+    // What the base URL makes, while none is set.
+    expect(
+      find.text('http://10.0.0.1/api/v1/openai/v1/models'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('http://10.0.0.1/api/v1/openai/v1/chat/completions'),
+      findsOneWidget,
+    );
+    await type(tester, 'Models URL', 'http://10.0.0.1/api/models');
+    await type(tester, 'Endpoint URL', 'http://10.0.0.1/api/chat');
+    var provider = providers.provider('gw')!;
+    expect(provider.modelsUrl, 'http://10.0.0.1/api/models');
+    expect(provider.endpointUrl, 'http://10.0.0.1/api/chat');
+
+    await tester.ensureVisible(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is IdeActionButton && widget.tooltip == 'More Actions',
+      ),
+    );
+    await tester.tap(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is IdeActionButton && widget.tooltip == 'More Actions',
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Edit…'));
+    await tester.pumpAndSettle();
+    final dialog = find.byType(ModelEditDialog);
+    // Its upstream's endpoint, while it has none of its own.
+    expect(
+      find.descendant(
+        of: dialog,
+        matching: find.text('http://10.0.0.1/api/chat'),
+      ),
+      findsOneWidget,
+    );
+    final input = find.descendant(
+      of: find.descendant(
+        of: dialog,
+        matching: find.bySemanticsLabel('Endpoint URL'),
+      ),
+      matching: find.byType(EditableText),
+    );
+    await tester.enterText(input.first, ' http://10.0.0.1/m ');
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+    provider = providers.provider('gw')!;
+    expect(provider.models.single.endpointUrl, 'http://10.0.0.1/m');
+    // Its endpoint type as it was: the upstream's.
+    expect(provider.models.single.protocol, isNull);
+  });
+
+  testWidgets('deleting an upstream asks first, and takes its key', (
+    tester,
+  ) async {
+    await providers.save(const ModelProvider(id: 'gw', name: 'Gateway'));
+    await providers.setKey('gw', 'sk');
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Advanced'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('Delete Upstream').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Delete Upstream').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Delete “Gateway”?'), findsOneWidget);
+    await tester.tap(find.text('Delete'));
+    await tester.pumpAndSettle();
+    expect(providers.providers, isEmpty);
+    expect(await secrets.read('provider.gw'), isNull);
+    expect(find.text('Add Upstream'), findsWidgets);
+  });
+
+  testWidgets('an upstream duplicated: its models, settings and key, '
+      'opened in its place (#177)', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        baseUrl: 'https://gw',
+        headers: {'x-team': 'a'},
+        models: [ProviderModel(id: 'up', contextWindow: 400000)],
+      ),
+    );
+    await providers.setKey('gw', 'sk');
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Advanced'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('Duplicate Upstream').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Duplicate Upstream').last);
+    await tester.pumpAndSettle();
+    final copy = providers.providers.last;
+    expect(copy.id, isNot('gw'));
+    expect(copy.name, 'Gateway Copy');
+    expect(copy.baseUrl, 'https://gw');
+    expect(copy.headers, {'x-team': 'a'});
+    expect(copy.models.single.contextWindow, 400000);
+    expect(await providers.key(copy.id), 'sk');
+    expect(find.text('Gateway Copy'), findsWidgets);
+    expect(providers.provider('gw'), isNotNull);
+  });
+
+  testWidgets('the models gone upstream are removed at once, asked first, '
+      'and their roles with them', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        baseUrl: 'https://gw',
+        models: [
+          ProviderModel(id: 'up'),
+          ProviderModel(id: 'old', missing: true),
+          ProviderModel(id: 'older', missing: true),
+        ],
+        roles: ProviderRoles(main: 'up', haiku: 'old'),
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remove Gone (2)'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Remove 2 models the upstream no longer lists?'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Remove').last);
+    await tester.pumpAndSettle();
+    final provider = providers.provider('gw')!;
+    expect(provider.models.map((m) => m.id), ['up']);
+    expect((provider.roles.main, provider.roles.haiku), ('up', null));
+    expect(find.textContaining('Remove Gone'), findsNothing);
+  });
+
+  testWidgets('a model duplicated: added as it is, under another id (#177)', (
+    tester,
+  ) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'gw',
+        name: 'Gateway',
+        baseUrl: 'https://gw',
+        models: [
+          ProviderModel(id: 'up', contextWindow: 400000, efforts: ['high']),
+        ],
+      ),
+    );
+    await pump(tester);
+    await tester.tap(find.text('Gateway'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is IdeActionButton && widget.tooltip == 'More Actions',
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Duplicate…'));
+    await tester.pumpAndSettle();
+    expect(find.text('Add Model'), findsOneWidget);
+    await type(tester, 'Model ID', 'up-fast');
+    await tester.pumpAndSettle();
+    final models = providers.provider('gw')!.models;
+    expect(models.map((m) => m.id), ['up', 'up-fast']);
+    expect(models.last.contextWindow, 400000);
+    expect(models.last.efforts, ['high']);
+    expect(models.last.custom, isTrue);
+  });
+
+  testWidgets('a ChatGPT upstream signs in to accounts, shows their quota, '
+      'and balances them', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'cx',
+        name: 'ChatGPT',
+        protocol: ProviderProtocol.codex,
+        accounts: [
+          ProviderAccount(id: 'a', email: 'a@example.com', plan: 'plus'),
+        ],
+      ),
+    );
+    final codex = _FakeCodex(providers);
+    codex.usages['a'] = CodexUsage(
+      at: DateTime.now(),
+      primary: CodexWindow(
+        usedPercent: 42,
+        minutes: 300,
+        resetsAt: DateTime.now().add(const Duration(minutes: 90)),
+      ),
+      secondary: const CodexWindow(usedPercent: 7, minutes: 10080),
+    );
+    await pump(tester, codex: codex);
+    expect(find.textContaining('1 account'), findsOneWidget);
+    await tester.tap(find.text('ChatGPT'));
+    await tester.pumpAndSettle();
+
+    // Signed in to, not a URL and a key.
+    expect(find.text('Base URL'), findsNothing);
+    expect(find.text('API Key'), findsNothing);
+    expect(codex.refreshed, 1);
+    expect(find.text('a@example.com'), findsOneWidget);
+    expect(find.text('Plus'), findsOneWidget);
+    expect(find.text('5h'), findsOneWidget);
+    expect(find.text('Weekly'), findsOneWidget);
+    expect(find.textContaining('42% used · resets in 1 h '), findsOne);
+    expect(find.text('7% used'), findsOneWidget);
+    // One account: nothing to balance.
+    expect(find.text('Load Balancing'), findsNothing);
+
+    await tester.tap(find.text('Add Account').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Waiting for sign-in…'), findsOneWidget);
+    expect(find.text('Copy Link'), findsOneWidget);
+    codex.finish(const ProviderAccount(id: 'b', email: 'b@example.com'));
+    await tester.pumpAndSettle();
+    expect(find.text('Waiting for sign-in…'), findsNothing);
+    expect(find.text('b@example.com'), findsOneWidget);
+    expect(find.text('Signed out: sign in again.'), findsOneWidget);
+    expect(find.text('Quota not known yet'), findsNothing);
+
+    // Two: balanced, as picked.
+    expect(find.text('Load Balancing'), findsOneWidget);
+    expect(find.text('Round Robin'), findsOneWidget);
+    await tester.tap(find.text('Round Robin'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Most Remaining').last);
+    await tester.pumpAndSettle();
+    expect(providers.provider('cx')!.balance, AccountBalance.mostRemaining);
+
+    await tester.tap(find.bySemanticsLabel('Use a@example.com'));
+    await tester.pumpAndSettle();
+    expect(providers.provider('cx')!.account('a')!.enabled, isFalse);
+
+    await tester.tap(find.byTooltip('Remove account').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Remove “b@example.com”?'), findsOneWidget);
+    await tester.tap(find.text('Remove account').last);
+    await tester.pumpAndSettle();
+    expect(codex.removed, ['b']);
+    expect(providers.provider('cx')!.accounts.map((a) => a.id), ['a']);
+  });
+
+  group('per-account quota refresh', () {
+    Future<_FakeCodex> openAccounts(WidgetTester tester) async {
+      await providers.save(
+        const ModelProvider(
+          id: 'cx',
+          name: 'ChatGPT',
+          protocol: ProviderProtocol.codex,
+          accounts: [
+            ProviderAccount(id: 'a', email: 'a@example.com'),
+            ProviderAccount(id: 'b', email: 'b@example.com', enabled: false),
+          ],
+        ),
+      );
+      final codex = _FakeCodex(providers);
+      await pump(tester, codex: codex);
+      await tester.tap(find.text('ChatGPT'));
+      await tester.pumpAndSettle();
+      codex.quotaRequests.clear();
+      return codex;
+    }
+
+    Finder refresh(String email) => find.byWidgetPredicate(
+      (widget) =>
+          widget is IdeActionButton &&
+          widget.tooltip == 'Refresh quota for $email',
+    );
+    Finder refreshAll() => find.widgetWithText(IdeButton, 'Refresh All Quotas');
+
+    testWidgets(
+      'each row refreshes only its own account; all stays available',
+      (tester) async {
+        final codex = await openAccounts(tester);
+        await tester.tap(refresh('a@example.com'));
+        await tester.pumpAndSettle();
+        expect(codex.quotaRequests, [
+          ['a'],
+        ]);
+        // Disabled accounts can still have their quota queried by hand.
+        await tester.tap(refresh('b@example.com'));
+        await tester.pumpAndSettle();
+        expect(codex.quotaRequests, [
+          ['a'],
+          ['b'],
+        ]);
+        await tester.tap(refreshAll());
+        await tester.pumpAndSettle();
+        expect(codex.quotaRequests, [
+          ['a'],
+          ['b'],
+          ['a', 'b'],
+        ]);
+      },
+    );
+
+    testWidgets('a busy account is disabled while another can refresh', (
+      tester,
+    ) async {
+      final codex = await openAccounts(tester);
+      final pending = Completer<void>();
+      codex.onRefresh = (provider) async {
+        if (provider.accounts.single.id == 'a') await pending.future;
+      };
+      await tester.tap(refresh('a@example.com'));
+      await tester.pump();
+      final busy = tester.widget<IdeActionButton>(refresh('a@example.com'));
+      expect(busy.onPressed, isNull);
+      expect(busy.iconWidget, isA<IdeSpinning>());
+      expect(
+        tester.widget<IdeActionButton>(refresh('b@example.com')).onPressed,
+        isNotNull,
+      );
+      expect(tester.widget<IdeButton>(refreshAll()).onPressed, isNull);
+      await tester.tap(refresh('a@example.com'));
+      await tester.pump();
+      expect(codex.quotaRequests, [
+        ['a'],
+      ]);
+      await tester.tap(refresh('b@example.com'));
+      await tester.pump();
+      expect(codex.quotaRequests, [
+        ['a'],
+        ['b'],
+      ]);
+      pending.complete();
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<IdeActionButton>(refresh('a@example.com')).onPressed,
+        isNotNull,
+      );
+      expect(
+        tester.widget<IdeActionButton>(refresh('a@example.com')).iconWidget,
+        isNull,
+      );
+      expect(tester.widget<IdeButton>(refreshAll()).onPressed, isNotNull);
+    });
+
+    testWidgets('refresh all disables per-account buttons until it finishes', (
+      tester,
+    ) async {
+      final codex = await openAccounts(tester);
+      final pending = Completer<void>();
+      codex.onRefresh = (_) => pending.future;
+      await tester.tap(refreshAll());
+      await tester.pump();
+      expect(codex.quotaRequests, [
+        ['a', 'b'],
+      ]);
+      expect(tester.widget<IdeButton>(refreshAll()).spinning, isTrue);
+      expect(
+        tester.widget<IdeActionButton>(refresh('a@example.com')).onPressed,
+        isNull,
+      );
+      expect(
+        tester.widget<IdeActionButton>(refresh('b@example.com')).onPressed,
+        isNull,
+      );
+      pending.complete();
+      await tester.pumpAndSettle();
+      expect(tester.widget<IdeButton>(refreshAll()).spinning, isFalse);
+      expect(
+        tester.widget<IdeActionButton>(refresh('a@example.com')).onPressed,
+        isNotNull,
+      );
+      expect(
+        tester.widget<IdeActionButton>(refresh('b@example.com')).onPressed,
+        isNotNull,
+      );
+    });
+  });
+
+  group('ChatGPT account import', () {
+    late Directory directory;
+
+    setUp(() {
+      directory = Directory.systemTemp.createTempSync(
+        'agilegeek-account-import-',
+      );
+    });
+
+    tearDown(() => directory.deleteSync(recursive: true));
+
+    Future<void> openImport(
+      WidgetTester tester,
+      _FakeCodex codex,
+      List<String> picked, {
+      bool input = false,
+    }) async {
+      final messenger = tester.binding.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(
+        const MethodChannel('agilegeek/window'),
+        (call) async {
+          if (call.method != 'pickOpenFiles') return null;
+          expect(input, isFalse);
+          expect(call.arguments, {'multiple': false});
+          return picked;
+        },
+      );
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(
+          const MethodChannel('agilegeek/window'),
+          null,
+        ),
+      );
+      await providers.save(
+        const ModelProvider(
+          id: 'cx',
+          name: 'ChatGPT',
+          protocol: ProviderProtocol.codex,
+        ),
+      );
+      await pump(tester, codex: codex);
+      await tester.tap(find.text('ChatGPT'));
+      await tester.pumpAndSettle();
+      final label = input ? 'Enter JSON…' : 'Choose File…';
+      await tester.ensureVisible(find.text(label).last);
+      await tester.tap(find.text(label).last);
+      await tester.pumpAndSettle();
+    }
+
+    Future<void> confirmImport(WidgetTester tester, _FakeCodex codex) async {
+      await tester.tap(find.text('Import').last);
+      // File I/O uses real time; the dialog and its continuations use the
+      // widget test's clock. Let both advance, without awaiting a fake-time
+      // completer from runAsync.
+      for (var i = 0; i < 100 && !codex.importFinished.isCompleted; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      expect(codex.importFinished.isCompleted, isTrue);
+      await tester.pumpAndSettle();
+    }
+
+    Finder jsonInput() => find.descendant(
+      of: find.byType(ModelDialogFrame),
+      matching: find.byType(EditableText),
+    );
+
+    testWidgets(
+      'empty input is disabled and cancel discards typed credentials',
+      (tester) async {
+        final codex = _FakeCodex(providers);
+        await openImport(tester, codex, [], input: true);
+        expect(
+          tester.widget<EditableText>(jsonInput()).maxLines,
+          anyOf(isNull, greaterThan(1)),
+        );
+        await tester.enterText(jsonInput(), '  ');
+        await tester.pump();
+        expect(
+          tester
+              .widget<IdeButton>(find.widgetWithText(IdeButton, 'Import').last)
+              .onPressed,
+          isNull,
+        );
+        await tester.enterText(
+          jsonInput(),
+          '{"refresh_token":"secret-discarded"}',
+        );
+        await tester.pump();
+        expect(codex.imports, isEmpty);
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+        expect(codex.imports, isEmpty);
+        expect(find.textContaining('secret-discarded'), findsNothing);
+        await tester.tap(find.text('Enter JSON…').last);
+        await tester.pumpAndSettle();
+        expect(
+          tester.widget<EditableText>(jsonInput()).controller.text,
+          isEmpty,
+        );
+        await tester.tap(find.text('Cancel'));
+        await tester.pumpAndSettle();
+      },
+      variant: TargetPlatformVariant({TargetPlatform.macOS}),
+    );
+
+    for (final (kind, contents) in const [
+      ('single', '{\n  "refresh_token": "secret-typed"\n}'),
+      (
+        'multiple',
+        '[\n  {"refresh_token": "secret-a"},\n  {"refresh_token": "secret-b"}\n]',
+      ),
+    ]) {
+      testWidgets('typed $kind JSON uses the shared account import service', (
+        tester,
+      ) async {
+        final codex = _FakeCodex(providers)
+          ..importResults = [
+            const CodexImportResult.added(
+              ProviderAccount(id: 'typed-a', email: 'a@example.com'),
+            ),
+            if (kind == 'multiple')
+              const CodexImportResult.added(
+                ProviderAccount(id: 'typed-b', email: 'b@example.com'),
+              ),
+          ];
+        await openImport(tester, codex, [], input: true);
+        await tester.enterText(jsonInput(), contents);
+        await tester.pump();
+        expect(codex.imports, isEmpty);
+        await confirmImport(tester, codex);
+        expect(codex.imports, [('cx', contents, true)]);
+        expect(codex.refreshed, 0);
+        expect(
+          find.text('Accounts imported: ${codex.importResults.length}'),
+          findsOneWidget,
+        );
+        expect(find.textContaining('secret-'), findsNothing);
+        expect(find.byType(ModelDialogFrame), findsNothing);
+      }, variant: TargetPlatformVariant({TargetPlatform.macOS}));
+    }
+
+    testWidgets('typed JSON errors do not keep credentials on the page', (
+      tester,
+    ) async {
+      final codex = _FakeCodex(providers)
+        ..importFailure = const CodexException('Invalid JSON credentials.');
+      await openImport(tester, codex, [], input: true);
+      await tester.enterText(jsonInput(), 'secret-invalid-input');
+      await tester.pump();
+      await confirmImport(tester, codex);
+      expect(find.text('Invalid JSON credentials.'), findsOneWidget);
+      expect(find.textContaining('secret-invalid-input'), findsNothing);
+      expect(providers.provider('cx')!.accounts, isEmpty);
+    }, variant: TargetPlatformVariant({TargetPlatform.macOS}));
+
+    testWidgets('canceling file selection never calls the import service', (
+      tester,
+    ) async {
+      final codex = _FakeCodex(providers);
+      await openImport(tester, codex, []);
+      expect(find.text('Import these ChatGPT credentials?'), findsNothing);
+      expect(codex.imports, isEmpty);
+      expect(providers.provider('cx')!.accounts, isEmpty);
+    }, variant: TargetPlatformVariant({TargetPlatform.macOS}));
+
+    testWidgets('canceling confirmation never reads or imports the file', (
+      tester,
+    ) async {
+      final codex = _FakeCodex(providers);
+      // Not readable: cancel must not try to open it.
+      await openImport(tester, codex, ['${directory.path}/absent.json']);
+      expect(find.text('Import these ChatGPT credentials?'), findsOneWidget);
+      expect(
+        find.textContaining('without changing the original file'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('rotate the refresh token'), findsOneWidget);
+      expect(codex.imports, isEmpty);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(codex.imports, isEmpty);
+      expect(
+        find.text('The credentials could not be read or imported.'),
+        findsNothing,
+      );
+    }, variant: TargetPlatformVariant({TargetPlatform.macOS}));
+
+    testWidgets(
+      'confirmed JSON import shows ordered failures without secrets',
+      (tester) async {
+        const contents = '{"refresh_token":"secret-import-token"}';
+        final file = File('${directory.path}/auth.json')
+          ..writeAsStringSync(contents);
+        final codex = _FakeCodex(providers)
+          ..importResults = const [
+            CodexImportResult.failed('Unsupported account type.'),
+            CodexImportResult.added(
+              ProviderAccount(id: 'imported', email: 'imported@example.com'),
+            ),
+            CodexImportResult.failed('Missing refresh token.'),
+          ];
+        await openImport(tester, codex, [file.path]);
+        expect(codex.imports, isEmpty);
+        expect(find.textContaining('secret-import-token'), findsNothing);
+        await confirmImport(tester, codex);
+        expect(codex.imports, [('cx', contents, true)]);
+        expect(codex.refreshed, 0);
+        expect(find.text('Accounts imported: 1'), findsOneWidget);
+        expect(find.text('Entry 1: Unsupported account type.'), findsOneWidget);
+        expect(find.text('Entry 3: Missing refresh token.'), findsOneWidget);
+        expect(find.text('imported@example.com'), findsOneWidget);
+        expect(find.textContaining('secret-import-token'), findsNothing);
+        expect(file.readAsStringSync(), contents);
+      },
+      variant: TargetPlatformVariant({TargetPlatform.macOS}),
+    );
+
+    testWidgets('unexpected import errors are not shown verbatim', (
+      tester,
+    ) async {
+      final file = File('${directory.path}/auth.json')..writeAsStringSync('{}');
+      final codex = _FakeCodex(providers)
+        ..importFailure = StateError('secret-credential-or-path');
+      await openImport(tester, codex, [file.path]);
+      await confirmImport(tester, codex);
+      expect(
+        find.text('The credentials could not be read or imported.'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('secret-credential-or-path'), findsNothing);
+      expect(find.text('Accounts imported: 0'), findsNothing);
+      expect(providers.provider('cx')!.accounts, isEmpty);
+    }, variant: TargetPlatformVariant({TargetPlatform.macOS}));
+  });
+
+  testWidgets('signing in can be cancelled', (tester) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'cx',
+        name: 'ChatGPT',
+        protocol: ProviderProtocol.codex,
+      ),
+    );
+    final codex = _FakeCodex(providers);
+    await pump(tester, codex: codex);
+    await tester.tap(find.text('ChatGPT'));
+    await tester.pumpAndSettle();
+    expect(find.text('No account yet'), findsOneWidget);
+    await tester.tap(find.text('Add Account').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(find.text('Waiting for sign-in…'), findsNothing);
+    expect(find.textContaining('Sign-in failed'), findsNothing);
+  });
+
+  testWidgets('with the port taken, the address signed in to is pasted', (
+    tester,
+  ) async {
+    await providers.save(
+      const ModelProvider(
+        id: 'cx',
+        name: 'ChatGPT',
+        protocol: ProviderProtocol.codex,
+      ),
+    );
+    final codex = _FakeCodex(providers)..listening = false;
+    await pump(tester, codex: codex);
+    await tester.tap(find.text('ChatGPT'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add Account').last);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Port 1455'), findsOneWidget);
+    expect(find.text('Address after sign-in'), findsOneWidget);
+    await tester.ensureVisible(find.text('Address after sign-in'));
+    await tester.pumpAndSettle();
+    // The last field: the name's, then the address's.
+    final address = find.byType(EditableText).last;
+    await tester.tap(address);
+    await tester.enterText(
+      address,
+      'http://localhost:1455/auth/callback?code=c&state=s',
+    );
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pumpAndSettle();
+    expect(codex.last!.submitted, [
+      'http://localhost:1455/auth/callback?code=c&state=s',
+    ]);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(find.text('Address after sign-in'), findsNothing);
+  });
+
+  group('magpie', () {
+    var status = const MagpieStatus(installed: true, version: '0.13.0');
+    MagpieFollow follow() => MagpieFollow(
+      providers: providers,
+      probe: () async => status,
+      list: (provider, key) async => const [
+        RemoteModel('auto/claude-opus-5-5', label: 'Opus · routing group'),
+        RemoteModel('deepseek/deepseek-v4', label: 'DeepSeek V4 · DeepSeek'),
+        RemoteModel('yiyuan/gpt-image-2', kind: ModelKind.image),
+      ],
+      claudeSettings: () async => null,
+    );
+
+    setUp(() {
+      status = const MagpieStatus(installed: true, version: '0.13.0');
+    });
+
+    testWidgets('not here: not offered', (tester) async {
+      status = const MagpieStatus();
+      await pump(tester, magpie: follow());
+      await tester.pump();
+      expect(find.text('Connect magpie'), findsNothing);
+    });
+
+    testWidgets('here: connected in one click, its models followed', (
+      tester,
+    ) async {
+      final magpie = follow();
+      await pump(tester, magpie: magpie);
+      await tester.pump();
+      await tester.tap(find.text('Connect magpie'));
+      await tester.pumpAndSettle();
+      final provider = providers.providers.single;
+      expect(provider.followsMagpie, isTrue);
+      expect(await providers.key(provider.id), Magpie.key);
+      expect(
+        {
+          for (final model in provider.models)
+            if (model.enabled) model.id,
+        },
+        {'auto/claude-opus-5-5', 'yiyuan/gpt-image-2'},
+      );
+      // Its page: the gateway, not an address or a key to fill in.
+      expect(find.text('magpie Gateway'), findsOneWidget);
+      expect(find.textContaining('Running · 127.0.0.1:3425'), findsOneWidget);
+      expect(find.text('Base URL'), findsNothing);
+      expect(find.text('Fetch from Upstream…'), findsNothing);
+      expect(find.text('Add Model…'), findsNothing);
+      // Back in the list: marked as following, and offered no more.
+      await tester.tap(find.byType(IdeBackButton));
+      await tester.pumpAndSettle();
+      expect(find.text('Follows magpie'), findsOneWidget);
+      expect(find.text('Connect magpie'), findsNothing);
+    });
+
+    testWidgets('not running: said so in the list', (tester) async {
+      await providers.save(Magpie.provider('magpie'));
+      status = const MagpieStatus(installed: true);
+      await pump(tester, magpie: follow());
+      await tester.pumpAndSettle();
+      expect(find.textContaining("magpie isn't running"), findsOneWidget);
+    });
+  });
+}

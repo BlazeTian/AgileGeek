@@ -1,0 +1,342 @@
+import 'dart:async';
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/ide/file_service.dart' show IdeFileNotFoundException;
+import 'package:agilegeek/ide/ide_explorer.dart';
+import 'package:agilegeek/ide/ide_input.dart';
+import 'package:agilegeek/ide/ide_list.dart';
+import 'package:agilegeek/ide/ide_workspace.dart';
+import 'package:agilegeek/ide/search/ide_search_view.dart';
+import 'package:agilegeek/ide/search/text_search.dart';
+import 'package:path/path.dart' as p;
+
+import '../workbench/fake_files.dart';
+
+/// The Search view against an engine over the in-memory files.
+void main() {
+  const files = {
+    'lib/a.dart': 'foo one\nFoo two',
+    'lib/b.dart': 'foo three',
+    'README.md': 'no match here',
+  };
+
+  late IdeWorkspace workspace;
+  late List<IdeTextQuery> queries;
+
+  setUp(() => queries = []);
+
+  Stream<Object> engine(String root, IdeTextQuery query) async* {
+    queries.add(query);
+    final accept = query.pathFilter();
+    final regExp = query.toRegExp();
+    final contents = (workspace.files as TreeFiles).contents;
+    for (final MapEntry(key: path, value: text) in contents.entries) {
+      final relative = p.relative(path, from: root).replaceAll(r'\', '/');
+      if (!accept(relative)) continue;
+      final matches = ideMatchLines(text, regExp, multiline: query.isMultiline);
+      if (matches.isNotEmpty) yield IdeFileMatches(path, matches);
+    }
+    yield const IdeTextSearchComplete(limitHit: false);
+  }
+
+  Future<void> pumpSearch(
+    WidgetTester tester, {
+    List<String> open = const [],
+  }) async {
+    workspace = await pumpWorkbench(
+      tester,
+      files,
+      open: open,
+      textSearch: engine,
+    );
+    await tester.pumpAndSettle();
+    await chord(tester, LogicalKeyboardKey.keyF, control: true, shift: true);
+    await tester.pumpAndSettle();
+  }
+
+  Finder input(String label) => find.descendant(
+    of: find.byWidgetPredicate(
+      (widget) => widget is IdeInputBox && widget.semanticsLabel == label,
+    ),
+    matching: find.byType(EditableText),
+  );
+
+  Future<void> search(WidgetTester tester, String text) async {
+    await tester.enterText(input('Search'), text);
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+  }
+
+  Finder label(String name) => find.byWidgetPredicate(
+    (widget) => widget is IdeResourceLabel && widget.name == name,
+  );
+
+  Finder matchRow(String text) => find.byWidgetPredicate(
+    (widget) =>
+        widget is RichText &&
+        widget.text.toPlainText() == text &&
+        widget.text is TextSpan &&
+        (widget.text as TextSpan).children != null,
+  );
+
+  testWidgets('searches as you type; results by file; a match opens its '
+      'file', (tester) async {
+    await pumpSearch(tester);
+    expect(find.byType(IdeSearchView), findsOneWidget);
+    await search(tester, 'foo');
+    expect(queries, hasLength(1));
+    expect(find.text('3 results in 2 files'), findsOneWidget);
+    expect(label('a.dart'), findsOneWidget);
+    expect(label('b.dart'), findsOneWidget);
+    expect(find.widgetWithText(IdeCountBadge, '2'), findsOneWidget);
+
+    await tester.tap(matchRow('foo three'));
+    await tester.pumpAndSettle();
+    expect(workspace.active?.path, inRoot('lib/b.dart'));
+
+    // Match Case searches again.
+    await tester.tap(find.byTooltip('Match Case (Alt+C)'));
+    await tester.pumpAndSettle();
+    expect(queries.last.isCaseSensitive, isTrue);
+    expect(find.text('2 results in 2 files'), findsOneWidget);
+
+    // A file collapses.
+    await tester.tap(
+      find.ancestor(of: label('a.dart'), matching: find.byType(IdeListRow)),
+    );
+    await tester.pumpAndSettle();
+    expect(matchRow('foo one'), findsNothing);
+  });
+
+  testWidgets('says why there are no results; an invalid expression is an '
+      'error', (tester) async {
+    await pumpSearch(tester);
+    await search(tester, 'absent');
+    expect(
+      find.text(
+        'No results found. Review your settings for configured exclusions '
+        'and check your gitignore files',
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.byTooltip('Use Regular Expression (Alt+R)'));
+    await search(tester, '(');
+    expect(
+      find.descendant(
+        of: find.byType(IdeSearchView),
+        matching: find.textContaining('Unterminated group'),
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('Replace All asks, then replaces in open and closed files', (
+    tester,
+  ) async {
+    await pumpSearch(tester, open: ['lib/a.dart']);
+    await search(tester, 'foo');
+    // The replace input folded away at first, as upstream's.
+    expect(input('Replace'), findsNothing);
+    await tester.tap(find.byTooltip('Toggle Replace'));
+    await tester.pumpAndSettle();
+    await tester.enterText(input('Replace'), 'bar');
+    await tester.pumpAndSettle();
+    // The preview shows the replacement.
+    expect(matchRow('foobar three'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Replace All (Ctrl+Alt+Enter)'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text("Replace 3 occurrences across 2 files with 'bar'?"),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Replace').last);
+    await tester.pumpAndSettle();
+
+    final contents = (workspace.files as TreeFiles).contents;
+    expect(contents[inRoot('lib/b.dart')], 'bar three');
+    // The open file was edited, then saved (it had no changes).
+    expect(contents[inRoot('lib/a.dart')], 'bar one\nbar two');
+    expect(workspace.documents.single.dirty, isFalse);
+    expect(
+      find.text("Replaced 3 occurrences across 2 files with 'bar'."),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('text pasted with its lines keeps them, and matches across '
+      'them; Enter searches, Ctrl+Enter is a new line', (tester) async {
+    await pumpSearch(tester);
+    await search(tester, 'one\nFoo');
+    final field = tester.widget<EditableText>(input('Search'));
+    expect(field.controller.text, 'one\nFoo');
+    expect(queries.last.pattern, 'one\nFoo');
+    expect(find.text('1 result in 1 file'), findsOneWidget);
+    expect(matchRow('foo one⏎Foo two'), findsOneWidget);
+
+    // Ctrl+Enter: a line break where the caret is.
+    field.controller.selection = const TextSelection.collapsed(offset: 3);
+    await tester.pump();
+    await chord(tester, LogicalKeyboardKey.enter, control: true);
+    await tester.pump();
+    expect(field.controller.text, 'one\n\nFoo');
+    // Enter: searched at once, the text as it is.
+    final before = queries.length;
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pump();
+    expect(queries.length, before + 1);
+    expect(field.controller.text, 'one\n\nFoo');
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets('the replace input and the files to include and exclude fold '
+      'away at first, and are kept as the user leaves them', (tester) async {
+    final session = IdeSearchSession();
+    addTearDown(session.dispose);
+    expect(session.replaceShown, isFalse);
+    expect(session.detailsShown, isFalse);
+    expect(session.kept, isEmpty);
+    session
+      ..replaceShown = true
+      ..detailsShown = true;
+    final again = IdeSearchSession()..restore(session.kept);
+    addTearDown(again.dispose);
+    expect(again.replaceShown, isTrue);
+    expect(again.detailsShown, isTrue);
+    // Files to include kept: shown.
+    final included = IdeSearchSession()..restore({'includes': 'lib'});
+    addTearDown(included.dispose);
+    expect(included.detailsShown, isTrue);
+    expect(included.replaceShown, isFalse);
+  });
+
+  testWidgets('dismissing hides a result', (tester) async {
+    await pumpSearch(tester);
+    await search(tester, 'foo');
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: tester.getCenter(label('b.dart')));
+    addTearDown(mouse.removePointer);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Dismiss (Delete)'));
+    await tester.pumpAndSettle();
+    expect(label('b.dart'), findsNothing);
+    expect(find.text('2 results in 1 file'), findsOneWidget);
+  });
+
+  testWidgets('the results follow an open file edited, unsaved edits and '
+      'all', (tester) async {
+    await pumpSearch(tester, open: ['lib/a.dart']);
+    await search(tester, 'foo');
+    expect(find.text('3 results in 2 files'), findsOneWidget);
+
+    workspace.edit(inRoot('lib/a.dart'), 'bar one\nFoo two\nfoo four');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(matchRow('foo one'), findsNothing);
+    expect(matchRow('foo four'), findsOneWidget);
+    expect(find.text('3 results in 2 files'), findsOneWidget);
+
+    // Left without matches, it drops out; back as it matches again.
+    workspace.edit(inRoot('lib/a.dart'), 'bar');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(label('a.dart'), findsNothing);
+    expect(find.text('1 result in 1 file'), findsOneWidget);
+    workspace.edit(inRoot('lib/a.dart'), 'foo again');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    expect(matchRow('foo again'), findsOneWidget);
+    expect(find.text('2 results in 2 files'), findsOneWidget);
+  });
+
+  test('the results follow their files changed on disk', () async {
+    final texts = {'/p/a.txt': 'foo one', '/p/sub/b.txt': 'foo two'};
+    final changes = <String, StreamController<void>>{};
+    final session = IdeSearchSession(
+      engine: (root, query) => Stream.fromIterable([
+        for (final MapEntry(key: path, value: text) in texts.entries)
+          IdeFileMatches(path, ideMatchLines(text, query.toRegExp())),
+        const IdeTextSearchComplete(limitHit: false),
+      ]),
+      read: (path) async =>
+          texts[path] ?? (throw IdeFileNotFoundException(path)),
+      watch: (directory) =>
+          (changes[directory] = StreamController<void>()).stream,
+    );
+    addTearDown(session.dispose);
+    session.query.text = 'foo';
+    session.search('/p');
+    await pumpEventQueue();
+    expect(changes.keys, unorderedEquals(['/p', '/p/sub']));
+
+    texts['/p/a.txt'] = 'x\nfoo moved';
+    changes['/p']!.add(null);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    // Folders first: b.txt's, then a.txt's.
+    expect(session.results.last.matches.single.line, 1);
+    expect(session.results.last.matches.single.text, 'foo moved');
+
+    texts.remove('/p/sub/b.txt');
+    changes['/p/sub']!.add(null);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(session.results.map((file) => file.path), ['/p/a.txt']);
+
+    // A new search's results only: the old one's watches gone.
+    session.clear();
+    expect(changes.values.every((c) => !c.hasListener), isTrue);
+  });
+
+  testWidgets('sized as VS Code: the inputs, their toggles, and the details '
+      'toggle', (tester) async {
+    await pumpSearch(tester);
+    Rect box(String label) => tester.getRect(
+      find.byWidgetPredicate(
+        (widget) => widget is IdeInputBox && widget.semanticsLabel == label,
+      ),
+    );
+    // The search widget's inputs are 2px shorter than the others.
+    expect(box('Search').height, 26);
+    final details = find.byTooltip('Toggle Search Details (Ctrl+Shift+J)');
+    expect(tester.getSize(details), const Size(25, 16));
+
+    // The details folded away at first, as upstream's.
+    expect(find.text('files to exclude'), findsNothing);
+    await tester.tap(details);
+    await tester.pumpAndSettle();
+    final exclude = box('files to exclude');
+    expect(exclude.height, 28);
+    final toggle = tester.getRect(
+      find.byTooltip('Use Exclude Settings and Ignore Files'),
+    );
+    expect(toggle.center.dy, exclude.center.dy);
+    expect(toggle.right, exclude.right - 2);
+  });
+
+  testWidgets('Find in Folder... searches in the folder', (tester) async {
+    await pumpSearch(tester);
+    await search(tester, 'foo');
+    await chord(tester, LogicalKeyboardKey.keyE, control: true, shift: true);
+    await tester.pumpAndSettle();
+    await tester.tapAt(
+      tester.getCenter(
+        find.descendant(
+          of: find.byType(IdeExplorer),
+          matching: find.text('lib'),
+        ),
+      ),
+      buttons: kSecondaryMouseButton,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Find in Folder...'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(IdeSearchView), findsOneWidget);
+    expect(find.text('files to include'), findsOneWidget);
+    expect(queries.last.includes, './lib');
+    expect(find.text('3 results in 2 files'), findsOneWidget);
+  });
+}

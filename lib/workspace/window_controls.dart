@@ -1,0 +1,815 @@
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:quill_native_bridge/quill_native_bridge.dart';
+
+import '../chat/chat_models.dart';
+import '../chat/composer/composer_files.dart';
+import '../chat/composer/file_drop.dart';
+import '../platform/app_platform.dart';
+import '../platform/event_log.dart';
+import '../theme/app_theme.dart' show AppMetrics;
+
+/// One of the window's own buttons, over a header the app draws itself: the
+/// system hit-tests and acts on those pixels, so the header only paints them
+/// (see [WindowControls.hoveredWindowButton]).
+enum WindowButton { minimize, maximize, close }
+
+/// Controls of the native window, where there is one (the desktop app; see
+/// MainFlutterWindow.swift and windows/runner/window_channel.cpp).
+///
+/// Each of the app's windows has its own channel: the main one's is
+/// `agilegeek/window`, another's `agilegeek/window.<viewId>` (see
+/// lib/window/). What is asked without saying of which window (a dialog,
+/// a menu) is the window in front's, [activeViewId].
+abstract final class WindowControls {
+  static const _main = MethodChannel('agilegeek/window');
+  static final Map<int, MethodChannel> _channels = {};
+
+  /// The channel of [viewId]'s window.
+  static MethodChannel channelFor(int viewId) => viewId == 0
+      ? _main
+      : _channels.putIfAbsent(
+          viewId,
+          () => MethodChannel('agilegeek/window.$viewId'),
+        );
+
+  /// The window in front, the keyboard's: where a dialog or a menu asked
+  /// for without a window shows. A press in a window makes it the one, as
+  /// its coming in front does (see AppWindows).
+  static int activeViewId = 0;
+
+  static MethodChannel get _channel => channelFor(activeViewId);
+
+  static MethodChannel _of(int? viewId) => channelFor(viewId ?? activeViewId);
+
+  /// Follows the presses in the app's windows for [activeViewId].
+  static void trackActiveView() {
+    if (_tracking) return;
+    _tracking = true;
+    GestureBinding.instance.pointerRouter.addGlobalRoute((event) {
+      if (event is PointerDownEvent) activeViewId = event.viewId;
+    });
+  }
+
+  static bool _tracking = false;
+
+  /// Whether the app runs in a window to command: the desktop app, not a
+  /// browser tab. Linux included (linux/runner); its file dialogs are the
+  /// GTK ones on `agilegeek/window`.
+  static bool get isDesktop => AppPlatform.isDesktop;
+
+  /// Whether the window is the app's own to draw: Windows, where the header
+  /// carries the menus, the session's tools and the window buttons (see
+  /// workspace/window_header/). Elsewhere the system draws the caption —
+  /// macOS with its traffic lights over a title bar Flutter paints under
+  /// them.
+  static bool get drawsHeader => AppPlatform.isWindows;
+
+  /// How far from the window's top what shows over everything (menus,
+  /// popovers, dialogs, quick picks) starts: below the header Windows draws,
+  /// whose strip the window drags itself by (see [setHitTestAreas]), so
+  /// nothing over it could be clicked (#198). In the overlay's own pixels,
+  /// as the header's height: the interface's zoom is outside both.
+  static double get headerInset => drawsHeader ? AppMetrics.headerHeight : 0;
+
+  /// Whether the window can be kept on top.
+  static bool get canKeepOnTop => isDesktop;
+
+  /// Makes the window's own parts light or dark as the color theme is: on
+  /// macOS the material under the sidebar, the traffic lights and the
+  /// system's menus (MainFlutterWindow.swift keeps it for the next start).
+  /// All the app's windows take it.
+  static Future<void> setDarkAppearance(bool dark) async {
+    if (!(AppPlatform.isMacOS || AppPlatform.isWindows)) return;
+    appEvent('window', 'appearance ${dark ? 'dark' : 'light'}');
+    try {
+      await _main.invokeMethod<void>('setAppearance', dark);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// The system's blur under every window, or none (see WindowBlur); kept
+  /// for the next start, whose windows open as it says.
+  static Future<void> setWindowBlur(bool on) async {
+    if (!(AppPlatform.isMacOS || AppPlatform.isWindows)) return;
+    try {
+      await _main.invokeMethod<void>('setWindowBlur', on);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Keeps the window above other apps' windows, or not.
+  static Future<void> setAlwaysOnTop(bool onTop, {int? viewId}) async {
+    if (!canKeepOnTop) return;
+    try {
+      await _of(viewId).invokeMethod<void>('setAlwaysOnTop', onTop);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Whether the window can go full screen: the desktop app (#299).
+  static bool get canFullScreen => isDesktop;
+
+  /// Takes the window to full screen, or back out of it as it was: whether
+  /// it is now (null where there is no window to ask).
+  static Future<bool?> toggleFullScreen({int? viewId}) async {
+    if (!canFullScreen) return null;
+    try {
+      return await _of(viewId).invokeMethod<bool>('toggleFullScreen');
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Whether the window can be made larger for what it shows: the desktop
+  /// app.
+  static bool get canGrow => isDesktop;
+
+  /// How much wider and taller the window can get on its screen: none while
+  /// it fills it (full screen, maximized); null where there is no window to
+  /// ask (the web, a host without the channel).
+  static Future<Size?> growRoom({int? viewId}) async {
+    if (!canGrow) return null;
+    try {
+      final room = await _of(viewId)
+          .invokeMapMethod<String, Object?>('windowRoom');
+      if (room == null) return null;
+      double size(String key) => (room[key] as num?)?.toDouble() ?? 0;
+      return Size(size('width'), size('height'));
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Makes the window [by] wider and taller, as far as its screen goes: its
+  /// top left stays, unless that would take it past the screen's edge,
+  /// where it moves back onto it.
+  static Future<void> grow(Size by, {int? viewId}) async {
+    if (!canGrow) return;
+    try {
+      await _of(viewId).invokeMethod<void>('growWindow', {
+        'width': by.width,
+        'height': by.height,
+      });
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Moves the window with the press under way, as a drag on the system's
+  /// title bar would: macOS, where the window leaves that to the title bar
+  /// Flutter draws (see title_bar_double_click.dart).
+  static Future<void> dragWindow({int? viewId}) async {
+    if (!handlesTitleDoubleClick) return;
+    try {
+      await _of(viewId).invokeMethod<void>('dragWindow');
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Whether a double click on the title bar is the app's to handle: macOS,
+  /// where Flutter draws the title bar and so gets its clicks. On Windows
+  /// the system handles its caption's own (HTCAPTION, see
+  /// windows/runner/flutter_window.cpp).
+  static bool get handlesTitleDoubleClick => AppPlatform.isMacOS;
+
+  /// Does what the system's settings say a double click on the title bar
+  /// does: zoom (by default), fill, minimize or nothing (see
+  /// MainFlutterWindow.swift).
+  static Future<void> handleTitleDoubleClick({int? viewId}) async {
+    if (!handlesTitleDoubleClick) return;
+    try {
+      await _of(viewId).invokeMethod<void>('handleTitleDoubleClick');
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Which of them the pointer is over, or null; the window reports it.
+  static final ValueNotifier<WindowButton?> hoveredWindowButton =
+      hoveredButtonOf(0);
+
+  /// Whether the window fills the screen, so its button offers the way back
+  /// down; the window reports it.
+  static final ValueNotifier<bool> maximized = maximizedOf(0);
+
+  static final Map<int, ValueNotifier<WindowButton?>> _hovered = {};
+  static final Map<int, ValueNotifier<bool>> _maximized = {};
+
+  /// [hoveredWindowButton] of [viewId]'s window.
+  static ValueNotifier<WindowButton?> hoveredButtonOf(int viewId) =>
+      _hovered.putIfAbsent(viewId, () => ValueNotifier(null));
+
+  /// [maximized] of [viewId]'s window.
+  static ValueNotifier<bool> maximizedOf(int viewId) =>
+      _maximized.putIfAbsent(viewId, () => ValueNotifier(false));
+
+  /// Starts taking what [viewId]'s window reports back: which button the
+  /// pointer is over, whether it is maximized (Windows); the menu bar's
+  /// commands (macOS). One handler takes both (see [handleEditCommands]).
+  static void handleWindowEvents([int viewId = 0]) {
+    if (!drawsHeader) return;
+    _listen(viewId);
+  }
+
+  static void _listen(int viewId) {
+    channelFor(viewId).setMethodCallHandler((call) async {
+      switch (call.method) {
+        case 'captionHover':
+          hoveredButtonOf(viewId).value = _buttonNamed('${call.arguments}');
+        case 'maximized':
+          maximizedOf(viewId).value = call.arguments == true;
+        case 'editCommand':
+          activeViewId = viewId;
+          runEditCommand('${call.arguments}');
+        case 'menuCommand':
+          activeViewId = viewId;
+          (_menuCommands[viewId] ?? _menuCommands[0])?.call(
+            '${call.arguments}',
+          );
+      }
+      return null;
+    });
+  }
+
+  /// Stops taking what [viewId]'s window reports (it is gone).
+  static void stopListening(int viewId) {
+    channelFor(viewId).setMethodCallHandler(null);
+    _menuCommands.remove(viewId);
+    _hovered.remove(viewId)?.dispose();
+    _maximized.remove(viewId)?.dispose();
+    _channels.remove(viewId);
+    _titleBarDrops.remove(viewId);
+  }
+
+  static final _titleBarDrops = <int, double>{};
+
+  /// Keeps the macOS traffic lights level with the title bar Flutter draws
+  /// as the interface is zoomed: [drop] (the window's points) below where
+  /// the system puts them. Said once a change; 0 is where they start.
+  static Future<void> setTitleBarDrop(
+    double drop, {
+    required int viewId,
+  }) async {
+    if (!AppPlatform.isMacOS) return;
+    if ((_titleBarDrops[viewId] ?? 0) == drop) return;
+    _titleBarDrops[viewId] = drop;
+    try {
+      await channelFor(viewId).invokeMethod<void>('setTitleBarDrop', drop);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  static WindowButton? _buttonNamed(String name) => switch (name) {
+    'minimize' => WindowButton.minimize,
+    'maximize' => WindowButton.maximize,
+    'close' => WindowButton.close,
+    _ => null,
+  };
+
+  /// Tells the window where the header the app draws keeps its controls, so
+  /// the system drags the rest of the strip and runs the window buttons
+  /// itself (with its own animations and Snap Layouts).
+  ///
+  /// The rectangles are in the app's own pixels, from the top left of the
+  /// window: [controls] are the ones Flutter keeps for itself (the menu bar
+  /// and the buttons beside it), the other three are the window buttons.
+  static Future<void> setHitTestAreas({
+    int? viewId,
+    required double height,
+    required List<Rect> controls,
+    required Rect minimize,
+    required Rect maximize,
+    required Rect close,
+  }) async {
+    if (!drawsHeader) return;
+    try {
+      await _of(viewId).invokeMethod<void>('setHitTestAreas', {
+        'height': height,
+        'controls': [for (final rect in controls) _encoded(rect)],
+        'buttons': {
+          'minimize': _encoded(minimize),
+          'maximize': _encoded(maximize),
+          'close': _encoded(close),
+        },
+      });
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  static Map<String, double> _encoded(Rect rect) => {
+    'left': rect.left,
+    'top': rect.top,
+    'width': rect.width,
+    'height': rect.height,
+  };
+
+  /// Runs one of the window's own commands: `minimize`, `maximize` (which
+  /// gives the way back while it is maximized) or `close`.
+  static Future<void> windowCommand(String command, {int? viewId}) async {
+    if (!drawsHeader) return;
+    try {
+      await _of(viewId).invokeMethod<void>('windowCommand', command);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Whether a file can be handed to its default app (editor_launcher's
+  /// `openExternal`: `open` on macOS, [openExternal] on Windows).
+  static bool get canOpenInDefaultApp => isDesktop;
+
+  /// Hands [target] to the system to open in its default app (the browser,
+  /// for a URL; whatever opens a file or folder), or in [app] when given,
+  /// with [arguments] passed to it.
+  ///
+  /// Only the Windows app's window does it, having no command of its own
+  /// to hand a target to (the macOS launcher runs `open`) — see
+  /// windows/runner/window_channel.cpp. False elsewhere, and when the app
+  /// is not there.
+  static Future<bool> openExternal(
+    String target, {
+    String? app,
+    List<String> arguments = const [],
+  }) async {
+    if (!AppPlatform.isWindows) return false;
+    try {
+      return await _channel.invokeMethod<bool>('open', {
+            'target': target,
+            'app': ?app,
+            if (arguments.isNotEmpty) 'arguments': arguments,
+          }) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// Whether there is a native folder picker: the desktop app.
+  static bool get canPickDirectory => isDesktop;
+
+  /// Asks the user for a folder (the native open panel); null if they
+  /// cancel or there is no such panel.
+  static Future<String?> pickDirectory() async {
+    if (!canPickDirectory) return null;
+    try {
+      return await _channel.invokeMethod<String>('pickDirectory');
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Whether [moveToTrash] can move files to a Trash.
+  static bool get canMoveToTrash => AppPlatform.isMacOS;
+
+  /// Moves [path] to the system's Trash (macOS); false where there is no
+  /// Trash to move to. Throws a [PlatformException] when moving fails.
+  static Future<bool> moveToTrash(String path) async {
+    if (!canMoveToTrash) return false;
+    try {
+      return await _channel.invokeMethod<bool>('trashItem', path) ?? false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// Whether [startFileDrag] can drag files out to other apps.
+  static bool get canDragFilesOut => isDesktop;
+
+  /// Goes on dragging [paths] from [viewId]'s window as the system drags
+  /// files, to let go in another app (Finder, Mail…) or back in this one:
+  /// the pointer, held down, has left the window. Whether it began.
+  static Future<bool> startFileDrag(List<String> paths, {int? viewId}) async {
+    if (!canDragFilesOut || paths.isEmpty) return false;
+    try {
+      return await _of(viewId)
+              .invokeMethod<bool>('startFileDrag', {'paths': paths}) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// Has [viewId]'s window watch the drag of files that began in it: once
+  /// the pointer leaves the window it drags [paths] on itself, as Finder
+  /// drags files (when null: they are not this machine's yet, it only says
+  /// so), and tells [FileDrops.setDragOut]'s. Whether it watches; when not,
+  /// the app finds the pointer out of the window itself.
+  static Future<bool> armFileDrag(List<String>? paths, {int? viewId}) async {
+    if (!canDragFilesOut) return false;
+    try {
+      return await _of(viewId)
+              .invokeMethod<bool>('armFileDrag', {'paths': paths}) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// The drag [armFileDrag] had watched ended.
+  static Future<void> disarmFileDrag({int? viewId}) async {
+    if (!canDragFilesOut) return;
+    try {
+      await _of(viewId).invokeMethod<void>('disarmFileDrag');
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests), or one that watches none.
+    }
+  }
+
+  /// Whether [revealInFileManager] can show a file (Finder, or File
+  /// Explorer on Windows).
+  static bool get canRevealInFileManager => isDesktop;
+
+  /// Opens a Finder (or File Explorer) window with [path] selected.
+  static Future<void> revealInFileManager(String path) async {
+    if (!canRevealInFileManager) return;
+    try {
+      await _channel.invokeMethod<void>('revealInFinder', path);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Carries out the Edit menu's commands (undo, cut, copy, paste, select
+  /// all…) where the focus is: the composer, or the conversation's
+  /// selection. The menu is the system's own on macOS only; on Windows the
+  /// framework handles those shortcuts itself. The menu bar's are the key
+  /// window's: each window's channel brings them.
+  static void handleEditCommands([int viewId = 0]) {
+    if (!hasEditMenu) return;
+    _listen(viewId);
+  }
+
+  /// Runs a command the system's menu bar picked (the app menu's
+  /// Preferences…: `workbench.action.openSettings`; the File menu's, see
+  /// [setFileMenuTitles]); set by the workbench. The main window's.
+  static void Function(String command)? get onMenuCommand => _menuCommands[0];
+  static set onMenuCommand(void Function(String command)? run) =>
+      setMenuCommands(0, run);
+
+  /// [onMenuCommand] of [viewId]'s window, where the menu bar's commands go
+  /// while it is the key window.
+  static void setMenuCommands(int viewId, void Function(String command)? run) {
+    if (run == null) {
+      _menuCommands.remove(viewId);
+    } else {
+      _menuCommands[viewId] = run;
+    }
+  }
+
+  static void Function(String command)? menuCommandsOf(int viewId) =>
+      _menuCommands[viewId];
+
+  static final Map<int, void Function(String command)> _menuCommands = {};
+
+  /// Whether the OS has a menu bar of its own to carry the Edit commands
+  /// (macOS), where the engine's own handling of them falls short.
+  static bool get hasEditMenu => AppPlatform.isMacOS;
+
+  /// Runs the Edit menu's [command] on the focused widget: what the macOS
+  /// menu bar and the Windows header's Edit menu both ask for.
+  static void runEditCommand(String command) {
+    const cause = SelectionChangedCause.keyboard;
+    final Intent? intent = switch (command) {
+      'undo' => const UndoTextIntent(cause),
+      'redo' => const RedoTextIntent(cause),
+      'cut' => const CopySelectionTextIntent.cut(cause),
+      'copy' => CopySelectionTextIntent.copy,
+      'paste' => const PasteTextIntent(cause),
+      'selectAll' => const SelectAllTextIntent(cause),
+      _ => null,
+    };
+    final context = FocusManager.instance.primaryFocus?.context;
+    if (intent != null && context != null) {
+      Actions.maybeInvoke(context, intent);
+    }
+  }
+
+  /// Whether menus can be the system's own. Linux has a GTK menu; its Paste
+  /// reads the clipboard in the item's activation, which Wayland allows.
+  static bool get hasNativeMenus => AppPlatform.isDesktop;
+
+  /// Shows a context menu of [items] at [position] (in the window, from
+  /// its top left); the id of the item chosen, null for none (or no such
+  /// menu).
+  static Future<String?> showContextMenu(
+    Offset position,
+    List<NativeMenuItem> items, {
+    int? viewId,
+  }) async {
+    if (!hasNativeMenus) return null;
+    try {
+      return await _of(viewId).invokeMethod<String>('showContextMenu', {
+        'x': position.dx,
+        'y': position.dy,
+        'items': [for (final item in items) item._encoded],
+      });
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Whether the clipboard holds anything to paste: text, files or images.
+  ///
+  /// Linux (Wayland) cannot be asked from here: a read is only allowed inside
+  /// the paste itself. The menu offers Paste, and an empty clipboard pastes
+  /// nothing.
+  static Future<bool> canPaste() async {
+    if (AppPlatform.isLinux) return true;
+    if (!hasNativeMenus) return false;
+    try {
+      return await _channel.invokeMethod<bool>('canPaste') ?? false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// Whether the clipboard holds text, from its types alone, without
+  /// reading it (macOS; see lib/platform/app_binding.dart). Asks the main
+  /// window, which is there as long as the app.
+  static Future<bool> hasPasteboardText() async =>
+      await _main.invokeMethod<bool>('hasPasteboardText') ?? false;
+
+  /// Plain text on the clipboard. On Linux this is the snapshot taken when
+  /// Ctrl+V or the menu's Paste happened; the engine's own clipboard read
+  /// comes back empty there (Wayland). Elsewhere it is that read.
+  static Future<String?> readPasteboardText() async {
+    if (AppPlatform.isLinux) {
+      try {
+        // Null is an answer (a picture, or nothing): don't ask the engine,
+        // which on Wayland blocks or comes back empty and would skip the image.
+        return await _channel.invokeMethod<String>('readPasteboardText');
+      } on MissingPluginException {
+        // A host without the channel (tests).
+      }
+    }
+    return (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+  }
+
+  /// The clipboard's HTML (a web page's, a document's copied), where the
+  /// platform can say.
+  static Future<String?> readPasteboardHtml() async {
+    final bridge = QuillNativeBridge();
+    try {
+      if (!await bridge.isSupported(
+        QuillNativeBridgeFeature.getClipboardHtml,
+      )) {
+        return null;
+      }
+      return await bridge.getClipboardHtml();
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Images on the clipboard, when what it holds is images rather than
+  /// text.
+  static Future<List<ImageAttachment>> readPasteboardImages() =>
+      _images('readPasteboardImages');
+
+  /// Files and folders copied to the clipboard (in Finder, Explorer, the
+  /// IDE's explorer…).
+  static Future<List<ComposerFile>> readPasteboardFiles() =>
+      _files('readPasteboardFiles');
+
+  /// Puts [paths] on the clipboard as files, as Finder and Explorer copy
+  /// them: pasted there, they are copied; pasted in the composer, they are
+  /// referred to. Whether it could.
+  static Future<bool> writePasteboardFiles(List<String> paths) async {
+    if (!isDesktop || paths.isEmpty) return false;
+    try {
+      return await _channel.invokeMethod<bool>('writePasteboardFiles', paths) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// Puts [text] on the clipboard, and beside it, in a format of the app's
+  /// own, [markdown]: what an editor copied, its tags and all (see
+  /// NativeMdClipboard), [plain] where a plain text's. Whether it could;
+  /// throws [MissingPluginException] where the host has no such format.
+  static Future<bool> writePasteboardMarkdown(
+    String text,
+    String markdown, {
+    required bool plain,
+  }) async =>
+      // The host keeps the copy as it is given, its JSON.
+      await _channel.invokeMethod<bool>('writePasteboardMarkdown', {
+        'text': text,
+        'copy': jsonEncode({'markdown': markdown, 'plain': plain}),
+      }) ??
+      false;
+
+  /// The editors' copy on the clipboard ([writePasteboardMarkdown]); null
+  /// where it has none (it was copied elsewhere since). Throws
+  /// [MissingPluginException] where the host has no such format.
+  static Future<({String markdown, bool plain})?>
+  readPasteboardMarkdown() async {
+    final copy = await _channel.invokeMethod<String>('readPasteboardMarkdown');
+    if (copy == null) return null;
+    try {
+      if (jsonDecode(copy) case {
+        'markdown': final String markdown,
+        'plain': final bool plain,
+      }) {
+        return (markdown: markdown, plain: plain);
+      }
+    } on FormatException {
+      // Not one of ours after all.
+    }
+    return null;
+  }
+
+  /// The image file at [path] as the composer takes one (the formats it
+  /// does not send as they are converted to PNG); null when it is no image
+  /// the system reads.
+  static Future<ImageAttachment?> readImageFile(String path) async {
+    if (!isDesktop) return null;
+    try {
+      final image = await _channel.invokeMapMethod<Object?, Object?>(
+        'readImageFile',
+        path,
+      );
+      if (image?['bytes'] case final Uint8List bytes) {
+        return ImageAttachment(
+          bytes: bytes,
+          mediaType: image!['type'] as String? ?? 'image/png',
+          name: image['name'] as String?,
+        );
+      }
+      return null;
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Whether there is a native file picker: the desktop app.
+  static bool get canPickFiles => isDesktop;
+
+  /// Asks the user for files (the native open panel); none if they cancel.
+  static Future<List<ComposerFile>> pickFiles() => _files('pickFiles');
+
+  /// Asks the user for files to open (the native open panel, in
+  /// [directory] when given): their absolute paths, one at most unless
+  /// [multiple]; none if they cancel or there is no such panel. Files
+  /// only, as the IDE's Open File… takes them.
+  static Future<List<String>> pickOpenFiles({
+    String? directory,
+    bool multiple = true,
+  }) async {
+    if (!canPickFiles) return const [];
+    try {
+      final paths = await _channel.invokeListMethod<Object?>('pickOpenFiles', {
+        'directory': ?directory,
+        'multiple': multiple,
+      });
+      return [
+        for (final path in paths ?? const <Object?>[])
+          if (path is String && path.isNotEmpty) path,
+      ];
+    } on MissingPluginException {
+      return const [];
+    }
+  }
+
+  /// Asks the user where to save a file (the native save panel, in
+  /// [directory] and under [name] when given; it asks before replacing a
+  /// file): the absolute path chosen, or null if they cancel or there is
+  /// no such panel.
+  static Future<String?> pickSaveFile({String? directory, String? name}) async {
+    if (!canPickFiles) return null;
+    try {
+      final path = await _channel.invokeMethod<String>('pickSaveFile', {
+        'directory': ?directory,
+        'name': ?name,
+      });
+      return path == null || path.isEmpty ? null : path;
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Names the macOS menu bar's File menu and its items in the app's
+  /// language: [titles] by key — `file` (the menu), `newUntitledFile`,
+  /// `openFile`, `openFolder`, `openRecent`, `save`, `saveAs`,
+  /// `closeFolder`, `clearRecent` and `more` (Open Recent's empty state).
+  /// Keys left out keep their English. Its items come back through
+  /// [onMenuCommand], as the workbench's command ids. Nothing elsewhere:
+  /// Windows' menus are the header's own.
+  static Future<void> setFileMenuTitles(Map<String, String> titles) async {
+    if (!hasEditMenu) return;
+    try {
+      await _main.invokeMethod<void>('setFileMenuTitles', titles);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// Which of the macOS File menu's items are ticked, by the key of their
+  /// title (see [setFileMenuTitles]): `autoSave`.
+  static Future<void> setFileMenuChecked(Map<String, bool> checked) async {
+    if (!hasEditMenu) return;
+    try {
+      await _main.invokeMethod<void>('setFileMenuChecked', checked);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  /// What the macOS File menu's Open Recent lists: [paths], the latest
+  /// first, then Clear Recently Opened (`workbench.action.clearRecentlyOpened`
+  /// through [onMenuCommand]). A path picked there comes back as one the
+  /// system asks to open (see OpenRequests), as `code <path>` does.
+  static Future<void> setRecentItems(List<String> paths) async {
+    if (!hasEditMenu) return;
+    try {
+      await _main.invokeMethod<void>('setRecentItems', paths);
+    } on MissingPluginException {
+      // A host without the channel (e.g. tests).
+    }
+  }
+
+  static Future<List<ComposerFile>> _files(String method) async {
+    if (!isDesktop) return const [];
+    try {
+      final files = await _channel.invokeListMethod<Object?>(method);
+      return FileDrops.decode(files ?? const []);
+    } on MissingPluginException {
+      return const [];
+    }
+  }
+
+  /// Puts [image] on the clipboard, as other apps paste a picture; whether
+  /// it could.
+  static Future<bool> writePasteboardImage(ImageAttachment image) async {
+    if (!isDesktop) return false;
+    try {
+      return await _channel.invokeMethod<bool>('writePasteboardImage', {
+            'bytes': image.bytes,
+            'type': image.mediaType,
+          }) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  static Future<List<ImageAttachment>> _images(String method) async {
+    if (!isDesktop) return const [];
+    try {
+      final images = await _channel.invokeListMethod<Map<Object?, Object?>>(
+        method,
+      );
+      return [
+        for (final image in images ?? const <Map<Object?, Object?>>[])
+          if (image['bytes'] case final Uint8List bytes)
+            ImageAttachment(
+              bytes: bytes,
+              mediaType: image['type'] as String? ?? 'image/png',
+              name: image['name'] as String?,
+            ),
+      ];
+    } on MissingPluginException {
+      return const [];
+    }
+  }
+}
+
+/// An item of a [WindowControls.showContextMenu] menu.
+class NativeMenuItem {
+  const NativeMenuItem(this.id, this.label, {this.key, this.enabled = true})
+    : separator = false;
+
+  const NativeMenuItem.separator()
+    : id = '',
+      label = '',
+      key = null,
+      enabled = false,
+      separator = true;
+
+  final String id;
+  final String label;
+
+  /// Its shortcut, shown as the platform writes one (e.g. `c` for ⌘C on
+  /// macOS, Ctrl+C on Windows).
+  final String? key;
+  final bool enabled;
+  final bool separator;
+
+  Map<String, Object?> get _encoded => separator
+      ? {'separator': true}
+      : {'id': id, 'label': label, 'key': key, 'enabled': enabled};
+}

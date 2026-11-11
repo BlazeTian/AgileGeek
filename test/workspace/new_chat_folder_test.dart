@@ -1,0 +1,262 @@
+// Over a new chat's input, the folder it is to work in: a project, none
+// (the Desktop), or one picked in Finder; it goes once a message is sent.
+
+import 'dart:async';
+
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/chat/chat_session.dart';
+import 'package:agilegeek/ide/ide_quick_input.dart';
+import 'package:agilegeek/kernel/agent_kernel.dart';
+import 'package:agilegeek/kernel/mock/mock_kernels.dart';
+import 'package:agilegeek/main.dart';
+import 'package:agilegeek/remote/open_remote.dart';
+import 'package:agilegeek/workspace/new_chat_folder_bar.dart';
+import 'package:agilegeek/workspace/workspace.dart';
+
+const _window = MethodChannel('agilegeek/window');
+const _desktop = '/Users/me/Desktop';
+
+final _mac = TargetPlatformVariant.only(TargetPlatform.macOS);
+
+/// The app on the mock workspace, a new agent open in its first project.
+Future<Workspace> _pumpNew(WidgetTester tester) async {
+  tester.view.physicalSize = const Size(1400, 900);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.reset);
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+    _window,
+    (call) async => null,
+  );
+  addTearDown(
+    () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      _window,
+      null,
+    ),
+  );
+  final desktop = NewChatFolderBar.desktop;
+  final pick = NewChatFolderBar.pickDirectory;
+  NewChatFolderBar.desktop = () => _desktop;
+  addTearDown(() {
+    NewChatFolderBar.desktop = desktop;
+    NewChatFolderBar.pickDirectory = pick;
+  });
+  final workspace = Workspace.mock();
+  await tester.pumpWidget(AgileGeekApp(workspace: workspace));
+  workspace.create();
+  await tester.pump();
+  return workspace;
+}
+
+Finder get _bar => find.byType(NewChatFolderBar);
+
+/// Kept sessions found only once [found] completes, as Claude Code's are
+/// after all of them are read.
+class _SlowCatalog implements SessionCatalog {
+  final found = Completer<List<SessionRecord>>();
+
+  @override
+  Future<List<ProjectRecord>> projects() async => const [];
+
+  @override
+  Future<List<SessionRecord>> sessionsIn(String cwd) => found.future;
+
+  @override
+  Future<void> delete(String id) async {}
+}
+
+void main() {
+  testWidgets('a new chat waits in the middle, under where it works', (
+    tester,
+  ) async {
+    final workspace = await _pumpNew(tester);
+    expect(workspace.selected.project.name, 'agilegeek');
+    expect(_bar, findsOneWidget);
+    expect(
+      find.descendant(of: _bar, matching: find.text('agilegeek')),
+      findsOneWidget,
+    );
+    expect(find.text('Open from Finder'), findsOneWidget);
+    // Its input is halfway down, not at the bottom.
+    final bar = tester.getTopLeft(_bar).dy;
+    expect(bar, lessThan(900 / 2));
+    expect(bar, greaterThan(900 / 4));
+  }, variant: _mac);
+
+  testWidgets('a hidden project is not offered for a new chat', (tester) async {
+    final workspace = await _pumpNew(tester);
+    final hidden = workspace.projects.firstWhere(
+      (project) => project.path == '~/code/cursor-docs',
+    );
+    workspace.hideProject(hidden);
+    await tester.pump();
+
+    await tester.tap(find.descendant(of: _bar, matching: find.text('agilegeek')));
+    await tester.pumpAndSettle();
+    expect(find.text('cursor-docs'), findsNothing);
+  }, variant: _mac);
+
+  testWidgets('no folder has it work in the Desktop, in its place', (
+    tester,
+  ) async {
+    final workspace = await _pumpNew(tester);
+    final was = workspace.selected;
+    await tester.tap(find.descendant(of: _bar, matching: find.text('agilegeek')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('No folder'));
+    await tester.pumpAndSettle();
+
+    final moved = workspace.selected;
+    expect(moved.project.path, _desktop);
+    expect(moved.session.kernelContext.cwd, _desktop);
+    // The untouched one is gone, not left behind in the sidebar.
+    expect(workspace.threads, isNot(contains(was)));
+    expect(
+      find.descendant(of: _bar, matching: find.text('No folder')),
+      findsOneWidget,
+    );
+  }, variant: _mac);
+
+  testWidgets('a folder picked in Finder becomes its project', (tester) async {
+    final workspace = await _pumpNew(tester);
+    NewChatFolderBar.pickDirectory = () async => '/tmp/picked';
+    await tester.tap(find.text('Open from Finder'));
+    await tester.pumpAndSettle();
+
+    expect(workspace.selected.project.path, '/tmp/picked');
+    expect(workspace.projects.first.path, '/tmp/picked');
+    expect(
+      find.descendant(of: _bar, matching: find.text('picked')),
+      findsOneWidget,
+    );
+  }, variant: _mac);
+
+  testWidgets('it goes once a message is sent, the input to the bottom', (
+    tester,
+  ) async {
+    final workspace = await _pumpNew(tester);
+    workspace.selected.session.send(const ComposerMessage(text: 'hello'));
+    await tester.pump();
+    expect(_bar, findsNothing);
+    // An agent with a conversation has none either.
+    workspace.select(workspace.threads.first);
+    await tester.pump();
+    expect(_bar, findsNothing);
+    // The mock's reply played out.
+    await tester.pump(const Duration(seconds: 30));
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    // Closed, its kernel keeps the conversation's calls in the ledger, which
+    // writes them a moment later.
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(seconds: 1));
+  }, variant: _mac);
+
+  test(
+    'a new folder is moved to at once, its kept sessions listed after',
+    () async {
+      final catalog = _SlowCatalog();
+      final mock = MockKernels.claudeCode;
+      final kernel = KernelDescriptor(
+        id: mock.id,
+        label: mock.label,
+        icon: mock.icon,
+        description: mock.description,
+        create: mock.create,
+        catalog: catalog,
+      );
+      final workspace = Workspace(
+        projects: const [Project('a', '/tmp/a')],
+        kernels: [kernel],
+      );
+      addTearDown(workspace.dispose);
+      final was = workspace.create();
+
+      final moved = workspace.moveNew(was, _desktop);
+      expect(workspace.selected, same(moved));
+      expect(moved.project.path, _desktop);
+      expect(workspace.threads, [moved]);
+
+      catalog.found.complete([
+        SessionRecord(
+          id: 'kept',
+          title: 'Earlier on the Desktop',
+          updatedAt: DateTime(2026, 9, 30),
+          cwd: _desktop,
+        ),
+      ]);
+      await pumpEventQueue();
+      expect(workspace.threads.map((thread) => thread.title), [
+        'New Chat',
+        'Earlier on the Desktop',
+      ]);
+      expect(workspace.selected, same(moved));
+    },
+  );
+
+  testWidgets('SSH hosts are under Remote, their projects at their side '
+      'under Choose Folder…, with Open Remote Project…, which asks for a '
+      'host', (tester) async {
+    final workspace = await _pumpNew(tester);
+    await workspace.openFolder('ssh://dev/home/me/app');
+    await workspace.openFolder('ssh://dev/home/me/api');
+    await workspace.openFolder('ssh://prod/srv/web');
+    await tester.pumpAndSettle();
+    expect(workspace.selected.project.host, 'prod');
+    await workspace.openFolder('ssh://dev/home/me/app');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.descendant(of: _bar, matching: find.text('app')));
+    await tester.pumpAndSettle();
+    final remote = tester.getTopLeft(find.text('Remote')).dy;
+    // This machine's first, without a heading; a row for each host under
+    // Remote, not one for each project.
+    expect(tester.getTopLeft(find.text('No folder')).dy, lessThan(remote));
+    expect(tester.getTopLeft(find.text('2 projects')).dy, greaterThan(remote));
+    expect(find.text('1 project'), findsOneWidget);
+    expect(find.text('/home/me/app'), findsNothing);
+
+    // Picked, a host shows its projects at its side, under a folder there
+    // to pick; one picked there is moved to.
+    await tester.tap(find.text('2 projects'));
+    await tester.pumpAndSettle();
+    expect(find.text('/home/me/app'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('Choose Folder…')).dy,
+      lessThan(
+        tester
+            .getTopLeft(
+              find.descendant(of: _bar, matching: find.text('app')).last,
+            )
+            .dy,
+      ),
+    );
+    expect(
+      tester.getTopLeft(find.text('/home/me/api')).dx,
+      greaterThan(tester.getTopRight(find.text('2 projects')).dx),
+    );
+    await tester.tap(find.text('/home/me/api'));
+    await tester.pumpAndSettle();
+    expect(workspace.selected.project.path, 'ssh://dev/home/me/api');
+    expect(find.text('/home/me/api'), findsNothing);
+
+    await tester.tap(find.descendant(of: _bar, matching: find.text('api')));
+    await tester.pumpAndSettle();
+    expect(find.text('Open Remote Project...'), findsOneWidget);
+
+    // Picking it walks to a host; nothing is connected to yet.
+    final configHosts = OpenRemoteFlow.defaultConfigHosts;
+    OpenRemoteFlow.defaultConfigHosts = () async => ['dev', 'prod'];
+    addTearDown(() => OpenRemoteFlow.defaultConfigHosts = configHosts);
+    await tester.tap(find.text('Open Remote Project...'));
+    await tester.pumpAndSettle();
+    expect(find.byType(IdeQuickInput), findsOneWidget);
+    expect(
+      tester
+          .widget<IdeQuickInput>(find.byType(IdeQuickInput))
+          .pick
+          ?.placeholder,
+      'Select a host, add one, or type user@host[:port]',
+    );
+  }, variant: _mac);
+}

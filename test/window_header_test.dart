@@ -1,0 +1,806 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/workspace/islands.dart';
+import 'package:agilegeek/chat/chat_screen.dart';
+import 'package:agilegeek/chat/side_panel/side_panel_view.dart';
+import 'package:agilegeek/chat/composer/composer.dart';
+import 'package:agilegeek/chat/panels/context_usage_panel.dart';
+import 'package:agilegeek/ide/ide_command_center.dart';
+import 'package:agilegeek/ide/ide_hover.dart';
+import 'package:agilegeek/ide/ide_layout.dart';
+import 'package:agilegeek/ide/ide_quick_input.dart';
+import 'package:agilegeek/ide/ide_workbench.dart';
+import 'package:agilegeek/ide/lsp_ui/problems_panel.dart';
+import 'package:agilegeek/ide/terminal/terminal_instance.dart';
+import 'package:agilegeek/main.dart';
+import 'package:agilegeek/settings/settings_dialog.dart';
+import 'package:agilegeek/sidebar/sidebar.dart';
+import 'package:agilegeek/theme/code_font.dart';
+import 'package:agilegeek/theme/codicons.dart';
+import 'package:agilegeek/theme/app_theme.dart';
+import 'package:agilegeek/workspace/back_to_chat_button.dart';
+import 'package:agilegeek/workspace/editor_launcher.dart';
+import 'package:agilegeek/workspace/open_in_editor_button.dart';
+import 'package:agilegeek/workspace/pin_window_button.dart';
+import 'package:agilegeek/workspace/window_header/about_dialog.dart';
+import 'package:agilegeek/workspace/window_header/header_menu_bar.dart';
+import 'package:agilegeek/workspace/window_header/window_header.dart';
+import 'package:agilegeek/workspace/workspace.dart';
+import 'package:agilegeek/update/version.dart';
+
+import 'ide/terminal/fake_pty.dart';
+import 'ide/terminal/fake_terminal.dart';
+
+const _window = MethodChannel('agilegeek/window');
+
+/// The app with the header Windows draws, and what it tells the window.
+Future<(Workspace, List<MethodCall>)> pumpWindowsApp(
+  WidgetTester tester, {
+  TerminalBackend? terminalBackend,
+}) async {
+  tester.view.physicalSize = const Size(1400, 900);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.reset);
+  final calls = <MethodCall>[];
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(_window, (
+    call,
+  ) async {
+    calls.add(call);
+    return null;
+  });
+  addTearDown(
+    () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      _window,
+      null,
+    ),
+  );
+  final workspace = Workspace.mock();
+  await tester.pumpWidget(
+    AgileGeekApp(workspace: workspace, terminalBackend: terminalBackend),
+  );
+  await tester.pump();
+  return (workspace, calls);
+}
+
+final _windows = TargetPlatformVariant.only(TargetPlatform.windows);
+
+void main() {
+  testWidgets('the header opens the current session\'s project, as the '
+      'session changes', (tester) async {
+    final (workspace, _) = await pumpWindowsApp(tester);
+    final other = workspace.threads.firstWhere(
+      (thread) => thread.project != workspace.current!.project,
+    );
+    workspace.select(other);
+    await tester.pump();
+    final button = tester.widget<OpenInEditorButton>(
+      find.descendant(
+        of: find.byType(WindowHeader),
+        matching: find.byType(OpenInEditorButton),
+      ),
+    );
+    expect(button.project, other.project);
+  }, variant: _windows);
+
+  testWidgets('the window hears where the header\'s controls are whenever '
+      'they move, and only then', (tester) async {
+    final (workspace, calls) = await pumpWindowsApp(tester);
+    List<MethodCall> reports() =>
+        calls.where((call) => call.method == 'setHitTestAreas').toList();
+    expect(reports(), hasLength(1));
+    await tester.pump();
+    await tester.pump();
+    expect(reports(), hasLength(1));
+
+    // A longer label: the editor button, and the pin beside it, move left.
+    workspace.preferredEditor = Editor.terminal;
+    await tester.pump();
+    await tester.pump();
+    expect(reports(), hasLength(2));
+    List<Object?> controls(MethodCall call) =>
+        (call.arguments as Map)['controls'] as List<Object?>;
+    expect(controls(reports().last), isNot(controls(reports().first)));
+  }, variant: _windows);
+
+  testWidgets('zoomed in, the window leaves the editor button to Flutter as '
+      'it is drawn: its chevron too, not dragging the window', (tester) async {
+    CodeFont.uiScale.value = 125;
+    addTearDown(() => CodeFont.uiScale.value = CodeFont.defaultUiScale);
+    final (_, calls) = await pumpWindowsApp(tester);
+    await tester.pump();
+    final button = tester.getRect(
+      find.descendant(
+        of: find.byType(WindowHeader),
+        matching: find.byType(OpenInEditorButton),
+      ),
+    );
+    final report = calls.lastWhere((call) => call.method == 'setHitTestAreas');
+    final controls = [
+      for (final control in (report.arguments as Map)['controls'] as List)
+        Rect.fromLTWH(
+          (control as Map)['left'] as double,
+          control['top'] as double,
+          control['width'] as double,
+          control['height'] as double,
+        ),
+    ];
+    expect(
+      controls.where(
+        (control) => control.contains(button.centerRight - const Offset(2, 0)),
+      ),
+      isNotEmpty,
+    );
+    expect(controls, contains(rectMoreOrLessEquals(button)));
+  }, variant: _windows);
+
+  testWidgets('Back to Chat takes Open in Fast Ide\'s place as it is, so '
+      'the switch does not jump', (tester) async {
+    final (workspace, _) = await pumpWindowsApp(tester);
+    workspace.preferredEditor = Editor.fastIde;
+    await tester.pump();
+    final header = find.byType(WindowHeader);
+    final open = tester.getRect(
+      find.descendant(of: header, matching: find.byType(OpenInEditorButton)),
+    );
+
+    workspace.layout = WorkspaceLayout.ide;
+    await tester.pump();
+    await tester.pump();
+    final back = tester.getRect(
+      find.descendant(of: header, matching: find.byType(BackToChatButton)),
+    );
+    expect(back, open);
+  }, variant: _windows);
+
+  testWidgets('over the IDE it is the IDE\'s title bar, and over the '
+      'conversations their window\'s top: no line under it either way; the '
+      'way back to the chat on the right', (tester) async {
+    final (workspace, calls) = await pumpWindowsApp(tester);
+    final header = find.byType(WindowHeader);
+    // A line along its foot, of anything in it as wide as it.
+    bool line() {
+      final width = tester.getSize(header).width;
+      final boxes = find.descendant(
+        of: header,
+        matching: find.byType(DecoratedBox),
+      );
+      return boxes.evaluate().any(
+        (element) =>
+            (element.size?.width ?? 0) >= width - .5 &&
+            switch ((element.widget as DecoratedBox).decoration) {
+              BoxDecoration(border: Border(:final bottom)) =>
+                bottom != BorderSide.none,
+              _ => false,
+            },
+      );
+    }
+
+    final back = find.descendant(
+      of: header,
+      matching: find.byType(BackToChatButton),
+    );
+    expect(line(), isFalse);
+    expect(back, findsNothing);
+
+    workspace.layout = WorkspaceLayout.ide;
+    await tester.pump();
+    await tester.pump();
+    expect(line(), isFalse);
+    expect(back, findsOneWidget);
+    final button = tester.getRect(back);
+    expect(button.height, 22);
+    expect(button.center.dy, tester.getRect(header).center.dy);
+    // The window leaves it to Flutter, rather than dragging by it.
+    final report = calls.lastWhere((call) => call.method == 'setHitTestAreas');
+    expect(
+      (report.arguments as Map)['controls'],
+      contains(
+        equals({
+          'left': button.left,
+          'top': button.top,
+          'width': button.width,
+          'height': button.height,
+        }),
+      ),
+    );
+
+    await tester.tap(back);
+    await tester.pump();
+    expect(workspace.layout, WorkspaceLayout.chat);
+    await tester.pump();
+    expect(back, findsNothing);
+  }, variant: _windows);
+
+  testWidgets('over the IDE, its search box and Go Back and Go Forward are '
+      'in the middle, as on its own title bar (#539)', (tester) async {
+    final (workspace, calls) = await pumpWindowsApp(tester);
+    final center = find.descendant(
+      of: find.byType(WindowHeader),
+      matching: find.byType(IdeCommandCenter),
+    );
+    expect(center, findsNothing);
+
+    workspace.layout = WorkspaceLayout.ide;
+    await tester.pump();
+    await tester.pump();
+    expect(center, findsOneWidget);
+    // The IDE draws no title bar of its own under it.
+    expect(find.byType(IdeCommandCenter), findsOneWidget);
+    final strip = tester.getRect(find.byType(WindowHeader));
+    expect(tester.getCenter(center).dx, closeTo(strip.center.dx, 60));
+    // Nowhere to go yet.
+    final arrows = tester.widgetList<IdeActionButton>(
+      find.descendant(of: center, matching: find.byType(IdeActionButton)),
+    );
+    expect(arrows.map((arrow) => arrow.onPressed), everyElement(isNull));
+    // The window leaves it to Flutter, rather than dragging by it.
+    final rect = tester.getRect(center);
+    final report = calls.lastWhere((call) => call.method == 'setHitTestAreas');
+    expect(
+      (report.arguments as Map)['controls'],
+      contains(
+        equals({
+          'left': rect.left,
+          'top': rect.top,
+          'width': rect.width,
+          'height': rect.height,
+        }),
+      ),
+    );
+
+    await tester.tap(
+      find.descendant(of: center, matching: find.byIcon(Codicons.search)),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(find.byType(IdeQuickInput), findsOneWidget);
+  }, variant: _windows);
+
+  testWidgets('narrow, the session\'s title is in the header, as macOS\'s '
+      'title bar has it: the menus folded into one button, the '
+      'conversation\'s background, no line', (tester) async {
+    final (workspace, _) = await pumpWindowsApp(tester);
+    tester.view.physicalSize = const Size(520, 760);
+    await tester.pump();
+    await tester.pump();
+    final header = find.byType(WindowHeader);
+    final title = workspace.current!.title;
+    final inHeader = find.descendant(of: header, matching: find.text(title));
+    expect(inHeader, findsOneWidget);
+    // Not again in a row of the chat's own.
+    expect(
+      find.descendant(of: find.byType(ChatScreen), matching: find.text(title)),
+      findsNothing,
+    );
+    expect(
+      find.descendant(of: header, matching: find.text('File')),
+      findsNothing,
+    );
+    final decoration =
+        tester
+                .widget<DecoratedBox>(
+                  find
+                      .descendant(
+                        of: header,
+                        matching: find.byType(DecoratedBox),
+                      )
+                      .first,
+                )
+                .decoration
+            as BoxDecoration;
+    expect(decoration.border, isNull);
+    final material = tester.widget<Material>(
+      find.descendant(of: header, matching: find.byType(Material)).first,
+    );
+    expect(material.color, AppColors.conversationSurface);
+    // The sidebar's toggle first, as by macOS's traffic lights, then the
+    // menus' button, then the title.
+    final menu = find.descendant(
+      of: header,
+      matching: find.widgetWithIcon(SidebarIconButton, Codicons.menu),
+    );
+    final toggle = find.descendant(
+      of: header,
+      matching: find.widgetWithIcon(
+        SidebarIconButton,
+        Codicons.layoutSidebarLeftOff,
+      ),
+    );
+    expect(
+      tester.getRect(menu).left,
+      greaterThan(tester.getRect(toggle).right),
+    );
+    expect(
+      tester.getRect(inHeader).left,
+      greaterThan(tester.getRect(menu).right),
+    );
+
+    // The menus, and a menu's commands beside it.
+    await tester.tap(menu);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.tap(find.text('File'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('Close Window'), findsOneWidget);
+
+    // Wide again: the menu bar, the title back in the chat.
+    tester.view.physicalSize = const Size(1400, 900);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(inHeader, findsNothing);
+    expect(
+      find.descendant(of: header, matching: find.text('File')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: find.byType(ChatScreen), matching: find.text(title)),
+      findsOneWidget,
+    );
+  }, variant: _windows);
+
+  testWidgets('under the settings, the header\'s left is theirs: the chat\'s '
+      'toggle, menus and title give way to the settings\' list toggle, '
+      'with no row of its own under the header', (tester) async {
+    final (workspace, calls) = await pumpWindowsApp(tester);
+    tester.view.physicalSize = const Size(520, 760);
+    await tester.pump();
+    await tester.pump();
+    final header = find.byType(WindowHeader);
+    final title = find.descendant(
+      of: header,
+      matching: find.text(workspace.current!.title),
+    );
+    final menu = find.descendant(
+      of: header,
+      matching: find.widgetWithIcon(SidebarIconButton, Codicons.menu),
+    );
+    expect(title, findsOneWidget);
+    expect(menu, findsOneWidget);
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+    final dialog = find.byType(SettingsDialog);
+    expect(dialog, findsOneWidget);
+    expect(title, findsNothing);
+    expect(menu, findsNothing);
+    for (final icon in [
+      Codicons.layoutSidebarLeft,
+      Codicons.layoutSidebarLeftOff,
+    ]) {
+      expect(
+        find.descendant(
+          of: header,
+          matching: find.widgetWithIcon(SidebarIconButton, icon),
+        ),
+        findsNothing,
+      );
+    }
+
+    // The settings' toggle, where the chat's was, in the header's strip.
+    final toggle = find.descendant(
+      of: dialog,
+      matching: find.widgetWithIcon(
+        SidebarIconButton,
+        Codicons.layoutSidebarLeftOff,
+      ),
+    );
+    expect(toggle, findsOneWidget);
+    final rect = tester.getRect(toggle);
+    expect(rect.left, WindowHeader.settingsToggleLeft);
+    expect(rect.center.dy, tester.getRect(header).center.dy);
+    // The window leaves it to Flutter, rather than dragging by it.
+    final report = calls.lastWhere((call) => call.method == 'setHitTestAreas');
+    expect(
+      (report.arguments as Map)['controls'],
+      contains(
+        equals({
+          'left': rect.left,
+          'top': rect.top,
+          'width': rect.width,
+          'height': rect.height,
+        }),
+      ),
+    );
+
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect(tester.state<SettingsDialogState>(dialog).navShown, isTrue);
+
+    // Closed: the chat's again.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(dialog, findsNothing);
+    expect(title, findsOneWidget);
+    expect(menu, findsOneWidget);
+  }, variant: _windows);
+
+  testWidgets('under the settings, the header\'s right has the window\'s '
+      'buttons alone: the IDE\'s tools under their barrier are not shown', (
+    tester,
+  ) async {
+    // #312: the IDE's layout toggles, the pin and Back to Chat showed over
+    // the settings, and a click on them did nothing.
+    final (workspace, calls) = await pumpWindowsApp(tester);
+    workspace.layout = WorkspaceLayout.ide;
+    await tester.pump();
+    await tester.pump();
+    final header = find.byType(WindowHeader);
+    Finder inHeader(Type type) =>
+        find.descendant(of: header, matching: find.byType(type));
+    final tools = [IdeLayoutToggle, PinWindowButton, BackToChatButton];
+    for (final type in tools) {
+      expect(inHeader(type), findsWidgets);
+    }
+
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+    expect(find.byType(SettingsDialog), findsOneWidget);
+    for (final type in tools) {
+      expect(inHeader(type), findsNothing);
+    }
+    // The window drags by where they were: only the settings' list toggle
+    // is left to Flutter.
+    final report = calls.lastWhere((call) => call.method == 'setHitTestAreas');
+    expect((report.arguments as Map)['controls'], hasLength(1));
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.byType(SettingsDialog), findsNothing);
+    for (final type in tools) {
+      expect(inHeader(type), findsWidgets);
+    }
+  }, variant: _windows);
+
+  testWidgets('the sidebar toggle comes after the menus, in the IDE\'s '
+      'layout icons', (tester) async {
+    await pumpWindowsApp(tester);
+    final header = find.byType(WindowHeader);
+    final menus = find.descendant(
+      of: header,
+      matching: find.byType(HeaderMenuBar),
+    );
+    // The sidebar's, not the side panel's.
+    final toggle = find.descendant(
+      of: header,
+      matching: find.byWidgetPredicate(
+        (widget) =>
+            widget is SidebarIconButton &&
+            widget.command == 'workbench.action.toggleSidebarVisibility',
+      ),
+    );
+    IconData icon() => tester.widget<SidebarIconButton>(toggle).icon;
+    expect(
+      tester.getRect(toggle).left,
+      greaterThan(tester.getRect(menus).right),
+    );
+    expect(icon(), Codicons.layoutSidebarLeft);
+    await tester.tap(toggle);
+    await tester.pump();
+    expect(icon(), Codicons.layoutSidebarLeftOff);
+  }, variant: _windows);
+
+  testWidgets('where the window has not the room for the sidebar and the '
+      'side panel, the one asked for last stays: the other gives way to the '
+      'window until it widens, to the one asked for until asked again', (
+    tester,
+  ) async {
+    await pumpWindowsApp(tester);
+    final header = find.byType(WindowHeader);
+    final sidebarToggle = find.descendant(
+      of: header,
+      matching: find.byWidgetPredicate(
+        (widget) =>
+            widget is SidebarIconButton &&
+            widget.command == 'workbench.action.toggleSidebarVisibility',
+      ),
+    );
+    // On the conversation's card; in the header where that has the title,
+    // the window narrow.
+    final panelToggle = find.byType(SidePanelToggle);
+    final sash = find.byKey(const ValueKey('side-panel-sash'));
+    Future<void> resize(double width) async {
+      tester.view.physicalSize = Size(width, 900);
+      await tester.pumpAndSettle();
+    }
+
+    Future<void> tap(Finder toggle) async {
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+    }
+
+    /// Whether the sidebar is docked and the panel shows, as the toggles
+    /// have them and as laid out.
+    (bool, bool) shown() {
+      final sidebar =
+          tester.widget<SidebarIconButton>(sidebarToggle).icon ==
+          Codicons.layoutSidebarLeft;
+      final panel = tester.widget<SidePanelToggle>(panelToggle).shown;
+      expect(sash.evaluate().isNotEmpty, panel);
+      // The conversation at the sidebar's right, or at the window's left.
+      expect(tester.getRect(find.byType(ChatScreen)).left > 100, sidebar);
+      return (sidebar, panel);
+    }
+
+    await tap(panelToggle);
+    expect(shown(), (true, true));
+
+    // The panel asked for last, the sidebar gives way to a narrow window,
+    // and is back as it widens.
+    await resize(800);
+    expect(shown(), (false, true));
+    await resize(1400);
+    expect(shown(), (true, true));
+
+    // Asked for, the sidebar stays and the panel closes, until asked again.
+    await resize(800);
+    await tap(sidebarToggle);
+    expect(shown(), (true, false));
+    await resize(1400);
+    expect(shown(), (true, false));
+
+    // As the panel, asked for again: the sidebar closes.
+    await resize(800);
+    await tap(panelToggle);
+    expect(shown(), (false, true));
+    await resize(1400);
+    expect(shown(), (false, true));
+
+    // The sidebar asked for last, the panel gives way to a narrow window.
+    await tap(sidebarToggle);
+    expect(shown(), (true, true));
+    await resize(800);
+    expect(shown(), (true, false));
+    await resize(1400);
+    expect(shown(), (true, true));
+  }, variant: _windows);
+
+  testWidgets('over the IDE, the IDE\'s layout toggles as on its own title '
+      'bar: the side bar\'s after the menus, the panel\'s and the chat\'s on '
+      'the right; no editor to open the project in', (tester) async {
+    final (workspace, calls) = await pumpWindowsApp(tester);
+    workspace.layout = WorkspaceLayout.ide;
+    await tester.pump();
+    await tester.pump();
+    final header = find.byType(WindowHeader);
+    final layout = tester
+        .widget<IdeWorkbench>(find.byType(IdeWorkbench))
+        .workspace
+        .layout;
+    Finder toggle(String tooltip) =>
+        find.descendant(of: header, matching: find.byTooltip(tooltip));
+    final sidebar = toggle('Toggle Primary Side Bar (Ctrl+B)');
+    final panel = toggle('Toggle Panel (Ctrl+`)');
+    final chat = toggle('Toggle Chat (Ctrl+J)');
+    List<IconData> icons() => [
+      for (final toggle in [sidebar, panel, chat])
+        tester
+            .widget<Icon>(
+              find.descendant(of: toggle, matching: find.byType(Icon)),
+            )
+            .icon!,
+    ];
+
+    final menus = find.descendant(
+      of: header,
+      matching: find.byType(HeaderMenuBar),
+    );
+    final pin = find.descendant(
+      of: header,
+      matching: find.byType(PinWindowButton),
+    );
+    expect(
+      tester.getRect(sidebar).left,
+      greaterThan(tester.getRect(menus).right),
+    );
+    expect(
+      tester.getRect(panel).right,
+      lessThanOrEqualTo(tester.getRect(chat).left),
+    );
+    expect(tester.getRect(chat).right, lessThan(tester.getRect(pin).left));
+    expect(
+      find.descendant(of: header, matching: find.byType(OpenInEditorButton)),
+      findsNothing,
+    );
+    expect(icons(), [
+      Codicons.layoutSidebarLeft,
+      Codicons.layoutPanelOff,
+      Codicons.layoutSidebarRight,
+    ]);
+    expect(find.text('Explorer'), findsOneWidget);
+    expect(find.text('PROBLEMS'), findsNothing);
+
+    // The IDE follows them.
+    for (final toggle in [sidebar, panel, chat]) {
+      await tester.tap(toggle);
+      await tester.pump();
+    }
+    expect(layout.sidebar, isFalse);
+    expect(layout.panel, IdePanelTab.problems);
+    expect(layout.chat, isFalse);
+    expect(icons(), [
+      Codicons.layoutSidebarLeftOff,
+      Codicons.layoutPanel,
+      Codicons.layoutSidebarRightOff,
+    ]);
+    expect(find.text('Explorer'), findsNothing);
+    expect(find.text('PROBLEMS'), findsOneWidget);
+
+    // The window leaves them to Flutter, rather than dragging by them.
+    await tester.pump();
+    final report = calls.lastWhere((call) => call.method == 'setHitTestAreas');
+    for (final toggle in [sidebar, panel, chat]) {
+      final rect = tester.getRect(
+        find.ancestor(of: toggle, matching: find.byType(IdeLayoutToggle)),
+      );
+      expect(
+        (report.arguments as Map)['controls'],
+        contains(
+          equals({
+            'left': rect.left,
+            'top': rect.top,
+            'width': rect.width,
+            'height': rect.height,
+          }),
+        ),
+      );
+    }
+  }, variant: _windows);
+
+  testWidgets('with terminals, the panel toggles open on TERMINAL, a '
+      'terminal of its own made; the app has none unless given them', (
+    tester,
+  ) async {
+    final ptys = <FakePty>[];
+    final (workspace, _) = await pumpWindowsApp(
+      tester,
+      terminalBackend: fakeTerminalBackend(ptys),
+    );
+    workspace.layout = WorkspaceLayout.ide;
+    await tester.pump();
+    await tester.pump();
+    final layout = tester
+        .widget<IdeWorkbench>(find.byType(IdeWorkbench))
+        .workspace
+        .layout;
+    await tester.tap(
+      find.descendant(
+        of: find.byType(WindowHeader),
+        matching: find.byTooltip('Toggle Panel (Ctrl+`)'),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(layout.panel, IdePanelTab.terminal);
+    expect(find.text('TERMINAL'), findsOneWidget);
+    expect(ptys, hasLength(1));
+    expect(ptys.single.launch!.executable, '/bin/zsh');
+  }, variant: _windows);
+
+  testWidgets('View → Context Panel opens the chat\'s, wherever the focus '
+      'is', (tester) async {
+    await pumpWindowsApp(tester);
+    FocusManager.instance.primaryFocus?.unfocus();
+    await tester.pump();
+    expect(find.byType(ContextUsagePanel), findsNothing);
+    await tester.tap(find.text('View'));
+    await tester.pump();
+    await tester.tap(find.text('Context Panel'));
+    await tester.pump();
+    expect(find.byType(ContextUsagePanel), findsOneWidget);
+  }, variant: _windows);
+
+  testWidgets('code falls back to a monospaced font Windows has', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: Scaffold(
+          body: Text('x', style: TextStyle(fontFamily: AppFonts.mono)),
+        ),
+      ),
+    );
+    final style = tester
+        .renderObject<RenderParagraph>(find.text('x'))
+        .text
+        .style!;
+    expect(style.fontFamily, AppFonts.mono);
+    expect(style.fontFamilyFallback, contains('Consolas'));
+  }, variant: _windows);
+
+  testWidgets('Chinese falls back to the font Windows itself links to', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: const Scaffold(body: Text('x')),
+      ),
+    );
+    final style = tester
+        .renderObject<RenderParagraph>(find.text('x'))
+        .text
+        .style!;
+    // The monospaced families carry no Han glyphs, so YaHei has to be in the
+    // chain and reachable — i.e. after them, not before.
+    final fallbacks = style.fontFamilyFallback!;
+    expect(fallbacks, contains('Microsoft YaHei UI'));
+    expect(
+      fallbacks.indexOf('Microsoft YaHei UI'),
+      greaterThan(fallbacks.indexOf('Consolas')),
+    );
+  }, variant: _windows);
+
+  testWidgets('on macOS the window\'s buttons are at its right, in the IDE '
+      'title bar\'s order; the conversation\'s on its card, under them', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(AgileGeekApp(workspace: Workspace.mock()));
+    await tester.pump();
+    Rect rectOf(Type type) => tester.getRect(
+      find.descendant(of: find.byType(ChatScreen), matching: find.byType(type)),
+    );
+    final sidePanel = rectOf(SidePanelToggle);
+    final pin = rectOf(PinWindowButton);
+    final open = rectOf(OpenInEditorButton);
+    // The pin, then the editor's button last, as the IDE's pin and Back to
+    // Chat; the side panel's toggle, as its chat toggle, the conversation's:
+    // along the top of its card, under them, at its right end.
+    expect(pin.right, lessThan(open.left));
+    final card = tester.getRect(
+      find.descendant(
+        of: find.byType(ChatScreen),
+        matching: find.byType(Island),
+      ),
+    );
+    expect(sidePanel.top, greaterThan(card.top));
+    expect(sidePanel.bottom, lessThan(card.top + ChatScreen.cardHeaderHeight));
+    expect(sidePanel.top, greaterThan(open.bottom));
+    // Its right edge on the rail's under it.
+    expect(sidePanel.right, card.right - AgentSidePanelArea.railRight);
+    // At the window's end, as far from it as the IDE's Back to Chat (the
+    // card's gap counted in): not its column's.
+    expect(open.right, 1400 - 8);
+    expect(
+      open.right,
+      greaterThan(tester.getRect(find.byType(ChatComposer)).right),
+    );
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+  testWidgets('About shows the app icon and the version this build is', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAppTheme(),
+        home: Builder(
+          builder: (context) => TextButton(
+            onPressed: () => showAboutAgileGeek(context),
+            child: const Text('About'),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('About'));
+    await tester.pumpAndSettle();
+    // version.dart's, which tool/bump_version.dart keeps with pubspec.yaml.
+    expect(find.text(currentAppVersion.marketing), findsOneWidget);
+    final icon = tester.widget<Image>(find.byType(Image));
+    expect((icon.image as AssetImage).assetName, aboutIconAsset);
+    expect(File(aboutIconAsset).existsSync(), isTrue);
+  });
+}

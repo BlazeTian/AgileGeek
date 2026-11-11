@@ -1,0 +1,1397 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
+
+import 'package:agile_editor/monaco/flutter/editor_document_model.dart';
+
+import 'file_service.dart';
+import 'file_views.dart';
+import 'git/git_repository.dart';
+import 'git/scm_host.dart';
+import 'git/repository_scan.dart';
+import 'host_paths.dart';
+import 'ide_layout.dart';
+import 'ide_local_history.dart';
+import 'ide_notifications.dart';
+import 'ide_view_state.dart';
+import 'lsp/language_features.dart';
+import 'lsp/lsp_protocol.dart';
+import 'search/ide_search_view.dart' show IdeSearchReplaceBackend;
+
+/// The original side of a diff tab: text at a revision, read again when
+/// the repository changes (VS Code's `git:` documents).
+class IdeDiffOriginal {
+  IdeDiffOriginal(this.read);
+
+  /// Reads the text.
+  final Future<String> Function() read;
+
+  /// The text; null while first read.
+  final ValueNotifier<String?> text = ValueNotifier(null);
+
+  /// Reads the text again; false when it failed.
+  Future<bool> reload() async {
+    try {
+      text.value = await read();
+      return true;
+    } catch (_) {
+      text.value ??= '';
+      return false;
+    }
+  }
+
+  void dispose() => text.dispose();
+}
+
+class IdeDocument {
+  IdeDocument(this.path, String text)
+    : model = EditorDocumentModel(text),
+      openError = null,
+      label = null,
+      readRevision = null,
+      diff = null,
+      isMedia = false,
+      view = null,
+      isUntitled = false;
+
+  /// A new file, not saved anywhere yet: [path] is its name alone
+  /// (`Untitled-1`), and saving it asks where to (Save As).
+  IdeDocument.untitled(this.path)
+    : model = EditorDocumentModel(''),
+      openError = null,
+      label = null,
+      readRevision = null,
+      diff = null,
+      isMedia = false,
+      view = null,
+      isUntitled = true;
+
+  /// An image, shown in VS Code's image preview rather than the text
+  /// editor, or a file of a [FileView] ([view], its id), shown as that:
+  /// it has no text.
+  IdeDocument.media(this.path, {this.view})
+    : model = EditorDocumentModel(''),
+      openError = null,
+      label = null,
+      readRevision = null,
+      diff = null,
+      isMedia = true,
+      isUntitled = false;
+
+  /// A file the editor could not open: its tab shows [openError] in VS
+  /// Code's placeholder editor, and it has no text.
+  IdeDocument.unopenable(this.path, Object this.openError)
+    : model = EditorDocumentModel(''),
+      label = null,
+      readRevision = null,
+      diff = null,
+      isMedia = false,
+      view = null,
+      isUntitled = false;
+
+  /// [path]'s text at a revision (Git's), read-only, titled with [label]
+  /// (`Deleted`, `Index`): VS Code's editor of a `git:` document.
+  IdeDocument.revision(
+    this.path,
+    String text, {
+    required String this.label,
+    required Future<String> Function() this.readRevision,
+  }) : model = EditorDocumentModel(text),
+       openError = null,
+       diff = null,
+       isMedia = false,
+       view = null,
+       isUntitled = false;
+
+  /// A diff tab: [diff]'s original against [model], [path]'s file (then
+  /// shared with its other tabs) or, with [readRevision], its text at a
+  /// revision; titled with [label] (`Working Tree`, `Index`).
+  IdeDocument.diff(
+    this.path,
+    this.model, {
+    required String this.label,
+    required IdeDiffOriginal this.diff,
+    this.readRevision,
+  }) : openError = null,
+       isMedia = false,
+       view = null,
+       isUntitled = false;
+
+  /// [path]'s own tab of the [model] its diff tab has.
+  IdeDocument._shared(this.path, this.model)
+    : openError = null,
+      label = null,
+      readRevision = null,
+      diff = null,
+      isMedia = false,
+      view = null,
+      isUntitled = false;
+
+  /// [document], new, saved to [path]: the same text and history.
+  IdeDocument._saved(this.path, IdeDocument document)
+    : model = document.model,
+      openError = null,
+      label = null,
+      readRevision = null,
+      diff = null,
+      isMedia = false,
+      view = null,
+      isUntitled = false;
+
+  /// [document] at [path], after its file moved: the same text, history
+  /// and unsaved changes.
+  IdeDocument._moved(this.path, IdeDocument document)
+    : model = document.model,
+      openError = document.openError,
+      label = document.label,
+      readRevision = document.readRevision,
+      diff = document.diff,
+      isMedia = document.isMedia,
+      view = document.view,
+      isUntitled = document.isUntitled;
+
+  final String path;
+  final EditorDocumentModel model;
+
+  /// Why the file is not shown ([IdeBinaryFileException],
+  /// [IdeFileTooLargeException], or the read's error); null when it is.
+  final Object? openError;
+
+  /// What the tab's title says after the name, in parentheses (nothing,
+  /// empty); null for a file's own tab.
+  final String? label;
+
+  /// Reads the text again, where it is at a revision, not the file's: the
+  /// document is then read-only.
+  final Future<String> Function()? readRevision;
+
+  /// The original side, for a diff tab.
+  final IdeDiffOriginal? diff;
+
+  /// Whether the tab is the image preview's, or a [FileView]'s
+  /// ([IdeDocument.media]).
+  final bool isMedia;
+
+  /// The [FileView] the tab shows its file in (its id), if any.
+  final String? view;
+
+  /// Whether it is a new file not saved yet ([IdeDocument.untitled]).
+  final bool isUntitled;
+
+  /// Whether its file was deleted while open: the tab says so, and saving
+  /// makes the file again (VS Code's orphaned editors).
+  bool deleted = false;
+
+  /// Tells the tab apart from [path]'s others.
+  String get key => label == null ? path : '$path\u0000$label';
+
+  /// Whether the text is the file's: saved to it, and given to language
+  /// servers.
+  bool get isFile =>
+      readRevision == null && openError == null && !isMedia && !isUntitled;
+  bool get readOnly => readRevision != null;
+
+  String get text => model.text;
+  set text(String value) => model.replaceText(value);
+  String get savedText => model.savedText;
+  set savedText(String value) => model.markSaved(value);
+
+  String get name => hostBasename(path);
+
+  /// The tab's title: the name, and the [label].
+  String get title => label?.isNotEmpty ?? false ? '$name ($label)' : name;
+  bool get dirty => !readOnly && model.isDirty;
+
+  void dispose() {
+    model.dispose();
+    diff?.dispose();
+  }
+}
+
+/// Open files belong to the IDE pane, not to any one agent conversation.
+class IdeWorkspace extends ChangeNotifier
+    implements IdeSearchReplaceBackend, IdeScmHost {
+  IdeWorkspace(
+    this.root, {
+    IdeFileService? files,
+    this.languages,
+    this._git,
+    this.hasFolder = true,
+    Stream<void> Function(String directory)? watch,
+    List<String> roots = const [],
+    this._gitOf,
+    IdeRepositoryDetection? repositoryDetection,
+    this.openWorktree,
+    p.Context? paths,
+  }) : _detection = repositoryDetection,
+       paths = paths == null
+           ? p.context
+           : p.Context(style: paths.style, current: root),
+       files = files ?? IdeFileService(root),
+       _watchDirectory =
+           watch ??
+           switch (files) {
+             final IdeHostFiles files => files.watchDirectory,
+             _ => watchDirectory,
+           } {
+    addListener(_watchOpenFiles);
+    _setRoots(roots);
+    if (_gitOf == null && _git != null && hasFolder) _detectIn(root);
+  }
+
+  /// The project's folder; a multi-folder workspace's own (empty) folder
+  /// when it has [roots].
+  @override
+  final String root;
+
+  /// Path syntax of the project's host, with relative paths based at [root]
+  /// when supplied; this machine's context otherwise.
+  final p.Context paths;
+
+  /// The folders of a multi-folder workspace, each a root of the explorer
+  /// and a repository of Source Control, as VS Code's workspace folders;
+  /// empty for a folder's project.
+  List<String> get roots => List.unmodifiable(_roots);
+  final List<String> _roots = [];
+
+  /// Whether it shows a multi-folder workspace (even one with no folders
+  /// yet).
+  bool get isMultiRoot => _gitOf != null;
+
+  /// Makes the repository of a workspace folder.
+  final IdeGitRepository? Function(String root)? _gitOf;
+
+  /// Has the workspace hold [roots] from now on: the repositories of those
+  /// gone are let go, those added made.
+  set roots(List<String> roots) {
+    if (listEquals(roots, _roots)) return;
+    _setRoots(roots);
+    notifyListeners();
+  }
+
+  void _setRoots(List<String> roots) {
+    final gitOf = _gitOf;
+    for (final root in _roots) {
+      if (roots.contains(root)) continue;
+      _repositories.remove(root)?.dispose();
+      for (final (_, git)
+          in _found.remove(root) ?? const <(String, IdeGitRepository)>[]) {
+        git.dispose();
+      }
+    }
+    _roots
+      ..clear()
+      ..addAll(roots);
+    if (gitOf == null) return;
+    for (final root in roots) {
+      if (!_repositories.containsKey(root)) _repositories[root] = gitOf(root);
+      _detectIn(root);
+    }
+    for (final own in [..._worktrees.keys]) {
+      if (!_ownRepositories.any((r) => identical(r.$2, own))) {
+        _worktrees.remove(own)?.dispose();
+      }
+    }
+    if (!_ownRepositories.any((r) => identical(r.$2, _activeRepository))) {
+      _activeRepository = null;
+    }
+  }
+
+  /// The workspace folders' repositories, by folder: null for one that is
+  /// none (or not yet known to be one).
+  final Map<String, IdeGitRepository?> _repositories = {};
+
+  /// Finds the repositories in the folders' subfolders; null for none.
+  final IdeRepositoryDetection? _detection;
+
+  /// The repositories found in each folder's subfolders (the project's
+  /// own folder's, for one folder), by path; empty while being looked for.
+  final Map<String, List<(String path, IdeGitRepository git)>> _found = {};
+
+  /// Looks for the repositories in [folder]'s subfolders, once.
+  void _detectIn(String folder) {
+    final detection = _detection;
+    if (detection == null || _found.containsKey(folder)) return;
+    _found[folder] = const [];
+    unawaited(() async {
+      final List<String> foundPaths;
+      try {
+        foundPaths = await detection.find(folder);
+      } catch (_) {
+        return;
+      }
+      // Gone meanwhile; or a workspace folder itself, with its own.
+      if (_disposed || !_found.containsKey(folder)) return;
+      final found = [
+        for (final path in foundPaths)
+          if (!_roots.any((root) => paths.equals(root, path)))
+            (path, detection.open(path)),
+      ];
+      if (found.isEmpty) return;
+      _found[folder] = found;
+      // The folder's own shows until known not to be a repository.
+      if (_folderGit(folder) case final git? when !git.loaded) {
+        void loaded() {
+          if (!git.loaded) return;
+          git.removeListener(loaded);
+          if (!_disposed) notifyListeners();
+        }
+
+        git.addListener(loaded);
+      }
+      notifyListeners();
+    }());
+  }
+
+  /// The repository of a workspace folder (the project's folder, for
+  /// one).
+  IdeGitRepository? _folderGit(String folder) =>
+      isMultiRoot ? _repositories[folder] : _git;
+
+  /// The repositories of [roots], in their order, each followed by those
+  /// found in its subfolders (`git.autoRepositoryDetection`); a project of
+  /// one folder's, its own and those found in its subfolders, when there
+  /// are any (none otherwise: [git] is its one). A folder that is not a
+  /// repository is left out when ones were found in it. Each the worktree
+  /// picked in its place, where one is ([showWorktree]).
+  @override
+  List<(String root, IdeGitRepository git)> get repositories => [
+    for (final (folder, git) in _ownRepositories)
+      (folder, _worktrees[git] ?? git),
+  ];
+
+  List<(String root, IdeGitRepository git)> get _ownRepositories => [
+    for (final folder in isMultiRoot ? _roots : [root])
+      if (isMultiRoot || (_found[folder]?.isNotEmpty ?? false))
+        ...ideFolderRepositories(
+          folder,
+          _folderGit(folder),
+          _found[folder] ?? const [],
+        ),
+  ];
+
+  IdeGitRepository? _activeRepository;
+
+  /// Where each tab's editor was left, by its key: given back when it
+  /// shows again (VS Code's editors' view state).
+  final IdeViewStates viewStates = IdeViewStates();
+
+  /// The document each moved or saved elsewhere became.
+  final Expando<IdeDocument> _successors = Expando();
+
+  IdeDocument _latest(IdeDocument doc) {
+    for (var next = _successors[doc]; next != null; next = _successors[doc]) {
+      doc = next;
+    }
+    return doc;
+  }
+
+  /// [doc]'s view state, where it was left.
+  IdeViewState viewStateOf(IdeDocument doc) => viewStates[_latest(doc).key];
+
+  /// [doc]'s view state, [update]d: the document it became's, after it
+  /// moved.
+  void keepViewState(
+    IdeDocument doc,
+    IdeViewState Function(IdeViewState kept) update,
+  ) {
+    final latest = _latest(doc);
+    // A new file closed is gone; another of its name is another.
+    if (latest.isUntitled && !_documents.contains(latest)) return;
+    viewStates.keep(latest.key, update(viewStates[latest.key]));
+  }
+
+  /// [from] is [to] from now on: its view state too.
+  void _succeeded(IdeDocument from, IdeDocument to) {
+    _successors[from] = to;
+    viewStates.move(from.key, to.key);
+  }
+
+  /// Repositories whose groups are folded in CHANGES, by root (#76).
+  @override
+  final Set<String> scmCollapsedRepositories = {};
+
+  /// Appends [lines] to the file at [path]: in its editor, saved, when it
+  /// is open; else on disk.
+  @override
+  Future<void> appendLines(String path, String lines) async {
+    final normalized = paths.normalize(path);
+    final doc = _documents.where((d) => d.path == normalized).firstOrNull;
+    if (doc == null || doc.openError != null) {
+      await ideAppendLinesToFile(files, path, lines);
+      return;
+    }
+    edit(doc.path, ideAppendLines(doc.text, lines));
+    await save(doc);
+  }
+
+  /// The repository SCm, the status bar and the timeline show:
+  /// the one picked of a workspace's (its first until one is).
+  @override
+  void selectRepository(IdeGitRepository repository) {
+    // A worktree picked in a repository's place: that repository.
+    for (final MapEntry(key: own, value: worktree) in _worktrees.entries) {
+      if (identical(worktree, repository)) repository = own;
+    }
+    if (identical(repository, _activeRepository)) return;
+    _activeRepository = repository;
+    notifyListeners();
+  }
+
+  /// The workspace folder [path] is in; null for none of them.
+  String? rootOf(String path) {
+    for (final root in _roots) {
+      if (paths.equals(root, path) || paths.isWithin(root, path)) return root;
+    }
+    return null;
+  }
+
+  /// [path] relative to its root, with `/` separators: in a multi-folder
+  /// workspace after the name of its folder (as VS Code labels them),
+  /// itself when in none.
+  String relativePath(String path) {
+    if (!isMultiRoot) {
+      return paths.relative(path, from: root).replaceAll(r'\', '/');
+    }
+    final folder = rootOf(path);
+    if (folder == null) return path;
+    final relative = paths.relative(path, from: folder).replaceAll(r'\', '/');
+    final name = paths.basename(folder);
+    return relative == '.' ? name : '$name/$relative';
+  }
+
+  /// The repository [path] is in: the deepest of those found in its
+  /// workspace folder's subfolders, else the folder's own.
+  IdeGitRepository? gitAt(String path) {
+    final folder = isMultiRoot ? rootOf(path) : root;
+    (String, IdeGitRepository)? deepest;
+    for (final found
+        in _found[folder] ?? const <(String, IdeGitRepository)>[]) {
+      if (!paths.equals(found.$1, path) && !paths.isWithin(found.$1, path)) {
+        continue;
+      }
+      if (deepest == null || found.$1.length > deepest.$1.length) {
+        deepest = found;
+      }
+    }
+    if (deepest != null) return deepest.$2;
+    return switch (rootOf(path)) {
+      final root? => _repositories[root],
+      null => isMultiRoot ? null : _git,
+    };
+  }
+
+  /// Whether [root] is a folder the user opened; without one (the IDE's
+  /// empty window, [root] then the home folder), there is no explorer
+  /// tree, and Search and Quick Open cover the open files alone.
+  final bool hasFolder;
+
+  @override
+  final IdeFileService files;
+
+  /// Language servers for this workspace's documents; null for none.
+  ///
+  /// When it is also a [LanguageDocumentSync] (the LSP manager), the
+  /// workspace keeps it in sync: open, every change (incrementally), save
+  /// and close; disposing the workspace shuts it down.
+  final LanguageFeatures? languages;
+
+  /// The project's Git repository, for the explorer's decorations, Source
+  /// Control and the timeline; null for none. Disposed with the workspace.
+  /// A multi-folder workspace's is the one picked of its [repositories], as
+  /// is a folder's with repositories in its subfolders.
+  /// The worktree picked in its place, where one is ([showWorktree]).
+  @override
+  IdeGitRepository? get git => switch (_pickedGit) {
+    final git? => _worktrees[git] ?? git,
+    null => null,
+  };
+  final IdeGitRepository? _git;
+
+  IdeGitRepository? get _pickedGit =>
+      isMultiRoot || (_found[root]?.isNotEmpty ?? false)
+      ? _activeRepository ?? _ownRepositories.firstOrNull?.$2
+      : _git;
+
+  /// Makes the repository of a worktree's folder; worktrees are only
+  /// listed when null.
+  final IdeGitRepository? Function(String path)? openWorktree;
+
+  /// The worktrees Source Control shows in place of the repositories they
+  /// are of, as picked on the Git log: by the latter.
+  final Map<IdeGitRepository, IdeGitRepository> _worktrees = Map.identity();
+
+  /// Has Source Control show the worktree at [path] of the repository
+  /// shown: its changes, its branch, what Git does; its main one's (the
+  /// folder's own) again for it.
+  void showWorktree(String path) {
+    final own = _pickedGit;
+    final open = openWorktree;
+    if (own == null || open == null) return;
+    final current = _worktrees[own];
+    if (paths.equals(path, (current ?? own).service.root)) return;
+    final git = paths.equals(path, own.service.root) ? null : open(path);
+    current?.dispose();
+    if (git == null) {
+      _worktrees.remove(own);
+    } else {
+      _worktrees[own] = git;
+    }
+    notifyListeners();
+  }
+
+  /// Tells the project's Git its files changed, after a search replaced
+  /// some ([IdeSearchReplaceBackend.refreshGit]).
+  @override
+  void refreshGit() => git?.scheduleRefresh();
+
+  LanguageDocumentSync? get _sync => switch (languages) {
+    final LanguageDocumentSync sync => sync,
+    _ => null,
+  };
+
+  /// Which of the workbench's parts show, for the window's header to toggle
+  /// as well (see [IdeLayout]).
+  final IdeLayout layout = IdeLayout();
+
+  /// Whether Go Back and Go Forward have somewhere to go, for the title
+  /// bar's arrows beside its search, the window's header's as well.
+  final ValueNotifier<({bool back, bool forward})> navigation = ValueNotifier((
+    back: false,
+    forward: false,
+  ));
+
+  /// The workbench's notifications.
+  final IdeNotifications notifications = IdeNotifications();
+
+  /// Language server sync, by file model (a file's tabs share one).
+  final Map<EditorDocumentModel, StreamSubscription<EditorContentChangeEvent>>
+  _syncing = {};
+  final List<IdeDocument> _documents = [];
+  final Map<String, Future<String>> _reads = {};
+
+  /// The folders of the open files, watched for changes made outside the
+  /// editor (an agent's edit, another program's): VS Code's file watcher.
+  final Stream<void> Function(String directory) _watchDirectory;
+
+  /// Changes to the entries of a folder, as this workspace watches them
+  /// (on the project's host for a remote one), for the explorer.
+  Stream<void> Function(String directory) get watchFolder => _watchDirectory;
+  final Map<String, StreamSubscription<void>> _watches = {};
+  final Set<String> _changedDirectories = {};
+  Timer? _changesTimer;
+  Future<void> _saves = Future.value();
+  String? _activeKey;
+  int _selection = 0;
+  bool _disposed = false;
+
+  @override
+  List<IdeDocument> get documents => List.unmodifiable(_documents);
+  IdeDocument? get active =>
+      _documents.where((d) => d.key == _activeKey).firstOrNull;
+
+  @override
+  String? get activePath => switch (active) {
+    final document? when document.isFile => document.path,
+    _ => null,
+  };
+
+  /// The open model of [path]'s file, which its tabs share.
+  EditorDocumentModel? _fileModel(String path) =>
+      _documents.where((d) => d.path == path && d.isFile).firstOrNull?.model;
+
+  /// The open model of [path]: its tab's.
+  EditorDocumentModel? modelOf(String path) =>
+      _fileModel(paths.normalize(path));
+
+  /// The document [edit], [applyEdits], [undo] and [redo] change: [path]'s
+  /// file's.
+  IdeDocument? _fileDocument(String path) =>
+      _documents.where((d) => d.path == path && d.isFile).firstOrNull ??
+      _documents.where((d) => d.path == path && !d.readOnly).firstOrNull;
+
+  /// Opens [path], or selects it when open. A file that cannot be read
+  /// opens too, as VS Code opens one: a tab whose editor says why
+  /// ([IdeDocument.openError]).
+  Future<void> open(String path) async {
+    if (_disposed) return;
+    path = paths.normalize(paths.absolute(path));
+    _dropReveal(path);
+    final request = ++_selection;
+    if (_documents.any((d) => d.key == path)) {
+      select(path);
+      return;
+    }
+    IdeDocument doc;
+    if (_fileModel(path) case final model?) {
+      // Its diff tab's: the same text and history.
+      doc = IdeDocument._shared(path, model);
+    } else if (FileViews.of(path) case final view?) {
+      doc = IdeDocument.media(path, view: view.id);
+    } else if (ideIsImagePath(path)) {
+      doc = IdeDocument.media(path);
+    } else {
+      final read = _reads.putIfAbsent(path, () => files.read(path));
+      try {
+        doc = IdeDocument(path, await read);
+      } catch (error) {
+        doc = IdeDocument.unopenable(path, error);
+      } finally {
+        if (identical(_reads[path], read)) _reads.remove(path);
+      }
+    }
+    _add(doc, select: request == _selection);
+  }
+
+  /// Opens [path] as [open] does, for the workbench to reveal and select
+  /// [range] in once it shows it ([takeReveal]): e.g. code the agent cited.
+  Future<void> openAt(String path, LspRange range) async {
+    if (_disposed) return;
+    path = paths.normalize(paths.absolute(path));
+    _reveal = (path, range);
+    await open(path);
+    // Already the active one, opening it changed nothing to be told of.
+    if (!_disposed) notifyListeners();
+  }
+
+  /// [openAt]'s, until the workbench takes it (one not built yet does as
+  /// it starts) or another file is opened or selected.
+  (String, LspRange)? _reveal;
+
+  void _dropReveal(String key) {
+    if (_reveal?.$1 != key) _reveal = null;
+  }
+
+  /// The range [openAt] asked for, once, while its file is the active one.
+  LspRange? takeReveal() {
+    if (_reveal case (final path, final range) when active?.path == path) {
+      _reveal = null;
+      return range;
+    }
+    return null;
+  }
+
+  /// Opens [paths] again as the last run left them, in order, after any
+  /// tabs open already: those that cannot be read anymore are left out.
+  /// [active] is selected, unless another tab was meanwhile.
+  Future<void> restore(List<String> paths, {String? active}) async {
+    final request = _selection;
+    for (final path in paths) {
+      if (_disposed) return;
+      final normal = this.paths.normalize(this.paths.absolute(path));
+      if (_documents.any((d) => d.key == normal)) continue;
+      final IdeDocument doc;
+      if (FileViews.of(normal) case final view?) {
+        doc = IdeDocument.media(normal, view: view.id);
+      } else if (ideIsImagePath(normal)) {
+        doc = IdeDocument.media(normal);
+      } else if (_fileModel(normal) case final model?) {
+        doc = IdeDocument._shared(normal, model);
+      } else {
+        try {
+          doc = IdeDocument(normal, await files.read(normal));
+        } catch (_) {
+          continue;
+        }
+      }
+      _add(doc, select: false);
+    }
+    if (_disposed || _selection != request) return;
+    final shown =
+        _documents.where((d) => d.key == active).firstOrNull ??
+        _documents.firstOrNull;
+    if (shown != null && _activeKey == null) select(shown.key);
+  }
+
+  /// Adds [doc] as a tab, [select]ed, unless one like it opened meanwhile.
+  void _add(IdeDocument doc, {required bool select}) {
+    if (_disposed) {
+      _release(doc);
+      return;
+    }
+    if (_documents.any((d) => d.key == doc.key)) {
+      _release(doc);
+    } else {
+      _documents.add(doc);
+      _startSync(doc);
+    }
+    if (select) _activeKey = doc.key;
+    notifyListeners();
+  }
+
+  /// Puts [doc]'s tab at [index] among the others (a tab dragged).
+  void moveDocument(IdeDocument doc, int index) {
+    final from = _documents.indexOf(doc);
+    if (from < 0) return;
+    _documents
+      ..removeAt(from)
+      ..insert(index.clamp(0, _documents.length), doc);
+    notifyListeners();
+  }
+
+  /// Opens a diff tab, or selects it: the text [original] reads against
+  /// [path]'s file, or against the text [modified] reads (read-only);
+  /// titled with [label]. VS Code's diff editor of a Git change.
+  Future<void> openDiff(
+    String path, {
+    required String label,
+    required Future<String> Function() original,
+    Future<String> Function()? modified,
+  }) async {
+    if (_disposed) return;
+    path = paths.normalize(paths.absolute(path));
+    _dropReveal(path);
+    final request = ++_selection;
+    final key = '$path\u0000$label';
+    if (_documents.where((d) => d.key == key).firstOrNull case final open?) {
+      select(key);
+      unawaited(open.diff?.reload());
+      return;
+    }
+    final side = IdeDiffOriginal(original);
+    final reading = side.reload();
+    EditorDocumentModel model;
+    if (modified != null) {
+      String text;
+      try {
+        text = await modified();
+      } catch (_) {
+        text = '';
+      }
+      model = EditorDocumentModel(text);
+    } else if (_fileModel(path) case final shared?) {
+      model = shared;
+    } else {
+      try {
+        model = EditorDocumentModel(await files.read(path));
+      } catch (_) {
+        side.dispose();
+        // As VS Code opens a file it cannot read: its own tab says why.
+        if (request == _selection) await open(path);
+        return;
+      }
+    }
+    await reading;
+    _add(
+      IdeDocument.diff(
+        path,
+        model,
+        label: label,
+        diff: side,
+        readRevision: modified,
+      ),
+      select: request == _selection,
+    );
+  }
+
+  /// Opens [path]'s text at a revision, which [read] reads, read-only and
+  /// titled with [label], or selects it.
+  Future<void> openRevision(
+    String path, {
+    required String label,
+    required Future<String> Function() read,
+  }) async {
+    if (_disposed) return;
+    path = paths.normalize(paths.absolute(path));
+    _dropReveal(path);
+    final request = ++_selection;
+    final key = '$path\u0000$label';
+    if (_documents.any((d) => d.key == key)) {
+      select(key);
+      return;
+    }
+    String text;
+    try {
+      text = await read();
+    } catch (_) {
+      text = '';
+    }
+    _add(
+      IdeDocument.revision(path, text, label: label, readRevision: read),
+      select: request == _selection,
+    );
+  }
+
+  /// Reads the revisions of the open diff and revision tabs again, after
+  /// the repository changed, as VS Code's `git:` documents follow it.
+  Future<void> reloadRevisions() async {
+    for (final doc in _documents.toList()) {
+      if (doc.diff case final diff?) await diff.reload();
+      if (doc.readRevision case final read?) {
+        final String text;
+        try {
+          text = await read();
+        } catch (_) {
+          continue;
+        }
+        if (_disposed || !_documents.contains(doc)) continue;
+        if (text != doc.text) {
+          doc.text = text;
+          doc.savedText = text;
+          notifyListeners();
+        }
+      }
+    }
+  }
+
+  /// Reads an unopenable [doc] again, in its place: [force]d past the
+  /// binary and size checks (Open Anyway), or as it was (Try Again).
+  Future<void> reopen(IdeDocument doc, {bool force = false}) async {
+    if (_disposed || doc.openError == null || !_documents.contains(doc)) {
+      return;
+    }
+    IdeDocument replacement;
+    try {
+      replacement = IdeDocument(
+        doc.path,
+        await files.read(doc.path, force: force),
+      );
+    } catch (error) {
+      replacement = IdeDocument.unopenable(doc.path, error);
+    }
+    final index = _documents.indexOf(doc);
+    if (_disposed || index < 0) {
+      replacement.dispose();
+      return;
+    }
+    _documents[index] = replacement;
+    _release(doc);
+    _startSync(replacement);
+    notifyListeners();
+  }
+
+  /// Reads the open documents among [paths] again, after something else
+  /// changed their files (a discard, an undone commit, an agent's edit), as
+  /// VS Code reloads an editor whose file changed on disk. Documents with
+  /// unsaved changes keep them; those whose file is gone are [deleted].
+  @override
+  Future<void> reload(Iterable<String> paths) async {
+    final wanted = {for (final path in paths) this.paths.normalize(path)};
+    var changed = false;
+    for (final doc in _documents.toList()) {
+      if (!wanted.contains(doc.path) || !doc.isFile) continue;
+      final String text;
+      try {
+        // A modified document's too, for whether its file is there: the
+        // read's baseline does not let a save write over the change.
+        text = await files.read(doc.path);
+      } on IdeFileNotFoundException {
+        if (_disposed || !_documents.contains(doc) || doc.deleted) continue;
+        doc.deleted = true;
+        changed = true;
+        continue;
+      } catch (_) {
+        continue;
+      }
+      if (_disposed || !_documents.contains(doc)) continue;
+      if (doc.deleted) {
+        doc.deleted = false;
+        changed = true;
+      }
+      if (doc.dirty || text == doc.text) continue;
+      doc.text = text;
+      doc.savedText = text;
+      changed = true;
+    }
+    if (changed && !_disposed) notifyListeners();
+  }
+
+  /// Watches the folders of the open files, and no others.
+  void _watchOpenFiles() {
+    if (_disposed) return;
+    final directories = {
+      for (final doc in _documents)
+        if (doc.isFile) paths.dirname(doc.path),
+    };
+    for (final directory in _watches.keys.toList()) {
+      if (!directories.contains(directory)) {
+        unawaited(_watches.remove(directory)!.cancel());
+      }
+    }
+    for (final directory in directories) {
+      _watches[directory] ??= _watchDirectory(directory).listen((_) {
+        _changedDirectories.add(directory);
+        // A write comes as several events; read once they settle.
+        _changesTimer?.cancel();
+        _changesTimer = Timer(_changesDelay, _reloadChanged);
+      });
+    }
+  }
+
+  static const _changesDelay = Duration(milliseconds: 100);
+
+  void _reloadChanged() {
+    final directories = {..._changedDirectories};
+    _changedDirectories.clear();
+    unawaited(
+      reload([
+        for (final doc in _documents)
+          if (directories.contains(paths.dirname(doc.path))) doc.path,
+      ]),
+    );
+  }
+
+  /// Follows a file or folder the explorer moved from [from] to [to]: the
+  /// documents in it take their new paths, and stay open.
+  void moved(String from, String to) {
+    if (_disposed) return;
+    from = paths.normalize(from);
+    to = paths.normalize(to);
+    final moved = <IdeDocument>[];
+    for (final (index, doc) in _documents.indexed.toList()) {
+      if (doc.path != from && !paths.isWithin(from, doc.path)) continue;
+      final path = doc.path == from
+          ? to
+          : paths.join(to, paths.relative(doc.path, from: from));
+      _stopSync(doc, force: true);
+      final next = IdeDocument._moved(path, doc);
+      _succeeded(doc, next);
+      _documents[index] = next;
+      moved.add(next);
+      if (_activeKey == doc.key) _activeKey = next.key;
+    }
+    for (final doc in moved) {
+      _startSync(doc);
+    }
+    if (moved.isNotEmpty) notifyListeners();
+  }
+
+  /// The documents in [path] (a file or folder), for asking before it is
+  /// deleted with unsaved changes.
+  List<IdeDocument> documentsIn(String path) {
+    path = paths.normalize(path);
+    return [
+      for (final doc in _documents)
+        if (doc.path == path || paths.isWithin(path, doc.path)) doc,
+    ];
+  }
+
+  /// Closes the unmodified documents of a deleted file or folder; those
+  /// with unsaved changes stay open, as VS Code keeps them.
+  void deleted(String path) {
+    for (final doc in documentsIn(path)) {
+      if (!doc.dirty) close(doc);
+    }
+  }
+
+  /// Selects the tab of [key] (a file's own tab's is its path; see
+  /// [IdeDocument.key]).
+  void select(String key) {
+    if (_disposed || !_documents.any((d) => d.key == key)) return;
+    _dropReveal(key);
+    _selection++;
+    if (_activeKey == key) return;
+    _activeKey = key;
+    notifyListeners();
+  }
+
+  @override
+  void edit(String path, String text) {
+    if (_disposed) return;
+    final doc = _fileDocument(path);
+    if (doc == null || doc.text == text) return;
+    doc.text = text;
+    notifyListeners();
+  }
+
+  /// Publishes an edit already applied to an open document's model.
+  /// Unlike [edit], this notifies even when the model already contains the edit,
+  /// without replacing text or invalidating the native controller's undo history.
+  void notifyDocumentChanged(IdeDocument doc) {
+    if (_disposed || !_documents.contains(doc)) return;
+    notifyListeners();
+  }
+
+  /// Publishes an edit typed into an open document's editor: [edits]
+  /// hears of every one, this workspace's own listeners (the whole
+  /// workbench rebuilds for them) only of those that change what they show
+  /// of it, i.e. the document going dirty or clean again.
+  void notifyDocumentEdited(IdeDocument doc) {
+    if (_disposed || !_documents.contains(doc)) return;
+    final dirty = doc.dirty;
+    if (_dirtyShown[doc] != dirty) {
+      notifyListeners();
+      _dirtyShown[doc] = dirty;
+    }
+    _edits.notifyListeners();
+  }
+
+  /// Every edit [notifyDocumentEdited] publishes, whether or not this
+  /// workspace notifies its own listeners of it.
+  Listenable get edits => _edits;
+  final _EditsNotifier _edits = _EditsNotifier();
+
+  /// Whether each document was dirty when last edited, since this
+  /// workspace last notified: an edit that leaves it so changes nothing
+  /// its listeners show.
+  final Map<IdeDocument, bool> _dirtyShown = {};
+
+  @override
+  void notifyListeners() {
+    // Whatever changed (a save, a revert), the next edit is told again.
+    _dirtyShown.clear();
+    super.notifyListeners();
+  }
+
+  void applyEdits(String path, List<EditorDocumentEdit> edits) {
+    if (_disposed) return;
+    final doc = _fileDocument(path);
+    if (doc == null) return;
+    final previous = doc.text;
+    doc.model.applyEdits(edits);
+    if (doc.text != previous) notifyListeners();
+  }
+
+  void _startSync(IdeDocument doc) {
+    final sync = _sync;
+    if (sync == null || !doc.isFile || _syncing.containsKey(doc.model)) return;
+    // Lent to [formatOutside]: the tab's text from now on.
+    if (_lent.remove(doc.path)) sync.closeDocument(doc.path);
+    sync.openDocument(doc.path, doc.text, version: doc.model.version);
+    _syncing[doc.model] = doc.model.changes.listen(
+      (event) => sync.changeDocument(
+        doc.path,
+        event.text,
+        version: event.version,
+        changes: [
+          for (final change in event.changes)
+            LspTextDocumentContentChange(
+              change.text,
+              range: LspRange(
+                LspPosition(change.startLine, change.startCharacter),
+                LspPosition(change.endLine, change.endCharacter),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Stops syncing [doc]'s file, once no other tab has it, or [force]d.
+  void _stopSync(IdeDocument doc, {bool force = false}) {
+    if (!force && _documents.any((d) => identical(d.model, doc.model))) {
+      return;
+    }
+    final subscription = _syncing.remove(doc.model);
+    if (subscription == null) return;
+    unawaited(subscription.cancel());
+    _sync?.closeDocument(doc.path);
+  }
+
+  /// The files [formatOutside] has open with the language servers, no tab
+  /// having them.
+  final Set<String> _lent = {};
+
+  /// How long [formatOutside] waits for the servers of a file to start.
+  static const formatStartTimeout = Duration(seconds: 20);
+
+  /// Formats [text], [path]'s as edited outside the IDE (beside the chat),
+  /// with this workspace's language servers: the file opened with them
+  /// meanwhile, unless a tab has it (with that text), and its servers
+  /// waited for. [IdeFormatOutcome.edits] null where none formats it.
+  Future<IdeFormatOutcome> formatOutside(
+    String path,
+    String text, {
+    LspRange? range,
+    required int tabSize,
+    required bool insertSpaces,
+  }) {
+    path = paths.normalize(paths.absolute(path));
+    // One of a file at a time: the servers have one text of it, lent by the
+    // one under way; the next lends its own once that is given back.
+    final previous = _formatting[path] ?? Future<void>.value();
+    final next = previous.then(
+      (_) => _formatOutside(
+        path,
+        text,
+        range: range,
+        tabSize: tabSize,
+        insertSpaces: insertSpaces,
+      ),
+    );
+    final done = next.then<void>((_) {}, onError: (Object _) {});
+    _formatting[path] = done;
+    unawaited(
+      done.whenComplete(() {
+        if (identical(_formatting[path], done)) _formatting.remove(path);
+      }),
+    );
+    return next;
+  }
+
+  /// Each file's [formatOutside] under way, the next waiting for it.
+  final Map<String, Future<void>> _formatting = {};
+
+  Future<IdeFormatOutcome> _formatOutside(
+    String path,
+    String text, {
+    LspRange? range,
+    required int tabSize,
+    required bool insertSpaces,
+  }) async {
+    final languages = this.languages;
+    final sync = _sync;
+    if (_disposed || languages == null || sync == null) {
+      return const IdeFormatOutcome(null);
+    }
+    final request = range == null
+        ? LanguageRequest.format
+        : LanguageRequest.rangeFormat;
+    bool open() => _syncing.containsKey(_fileModel(path));
+    var lent = false;
+    if (open()) {
+      // Its tab's text is what the servers have.
+      if (_fileModel(path)!.snapshot.text != text) {
+        return const IdeFormatOutcome(null);
+      }
+    } else if (!_lent.contains(path)) {
+      sync.openDocument(path, text);
+      _lent.add(path);
+      lent = true;
+    }
+    try {
+      final started = DateTime.now();
+      while (!languages.supports(path, request)) {
+        final statuses = languages.statusFor(path);
+        final waited = DateTime.now().difference(started);
+        final starting = statuses.isEmpty
+            // Its servers are matched to it later on another machine.
+            ? waited < const Duration(seconds: 1)
+            : statuses.any(
+                (status) => switch (status.state) {
+                  LanguageServerState.idle ||
+                  LanguageServerState.starting ||
+                  LanguageServerState.restarting ||
+                  LanguageServerState.installing => true,
+                  _ => false,
+                },
+              );
+        if (!starting || waited > formatStartTimeout || _disposed) {
+          final missing = statuses
+              .where((status) => status.installable)
+              .firstOrNull;
+          return IdeFormatOutcome(
+            null,
+            missing: missing?.serverId,
+            install: missing == null
+                ? null
+                : () => languages.install(missing.serverId, path: path),
+          );
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      final edits = await languages.format(
+        path,
+        range: range,
+        tabSize: tabSize,
+        insertSpaces: insertSpaces,
+      );
+      // A tab opened it meanwhile, with its own text.
+      if (lent && !_lent.contains(path)) return const IdeFormatOutcome(null);
+      return IdeFormatOutcome(edits);
+    } finally {
+      if (lent && _lent.remove(path) && !_disposed) sync.closeDocument(path);
+    }
+  }
+
+  /// Disposes [doc], but not the model another tab still has.
+  void _release(IdeDocument doc) {
+    if (_documents.any((d) => identical(d.model, doc.model))) {
+      doc.diff?.dispose();
+    } else {
+      doc.dispose();
+    }
+  }
+
+  bool undo(String path) => _historyChange(path, redo: false);
+  bool redo(String path) => _historyChange(path, redo: true);
+
+  bool _historyChange(String path, {required bool redo}) {
+    if (_disposed) return false;
+    final doc = _fileDocument(path);
+    if (doc == null) return false;
+    final changed = redo ? doc.model.redo() : doc.model.undo();
+    if (changed) notifyListeners();
+    return changed;
+  }
+
+  /// Asks where to save a document (Save As): a path, or null when
+  /// cancelled. Without it, a new file cannot be saved.
+  Future<String?> Function(IdeDocument doc)? askSavePath;
+
+  /// Told the path of each file saved (the debugger's breakpoints verify
+  /// again).
+  void Function(String path)? onSaved;
+
+  /// Keeps each file's text as it was before a save and as saved.
+  IdeLocalHistory? localHistory;
+
+  /// Opens a new file, not saved anywhere yet (`Untitled-1`), and selects
+  /// it.
+  IdeDocument newUntitled() {
+    final names = {for (final doc in _documents) doc.path};
+    var n = 1;
+    while (names.contains('Untitled-$n')) {
+      n++;
+    }
+    final doc = IdeDocument.untitled('Untitled-$n');
+    _add(doc, select: true);
+    return doc;
+  }
+
+  /// Saves [doc] to a path asked for ([askSavePath]), its tab then that
+  /// file's: the new document, or null when not saved. A remote project's
+  /// file is saved to this machine, where the save panel is: a copy of its
+  /// text, its tab still the host's file.
+  Future<IdeDocument?> saveAs(IdeDocument doc) async {
+    if (_disposed || !_documents.contains(doc) || doc.readOnly) return null;
+    final text = doc.text;
+    final path = await askSavePath?.call(doc);
+    if (path == null || _disposed || !_documents.contains(doc)) return null;
+    if (files is IdeHostFiles && !doc.isUntitled) {
+      await saveCopyTo(files, doc.path, path, text: text);
+      return null;
+    }
+    return saveTo(doc, path);
+  }
+
+  /// Writes [doc]'s text to [path] (made if it is not there), and has its
+  /// tab be that file's, in place of any other of it.
+  Future<IdeDocument?> saveTo(IdeDocument doc, String path) async {
+    path = paths.normalize(paths.absolute(path));
+    final text = doc.text;
+    try {
+      await files.create(path);
+    } on IdeFileExistsException {
+      // Written over: the dialog asked.
+    }
+    await files.read(path, force: true);
+    await files.write(path, text);
+    if (_disposed || !_documents.contains(doc)) return null;
+    for (final other in [..._documents]) {
+      if (other.path == path && !identical(other, doc)) close(other);
+    }
+    final index = _documents.indexOf(doc);
+    if (index < 0) return null;
+    _stopSync(doc, force: true);
+    final saved = IdeDocument._saved(path, doc)..savedText = text;
+    _succeeded(doc, saved);
+    _documents[index] = saved;
+    if (_activeKey == doc.key) _activeKey = saved.key;
+    _startSync(saved);
+    if (_syncing.containsKey(saved.model)) _sync?.saveDocument(path, text);
+    gitAt(path)?.scheduleRefresh();
+    notifyListeners();
+    onSaved?.call(path);
+    return saved;
+  }
+
+  @override
+  Future<void> save(IdeDocument doc) {
+    if (doc.isUntitled) return saveAs(doc);
+    final text = doc.text;
+    final result = _saves.then((_) async {
+      if (_disposed || !_documents.contains(doc) || !doc.isFile) {
+        return;
+      }
+      String? expectedText = doc.savedText;
+      if (doc.deleted) {
+        // Saving a deleted file makes it again, as VS Code's does.
+        try {
+          await files.create(doc.path);
+          await files.read(doc.path);
+          expectedText = '';
+        } on IdeFileExistsException {
+          // Back meanwhile: written over only if it is as it was.
+        }
+      }
+      if (expectedText != null) {
+        unawaited(localHistory?.record(doc.path, expectedText));
+      }
+      await files.write(doc.path, text, expectedText: expectedText);
+      unawaited(localHistory?.record(doc.path, text));
+      if (_disposed || !_documents.contains(doc)) return;
+      doc.deleted = false;
+      doc.savedText = text;
+      if (_syncing.containsKey(doc.model)) _sync?.saveDocument(doc.path, text);
+      gitAt(doc.path)?.scheduleRefresh();
+      notifyListeners();
+      onSaved?.call(doc.path);
+    });
+    _saves = result.then<void>((_) {}, onError: (Object _, StackTrace _) {});
+    return result;
+  }
+
+  void close(IdeDocument doc) {
+    if (_disposed) return;
+    final index = _documents.indexOf(doc);
+    if (index < 0) return;
+    _selection++;
+    _documents.removeAt(index);
+    if (doc.isUntitled) viewStates.keep(doc.key, IdeViewState.empty);
+    _stopSync(doc);
+    _release(doc);
+    if (_activeKey == doc.key) {
+      _activeKey = _documents.isEmpty
+          ? null
+          : _documents[index.clamp(0, _documents.length - 1)].key;
+    }
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _changesTimer?.cancel();
+    navigation.dispose();
+    for (final watch in _watches.values) {
+      unawaited(watch.cancel());
+    }
+    _watches.clear();
+    final documents = _documents.toList();
+    _documents.clear();
+    final models = <EditorDocumentModel>{};
+    for (final doc in documents) {
+      _stopSync(doc);
+      doc.diff?.dispose();
+      if (models.add(doc.model)) doc.model.dispose();
+    }
+    if (_sync case final sync?) unawaited(sync.shutdown());
+    _git?.dispose();
+    for (final worktree in _worktrees.values) {
+      worktree.dispose();
+    }
+    for (final repository in _repositories.values) {
+      repository?.dispose();
+    }
+    for (final found in _found.values) {
+      for (final (_, git) in found) {
+        git.dispose();
+      }
+    }
+    layout.dispose();
+    notifications.dispose();
+    _edits.dispose();
+    super.dispose();
+  }
+}
+
+class _EditsNotifier extends ChangeNotifier {
+  @override
+  void notifyListeners() => super.notifyListeners();
+}
+
+/// What [IdeWorkspace.formatOutside] came to.
+@immutable
+class IdeFormatOutcome {
+  const IdeFormatOutcome(this.edits, {this.missing, this.install});
+
+  /// The edits that format the text (none where it is formatted already);
+  /// null where no language server formats it.
+  final List<LspTextEdit>? edits;
+
+  /// A server that would, not installed yet, and what installs it.
+  final String? missing;
+  final Future<void> Function()? install;
+}

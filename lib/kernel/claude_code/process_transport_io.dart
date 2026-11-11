@@ -1,0 +1,265 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
+import '../../models/launch_environment.dart';
+import '../../network/network_proxy_io.dart';
+import '../../platform/data_dir.dart';
+import '../../platform/child_process_registry.dart';
+import 'claude_code_transport.dart';
+import 'claude_environment.dart';
+import 'claude_settings_file.dart';
+import 'local_claude_io.dart';
+
+/// Claude Code as a child process, over its stdin and stdout.
+class ProcessTransport implements ClaudeCodeTransport {
+  ProcessTransport._(this._process, {this.executable}) {
+    _live.add(this);
+    unawaited(registry.add(_process.pid));
+    _process.stdout
+        .transform(_decoder)
+        .transform(const LineSplitter())
+        .listen(_line, onError: _undecodable, onDone: _stdoutDone);
+    _process.stderr
+        .transform(_decoder)
+        .transform(const LineSplitter())
+        .listen(_stderrLine, onError: _undecodable);
+    unawaited(_process.exitCode.then(_exited));
+  }
+
+  /// What both streams are read with, and not strict about it: a line that
+  /// is not UTF-8 takes the replacement character and goes on to [_line],
+  /// which drops it as it would any other line that is not protocol. Strict,
+  /// the decode error would reach the subscription instead and end the
+  /// stream there — and what the CLI printed before it failed is exactly
+  /// what says why (its own errors can carry the console's code page on
+  /// Windows), so the session would end with nothing said of it.
+  static const _decoder = Utf8Decoder(allowMalformed: true);
+
+  /// A read error on either stream: kept as a stderr line, so that it is in
+  /// the report when the process ends.
+  void _undecodable(Object error) => _stderrLine('$error');
+
+  /// A transport over [process], e.g. a stand-in process under test.
+  @visibleForTesting
+  factory ProcessTransport.forProcess(Process process) =>
+      ProcessTransport._(process);
+
+  /// Where the running processes are kept track of across runs.
+  @visibleForTesting
+  static ClaudeProcessRegistry registry = ClaudeProcessRegistry(
+    file: File(DataDirectory.current.processRegistryFile('claude')),
+  );
+
+  /// The processes this run of the app started and that still run.
+  static final Set<ProcessTransport> _live = {};
+
+  /// Ends every Claude Code process this run started, and waits (up to
+  /// [timeout] each) for them to go: done as the app quits, so a turn under
+  /// way does not go on unseen, spending tokens, after the app is gone.
+  static Future<void> stopAll({
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    await Future.wait([
+      for (final transport in [..._live]) transport._stop(timeout),
+    ]);
+    // Their entries gone from the list before the app is.
+    await registry.flush();
+  }
+
+  /// Ends the processes an earlier run left behind; see
+  /// [ClaudeProcessRegistry].
+  static Future<void> reapLeftovers() => registry.reaped;
+
+  Future<void> _stop(Duration timeout) async {
+    close();
+    try {
+      await _process.exitCode.timeout(timeout);
+    } on TimeoutException {
+      _process.kill(ProcessSignal.sigkill);
+    }
+  }
+
+  static Future<ClaudeCodeTransport> start(ClaudeLaunch launch) async {
+    // Left over from a run that ended without stopping them: gone first, so
+    // two processes never go on with one session.
+    await registry.reaped;
+    final cli = await LocalClaude.locate();
+    if (!Directory(launch.cwd).existsSync()) {
+      throw ClaudeFolderGone(launch.cwd);
+    }
+    // A key goes in a file only the user reads, not the command line.
+    final settingsFile = launch.hasSecrets
+        ? await ClaudeSettingsFile.write(launch.settings)
+        : null;
+    final started = switch (settingsFile) {
+      final path? => launch.withSettingsFile(path),
+      null => launch,
+    };
+    // The proxy as it is now: Clash may have been turned on since.
+    final proxy = await NetworkProxy.instance.environment();
+    try {
+      final process = await Process.start(
+        cli.executable,
+        started.arguments,
+        workingDirectory: launch.cwd,
+        environment: {
+          ...cli.environment,
+          ...proxy,
+          // A provider's session: none of the user's own model setup.
+          if (launch.env != null)
+            for (final name in ClaudeModelVariables.inherited) name: '',
+          ...ClaudeLaunch.environment,
+          ...ClaudeEnvironment.stateDirectory(cli.environment),
+        },
+        // The login shell's environment is the whole of it; on Windows it
+        // is the app's own, and the child needs the parent's beside it for
+        // what `cmd.exe` itself runs on (COMSPEC, PATHEXT, …).
+        includeParentEnvironment: Platform.isWindows,
+        // An npm shim is a `.cmd`, which only the shell can run.
+        runInShell: cli.throughShell,
+      );
+      if (settingsFile != null) {
+        // Read as it starts; gone with it.
+        unawaited(
+          process.exitCode.then((_) => ClaudeSettingsFile.delete(settingsFile)),
+        );
+      }
+      return ProcessTransport._(process, executable: cli.executable);
+    } on ProcessException catch (error) {
+      if (settingsFile != null) await ClaudeSettingsFile.delete(settingsFile);
+      // Which file: Windows' own words for it leave `%1` in its place.
+      throw ClaudeUnavailable(
+        'Claude Code could not start',
+        detail: '${cli.executable}\n${error.message}',
+      );
+    }
+  }
+
+  /// See [LocalClaude.rejectTooOld].
+  static Future<bool> rejectTooOld(String executable) =>
+      LocalClaude.rejectTooOld(executable);
+
+  /// [ClaudeEnvironment.essentialTrafficVariable], if the CLI runs with it
+  /// set: it then sends no request for the plan usage.
+  static Future<String?> usageOffBy() async {
+    const setting = ClaudeEnvironment.essentialTrafficVariable;
+    final value = (await ClaudeEnvironment.of())[setting];
+    return value == null || value.isEmpty ? null : setting;
+  }
+
+  final Process _process;
+
+  /// The CLI run, to name in a report of its failing.
+  final String? executable;
+
+  final StreamController<Map<String, Object?>> _messages =
+      StreamController.broadcast();
+
+  /// The last lines it printed on stderr, to say why it failed.
+  final List<String> _stderr = [];
+  static const _stderrLines = 30;
+
+  int? _exitCode;
+  bool _stdoutClosed = false;
+
+  @override
+  Stream<Map<String, Object?>> get messages => _messages.stream;
+
+  void _line(String line) {
+    if (line.trim().isEmpty) return;
+    try {
+      final decoded = jsonDecode(line);
+      if (decoded is Map<String, Object?>) _messages.add(decoded);
+    } on FormatException {
+      // Not protocol (e.g. a warning printed to stdout): keep it for the
+      // failure report.
+      _stderrLine(line);
+    }
+  }
+
+  void _stderrLine(String line) {
+    _stderr.add(line);
+    if (_stderr.length > _stderrLines) _stderr.removeAt(0);
+  }
+
+  void _stdoutDone() {
+    _stdoutClosed = true;
+    _finish();
+  }
+
+  void _exited(int code) {
+    _exitCode = code;
+    _live.remove(this);
+    unawaited(registry.remove(_process.pid));
+    _finish();
+  }
+
+  /// Ends the stream once both the output is read and the process gone,
+  /// so its last messages come before the exit.
+  void _finish() {
+    final code = _exitCode;
+    if (code == null || !_stdoutClosed || _messages.isClosed) return;
+    _messages
+      ..add(
+        ClaudeExit.message(code, _stderr.join('\n'), executable: executable),
+      )
+      ..close();
+  }
+
+  @override
+  void write(Map<String, Object?> message) {
+    if (_exitCode != null) return;
+    try {
+      _process.stdin.writeln(jsonEncode(message));
+    } on StateError {
+      // Closed under us: the exit message follows.
+    }
+  }
+
+  @override
+  Future<void> get exited => _process.exitCode.then((_) {});
+
+  @override
+  void close() {
+    if (_exitCode != null) return;
+    unawaited(_process.stdin.close().catchError((_) {}));
+    if (Platform.isWindows) {
+      unawaited(_endTree());
+    } else {
+      _process.kill();
+    }
+  }
+
+  /// Windows ends a killed process alone, and the MCP servers it started
+  /// go on without it: given a moment to end them itself, its input
+  /// closed, then ended with all it started.
+  Future<void> _endTree() async {
+    final ended = await _process.exitCode
+        .timeout(const Duration(seconds: 1))
+        .then((_) => true, onError: (Object _) => false);
+    if (ended) return;
+    try {
+      await Process.run('taskkill', ['/pid', '${_process.pid}', '/T', '/F']);
+    } on ProcessException {
+      _process.kill();
+    }
+  }
+}
+
+/// The Claude Code processes the app has running (`claude-processes.json`);
+/// see [ChildProcessRegistry]. Entries a run recorded without a command
+/// line are ended only when they run Claude Code with stream-json.
+class ClaudeProcessRegistry extends ChildProcessRegistry {
+  ClaudeProcessRegistry({
+    required super.file,
+    super.ownPid,
+    super.lookup,
+    super.signal,
+  }) : super(recognizes: _isClaude);
+
+  static bool _isClaude(String command) =>
+      command.contains('claude') && command.contains('stream-json');
+}

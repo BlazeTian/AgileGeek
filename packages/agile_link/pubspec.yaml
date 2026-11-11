@@ -1,0 +1,21 @@
+name: agile_link
+description: >-
+  AgileGeek's link between a desktop and the phones paired with it: pairing
+  by QR code, connections by device key over iroh (QUIC, direct or through
+  AgileGeek's relays, end-to-end encrypted) and the requests that go over
+  them. No Flutter in the library.
+version: 0.1.0
+publish_to: none
+resolution: workspace
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  agile_iroh:
+    path: ../agile_iroh
+  pinenacl: ^0.6.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

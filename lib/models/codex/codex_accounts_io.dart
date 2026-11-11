@@ -1,0 +1,1091 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+
+import '../model_provider.dart';
+import '../model_providers.dart';
+import '../model_runtime.dart' show UpstreamException;
+import '../proxy/prompt_cache_key.dart';
+import '../secret_store.dart';
+import '../upstream.dart';
+import 'codex_api.dart';
+import 'codex_balancer.dart';
+import 'codex_import.dart';
+import 'codex_oauth.dart';
+import 'codex_service.dart';
+import 'codex_usage.dart';
+
+/// The ChatGPT (Codex) providers' accounts while the app runs: signing in
+/// to them, their access tokens (in memory; refreshed from the refresh
+/// token kept in the keychain), how much of their quota is used, and
+/// which takes a request ([CodexBalancer]).
+class CodexAccounts extends CodexService {
+  CodexAccounts({
+    required this._providers,
+    this.endpoints = const CodexEndpoints(),
+    this._findProxy,
+    this._openBrowser,
+    DateTime Function()? now,
+    this.loginTimeout = const Duration(minutes: 10),
+  }) : _now = now ?? DateTime.now;
+
+  final ModelProviders Function() _providers;
+  final CodexEndpoints endpoints;
+  final String Function(Uri url)? _findProxy;
+  final Future<bool> Function(String url)? _openBrowser;
+  final DateTime Function() _now;
+  final Duration loginTimeout;
+
+  final CodexBalancer _balancer = CodexBalancer();
+  final Map<String, ({String access, DateTime expiresAt})> _tokens = {};
+  final Map<String, _AccountRequests> _requests = {};
+  final Map<String, CodexUsage> _usage = {};
+  final Map<String, String> _errors = {};
+  final Map<String, DateTime> _limited = {};
+  final Map<String, List<CodexResetCredit>> _resetCredits = {};
+
+  /// How long after a reset credit of an account's was used, or tried,
+  /// another is not by itself: its quota may not show started over yet.
+  static const autoResetBackoff = Duration(minutes: 10);
+
+  /// Those whose refresh token no longer works: until signed in again.
+  final Set<String> _signedOut = {};
+
+  HttpClient? _client;
+
+  static String _key(String providerId, String accountId) =>
+      '$providerId/$accountId';
+
+  HttpClient get _http => _client ??= HttpClient()
+    ..connectionTimeout = const Duration(seconds: 30)
+    ..idleTimeout = const Duration(seconds: 30)
+    ..findProxy = _findProxy ?? (_) => 'DIRECT';
+
+  void close() {
+    _client?.close(force: true);
+    _client = null;
+  }
+
+  // --- What is known ---------------------------------------------------------
+
+  @override
+  CodexUsage? usage(String providerId, String accountId) =>
+      _usage[_key(providerId, accountId)];
+
+  @override
+  String? error(String providerId, String accountId) =>
+      _errors[_key(providerId, accountId)];
+
+  @override
+  DateTime? limitedUntil(String providerId, String accountId) {
+    final key = _key(providerId, accountId);
+    final now = _now();
+    final until = [?_limited[key], ?_usage[key]?.limitedUntil]
+        .where((time) => time.isAfter(now))
+        .fold<DateTime?>(
+          null,
+          (latest, time) =>
+              latest == null || time.isAfter(latest) ? time : latest,
+        );
+    return until;
+  }
+
+  @override
+  bool signedOut(String providerId, String accountId) =>
+      _signedOut.contains(_key(providerId, accountId));
+
+  @override
+  List<CodexResetCredit>? resetCredits(String providerId, String accountId) =>
+      _resetCredits[_key(providerId, accountId)];
+
+  @override
+  bool resetting(String providerId, String accountId) =>
+      _requests[_key(providerId, accountId)]?.reset != null;
+
+  // --- Which account ---------------------------------------------------------
+
+  /// [provider]'s accounts that can take a request now, but [exclude].
+  List<ProviderAccount> available(
+    ModelProvider provider, {
+    Set<String> exclude = const {},
+  }) => [
+    for (final account in provider.accounts)
+      if (account.enabled &&
+          !exclude.contains(account.id) &&
+          !signedOut(provider.id, account.id) &&
+          limitedUntil(provider.id, account.id) == null)
+        account,
+  ];
+
+  /// The account [session]'s request goes to, by [provider]'s balance;
+  /// null when none can take it.
+  ProviderAccount? pick(
+    ModelProvider provider, {
+    String? session,
+    Set<String> exclude = const {},
+  }) => _balancer.pick(
+    provider.id,
+    available(provider, exclude: exclude),
+    provider.balance,
+    session: session,
+    used: (account) => usage(provider.id, account.id)?.mostUsed,
+  );
+
+  @override
+  ProviderAccount? accountFor(ModelProvider provider, {String? session}) =>
+      _balancer.peek(
+        provider.id,
+        available(provider),
+        provider.balance,
+        session: session == null ? null : promptCacheKeyOf(session),
+        used: (account) => usage(provider.id, account.id)?.mostUsed,
+      );
+
+  @override
+  DateTime? backAt(ModelProvider provider) {
+    DateTime? first;
+    for (final account in provider.accounts) {
+      if (!account.enabled || signedOut(provider.id, account.id)) continue;
+      final until = limitedUntil(provider.id, account.id);
+      if (until == null) return null;
+      if (first == null || until.isBefore(first)) first = until;
+    }
+    return first;
+  }
+
+  /// Account [account] out of quota until [until].
+  void markLimited(
+    ModelProvider provider,
+    ProviderAccount account,
+    DateTime until,
+  ) {
+    _limited[_key(provider.id, account.id)] = until;
+    _balancer.forget(provider.id, account.id);
+    notifyListeners();
+    // Its quota asked again: a reset credit used, if it is to be.
+    if (_providers().provider(provider.id)?.autoResetCredits ?? false) {
+      unawaited(_fetchUsage(provider.id, account));
+    }
+  }
+
+  /// What went wrong with [account]; null as it works again.
+  void markError(ModelProvider provider, ProviderAccount account, String? e) {
+    final key = _key(provider.id, account.id);
+    if (_errors[key] == e) return;
+    if (e == null) {
+      _errors.remove(key);
+    } else {
+      _errors[key] = e;
+    }
+    notifyListeners();
+  }
+
+  /// What a reply's headers tell of [account]'s quota.
+  void record(
+    ModelProvider provider,
+    ProviderAccount account,
+    String? Function(String name) header,
+  ) {
+    final key = _key(provider.id, account.id);
+    final usage = CodexUsage.fromHeaders(header, _now(), previous: _usage[key]);
+    if (usage == null) return;
+    _usage[key] = usage;
+    notifyListeners();
+  }
+
+  // --- Tokens ----------------------------------------------------------------
+
+  /// [account]'s access token: refreshed when about to expire, or when
+  /// [rejected] (the one the backend refused) is still the one held. One
+  /// refresh at a time: each gives a new refresh token, the old one void.
+  /// Throws [CodexException].
+  Future<String> accessToken(
+    ModelProvider provider,
+    ProviderAccount account, {
+    String? rejected,
+  }) async {
+    final key = _key(provider.id, account.id);
+    final held = _tokens[key];
+    if (held != null &&
+        held.access != rejected &&
+        held.expiresAt.isAfter(_now().add(const Duration(minutes: 1)))) {
+      return held.access;
+    }
+    final requests = _requests.putIfAbsent(key, _AccountRequests.new);
+    if (requests.token case final running?) return running;
+    final refresh = _refresh(provider.id, account, requests).whenComplete(() {
+      requests.token = null;
+    });
+    requests.token = refresh;
+    return refresh;
+  }
+
+  bool _current(
+    String providerId,
+    String accountId,
+    _AccountRequests requests,
+  ) =>
+      identical(_requests[_key(providerId, accountId)], requests) &&
+      _providers().provider(providerId)?.account(accountId) != null;
+
+  Future<String> _refresh(
+    String providerId,
+    ProviderAccount account,
+    _AccountRequests requests,
+  ) async {
+    final key = _key(providerId, account.id);
+    final ref = ModelProvider.accountRefFor(providerId, account.id);
+    final secrets = _providers().secrets;
+    void checkCurrent() {
+      if (!_current(providerId, account.id, requests)) {
+        throw const CodexException('The account changed.');
+      }
+    }
+
+    String? refreshToken;
+    try {
+      refreshToken = await secrets.read(ref);
+    } on SecretStoreException catch (error) {
+      checkCurrent();
+      throw _fail(key, 'The token could not be read: $error');
+    }
+    checkCurrent();
+    if (refreshToken == null || refreshToken.isEmpty) {
+      throw _fail(key, 'Signed out: sign in again.', signedOut: true);
+    }
+    final (status, text) = await _postForm(
+      endpoints.token,
+      codexRefreshForm(refreshToken),
+    );
+    checkCurrent();
+    if (status >= 400) {
+      final message = upstreamErrorMessage(status, text);
+      // The refresh token refused (used, expired, revoked): only signing
+      // in again helps.
+      final refused = status == 400 || status == 401 || status == 403;
+      throw _fail(
+        key,
+        refused
+            ? 'Signed out ($message): sign in again.'
+            : 'The token could not be refreshed: $message',
+        signedOut: refused,
+      );
+    }
+    final tokens = CodexTokens.fromJson(_decode(text), _now());
+    if (tokens == null) {
+      throw _fail(key, 'The token endpoint gave no access token.');
+    }
+    if (tokens.refresh case final rotated? when rotated != refreshToken) {
+      try {
+        await secrets.write(ref, rotated);
+      } on SecretStoreException catch (error) {
+        debugPrint('Refresh token of ${account.id} not kept: $error');
+      }
+      checkCurrent();
+    }
+    _tokens[key] = (access: tokens.access, expiresAt: tokens.expiresAt);
+    _signedOut.remove(key);
+    if (_errors.remove(key) != null) notifyListeners();
+    return tokens.access;
+  }
+
+  CodexException _fail(String key, String message, {bool signedOut = false}) {
+    _errors[key] = message;
+    if (signedOut) {
+      _signedOut.add(key);
+      _tokens.remove(key);
+    }
+    notifyListeners();
+    return CodexException(message);
+  }
+
+  // --- Signing in ------------------------------------------------------------
+
+  @override
+  Future<CodexLogin> login(String providerId) async {
+    final pkce = CodexPkce.generate();
+    final state = codexState();
+    final port = endpoints.callbackPort;
+    final servers = <HttpServer>[];
+    // The port is the one OpenAI has for this client: no other will do.
+    // Another program on it (a proxy in Docker, the Codex CLI signing in),
+    // the browser lands on it all the same, and its address is pasted.
+    try {
+      servers.add(await HttpServer.bind(InternetAddress.loopbackIPv4, port));
+      // `localhost` may be ::1 first.
+      try {
+        servers.add(
+          await HttpServer.bind(
+            InternetAddress.loopbackIPv6,
+            port,
+            v6Only: true,
+          ),
+        );
+      } on SocketException {
+        // No IPv6 here.
+      }
+    } on SocketException {
+      // Taken.
+    }
+    final url = codexAuthorizeUrl(
+      endpoints,
+      state: state,
+      challenge: pkce.challenge,
+    );
+    final login = _Login(url, servers, state, loginTimeout);
+    login._result = login._code.future.then(
+      (code) => _signedIn(providerId, code, pkce.verifier),
+    );
+    if (_openBrowser case final open?) unawaited(open('$url'));
+    return login;
+  }
+
+  Future<ProviderAccount> _signedIn(
+    String providerId,
+    String code,
+    String verifier,
+  ) async {
+    final (status, text) = await _postForm(
+      endpoints.token,
+      codexCodeForm(endpoints, code: code, verifier: verifier),
+    );
+    if (status >= 400) {
+      throw CodexException(
+        'Sign-in failed: ${upstreamErrorMessage(status, text)}',
+      );
+    }
+    final tokens = CodexTokens.fromJson(_decode(text), _now());
+    final refreshToken = tokens?.refresh;
+    if (tokens == null || refreshToken == null) {
+      throw const CodexException('Sign-in gave no refresh token.');
+    }
+    return _keepTokens(providerId, tokens);
+  }
+
+  @override
+  Future<List<CodexImportResult>> importAccountsJson(
+    String providerId,
+    String contents, {
+    required bool confirmed,
+  }) async {
+    if (!confirmed) {
+      throw const CodexException('Import requires user confirmation.');
+    }
+    final provider = _providers().provider(providerId);
+    if (provider == null || provider.protocol != ProviderProtocol.codex) {
+      throw const CodexException('A ChatGPT provider is required.');
+    }
+    final entries = parseCodexCredentials(contents);
+    final results = <CodexImportResult>[];
+    for (final entry in entries) {
+      final credential = entry.credential;
+      if (credential == null) {
+        results.add(CodexImportResult.failed(entry.error!));
+        continue;
+      }
+      try {
+        final id = credential.identity.key;
+        final known = _providers().provider(providerId)?.account(id);
+        // An older export must not replace a token that has since rotated.
+        if (known != null && !signedOut(providerId, id)) {
+          final saved = await _providers().secrets.read(
+            ModelProvider.accountRefFor(providerId, id),
+          );
+          if (saved != null && saved.isNotEmpty) {
+            results.add(CodexImportResult.known(known));
+            continue;
+          }
+        }
+        final account = await _keepTokens(
+          providerId,
+          CodexTokens(
+            access: credential.accessToken ?? '',
+            refresh: credential.refreshToken,
+            expiresAt: credential.expiresAt ?? _now(),
+          ),
+          importedIdentity: credential.identity,
+          refreshUsage: false,
+        );
+        results.add(CodexImportResult.added(account));
+      } on SecretStoreException {
+        results.add(
+          const CodexImportResult.failed('The token could not be read.'),
+        );
+      } on CodexException catch (error) {
+        results.add(CodexImportResult.failed(error.message));
+      }
+    }
+    return results;
+  }
+
+  Future<ProviderAccount> _keepTokens(
+    String providerId,
+    CodexTokens tokens, {
+    CodexIdentity? importedIdentity,
+    bool refreshUsage = true,
+  }) async {
+    final fromId = CodexIdentity.fromIdToken(tokens.idToken);
+    final fromAccess = CodexIdentity.fromIdToken(tokens.access);
+    final identity =
+        importedIdentity ??
+        CodexIdentity(
+          email: fromId.email ?? fromAccess.email,
+          accountId: fromId.accountId ?? fromAccess.accountId,
+          userId: fromId.userId ?? fromAccess.userId,
+          plan: fromId.plan ?? fromAccess.plan,
+        );
+    final providers = _providers();
+    final provider = providers.provider(providerId);
+    if (provider == null) {
+      throw const CodexException('The provider was removed.');
+    }
+    final account = switch (provider.account(identity.key)) {
+      final known? => known.copyWith(
+        email: identity.email,
+        plan: identity.plan,
+        accountId: identity.accountId,
+      ),
+      null => ProviderAccount(
+        id: identity.key,
+        email: identity.email,
+        plan: identity.plan,
+        accountId: identity.accountId,
+      ),
+    };
+    final key = _key(providerId, account.id);
+    // Requests from before this sign-in must not change its token or quota.
+    _requests.remove(key);
+    try {
+      await providers.secrets.write(
+        ModelProvider.accountRefFor(providerId, account.id),
+        tokens.refresh!,
+      );
+    } on SecretStoreException {
+      throw const CodexException('The token could not be kept.');
+    }
+    _requests.remove(key);
+    _tokens[key] = (access: tokens.access, expiresAt: tokens.expiresAt);
+    _signedOut.remove(key);
+    _errors.remove(key);
+    _limited.remove(key);
+    _resetCredits.remove(key);
+    await providers.save(
+      (providers.provider(providerId) ?? provider).withAccount(account),
+    );
+    notifyListeners();
+    if (refreshUsage) unawaited(_fetchUsage(providerId, account));
+    return account;
+  }
+
+  @override
+  Future<void> removeAccount(String providerId, String accountId) async {
+    final key = _key(providerId, accountId);
+    _requests.remove(key);
+    final providers = _providers();
+    if (providers.provider(providerId) case final provider?) {
+      await providers.save(
+        provider.copyWith(
+          accounts: [
+            for (final account in provider.accounts)
+              if (account.id != accountId) account,
+          ],
+        ),
+      );
+    }
+    try {
+      await providers.secrets.delete(
+        ModelProvider.accountRefFor(providerId, accountId),
+      );
+    } on SecretStoreException catch (error) {
+      debugPrint('Token of $accountId not removed: $error');
+    }
+    _requests.remove(key);
+    _tokens.remove(key);
+    _usage.remove(key);
+    _errors.remove(key);
+    _limited.remove(key);
+    _resetCredits.remove(key);
+    _signedOut.remove(key);
+    _balancer.forget(providerId, accountId);
+    notifyListeners();
+  }
+
+  // --- Quota and models ------------------------------------------------------
+
+  @override
+  Future<void> refreshUsage(ModelProvider provider, {bool force = true}) =>
+      Future.wait([
+        for (final account in provider.accounts)
+          _fetchUsage(provider.id, account, force: force),
+      ]);
+
+  Future<void> _fetchUsage(
+    String providerId,
+    ProviderAccount account, {
+    bool force = true,
+  }) {
+    final key = _key(providerId, account.id);
+    final provider = _providers().provider(providerId);
+    if (provider?.account(account.id) == null) return Future.value();
+    final requests = _requests.putIfAbsent(key, _AccountRequests.new);
+    if (requests.usage case final running?) return running;
+    final previous = _usage[key];
+    if (!force && !_stale(previous, requests.usageAttemptedAt)) {
+      return Future.value();
+    }
+    requests.usageAttemptedAt = _now();
+    final fetch = _queryUsage(provider!, account, requests, previous)
+        .whenComplete(() {
+          requests.usage = null;
+        });
+    requests.usage = fetch;
+    return fetch;
+  }
+
+  /// Whether [usage] is to be asked again: not known, learned (or [tried])
+  /// [CodexService.usageMaxAge] ago, or a window of it started over since
+  /// (and not tried since).
+  bool _stale(CodexUsage? usage, DateTime? tried) {
+    final now = _now();
+    if (usage != null &&
+        usage.windows.any(
+          (window) => switch (window.resetsAt) {
+            final at? =>
+              at.isAfter(usage.at) &&
+                  !at.isAfter(now) &&
+                  (tried == null || tried.isBefore(at)),
+            null => false,
+          },
+        )) {
+      return true;
+    }
+    final last = [?usage?.at, ?tried].fold<DateTime?>(
+      null,
+      (latest, at) => latest == null || at.isAfter(latest) ? at : latest,
+    );
+    return last == null || now.difference(last) >= CodexService.usageMaxAge;
+  }
+
+  Future<void> _queryUsage(
+    ModelProvider provider,
+    ProviderAccount account,
+    _AccountRequests requests,
+    CodexUsage? previous,
+  ) async {
+    final key = _key(provider.id, account.id);
+    // Headers learned while this query ran are newer, even at the same clock
+    // time. Neither its answer nor an error should replace that snapshot.
+    bool current() =>
+        _current(provider.id, account.id, requests) &&
+        identical(_usage[key], previous);
+    try {
+      final (status, text) = await _get(provider, account, endpoints.usage);
+      if (!current()) return;
+      if (status >= 400) {
+        _errors[key] = upstreamErrorMessage(status, text);
+      } else {
+        final usage = CodexUsage.fromJson(_decode(text), _now());
+        _usage[key] = usage;
+        _errors.remove(key);
+        if (!usage.limitReached) _limited.remove(key);
+        switch (usage.resetCredits) {
+          case 0:
+            _resetCredits[key] = const [];
+          // Listed again as their count changes.
+          case final count? when _resetCredits[key]?.length != count:
+            unawaited(_listResetCredits(provider, account, requests));
+        }
+        unawaited(_autoReset(provider.id, account));
+      }
+    } on CodexException catch (error) {
+      if (!current()) return;
+      _errors[key] = error.message;
+    } on Object catch (error) {
+      if (!current()) return;
+      _errors[key] = '$error';
+    }
+    notifyListeners();
+  }
+
+  Future<void> _listResetCredits(
+    ModelProvider provider,
+    ProviderAccount account,
+    _AccountRequests requests,
+  ) async {
+    final key = _key(provider.id, account.id);
+    try {
+      final (status, text) = await _get(
+        provider,
+        account,
+        endpoints.resetCredits,
+      );
+      if (status >= 400 || !_current(provider.id, account.id, requests)) {
+        return;
+      }
+      final json = _decode(text);
+      final credits = CodexResetCredit.listFromJson(json, _now());
+      _resetCredits[key] = credits;
+      // The list's count is the backend's own: the usage's kept with it.
+      final count = switch (json) {
+        {'available_count': final num count} when count > 0 => count.toInt(),
+        _ => credits.length,
+      };
+      if (_usage[key] case final usage? when usage.resetCredits != count) {
+        _usage[key] = usage.withResetCredits(count);
+      }
+      notifyListeners();
+    } on Object catch (error) {
+      debugPrint('Reset credits of ${account.id} not listed: $error');
+    }
+  }
+
+  @override
+  Future<void> useResetCredit(ModelProvider provider, String accountId) async {
+    final account = _providers().provider(provider.id)?.account(accountId);
+    if (account == null) throw const CodexException('The account was removed.');
+    await _reset(provider.id, account);
+  }
+
+  /// Uses up a reset credit of [account]'s, if [providerId] is to by itself
+  /// and its quota is used up (for longer than five hours, unless its
+  /// five hours are to be reset too); whether one was.
+  /// After one, the next waits [autoResetBackoff].
+  Future<bool> _autoReset(String providerId, ProviderAccount account) async {
+    final key = _key(providerId, account.id);
+    final requests = _requests[key];
+    if (requests?.reset case final running?) {
+      try {
+        await running;
+        return true;
+      } on Object {
+        return false;
+      }
+    }
+    final provider = _providers().provider(providerId);
+    final usage = _usage[key];
+    final now = _now();
+    if (provider == null ||
+        !provider.autoResetCredits ||
+        !account.enabled ||
+        signedOut(providerId, account.id) ||
+        usage == null ||
+        (usage.resetCredits ?? 0) <= 0 ||
+        !usage.usedUp(now, fiveHours: provider.resetCreditsFiveHours)) {
+      return false;
+    }
+    if (requests?.resetTriedAt case final tried?
+        when now.difference(tried) < autoResetBackoff) {
+      return false;
+    }
+    try {
+      await _reset(providerId, account);
+      return true;
+    } on Object catch (error) {
+      debugPrint('Reset credit of ${account.id} not used: $error');
+      return false;
+    }
+  }
+
+  /// Uses up a reset credit of [account]'s: one at a time. Throws
+  /// [CodexException].
+  Future<void> _reset(String providerId, ProviderAccount account) {
+    final key = _key(providerId, account.id);
+    final requests = _requests.putIfAbsent(key, _AccountRequests.new);
+    if (requests.reset case final running?) return running;
+    requests.resetTriedAt = _now();
+    final reset = _redeem(providerId, account, requests).whenComplete(() {
+      requests.reset = null;
+      notifyListeners();
+    });
+    requests.reset = reset;
+    notifyListeners();
+    return reset;
+  }
+
+  Future<void> _redeem(
+    String providerId,
+    ProviderAccount account,
+    _AccountRequests requests,
+  ) async {
+    final provider = _providers().provider(providerId);
+    if (provider == null) {
+      throw const CodexException('The provider was removed.');
+    }
+    final key = _key(providerId, account.id);
+    final int status;
+    final String text;
+    try {
+      // Retried with the same id, the backend uses up one credit for both.
+      (status, text) = await _send(
+        provider,
+        account,
+        endpoints.consumeResetCredit,
+        body: utf8.encode(jsonEncode({'redeem_request_id': _requestId()})),
+      );
+    } on CodexException {
+      rethrow;
+    } on Object catch (error) {
+      throw CodexException('The reset credit could not be used: $error');
+    }
+    if (!_current(providerId, account.id, requests)) {
+      throw const CodexException('The account changed.');
+    }
+    if (status >= 400) {
+      final message =
+          'The reset credit could not be used: '
+          '${upstreamErrorMessage(status, text)}';
+      _errors[key] = message;
+      notifyListeners();
+      throw CodexException(message);
+    }
+    _limited.remove(key);
+    _errors.remove(key);
+    if (_usage[key] case final usage? when (usage.resetCredits ?? 0) > 0) {
+      _usage[key] = usage.withResetCredits(usage.resetCredits! - 1);
+    }
+    final credits = _resetCredits[key];
+    if (credits != null && credits.isNotEmpty) {
+      _resetCredits[key] = credits.sublist(1);
+    }
+    notifyListeners();
+    // Asked again after one under way, which was asked before the reset.
+    await requests.usage;
+    await _fetchUsage(providerId, account);
+  }
+
+  /// A version 4 UUID, which the backend knows a request by.
+  static String _requestId() {
+    final random = Random.secure();
+    final bytes = [for (var i = 0; i < 16; i++) random.nextInt(256)];
+    bytes[6] = bytes[6] & 0x0f | 0x40;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+    final hex = [for (final b in bytes) b.toRadixString(16).padLeft(2, '0')];
+    return [
+      hex.sublist(0, 4),
+      hex.sublist(4, 6),
+      hex.sublist(6, 8),
+      hex.sublist(8, 10),
+      hex.sublist(10),
+    ].map((part) => part.join()).join('-');
+  }
+
+  /// The models [provider]'s backend lists, asked as one of its accounts.
+  /// Throws [UpstreamException].
+  Future<List<RemoteModel>> listModels(ModelProvider provider) async {
+    final account = pick(provider);
+    if (account == null) {
+      throw UpstreamException(
+        provider.accounts.isEmpty
+            ? 'Sign in to a ChatGPT account first.'
+            : 'No account can be used now.',
+      );
+    }
+    try {
+      final url = endpoints.models(codexVersionOf(provider));
+      final (status, text) = await _get(provider, account, url);
+      if (status >= 400) {
+        throw UpstreamException(
+          '${upstreamErrorMessage(status, text)} (GET $url)',
+        );
+      }
+      return [
+        ...parseCodexModels(_decode(text)),
+        // Its pictures, as the Codex CLI makes them.
+        const RemoteModel(codexImageModel, label: 'GPT Image 2'),
+      ];
+    } on CodexException catch (error) {
+      throw UpstreamException(error.message);
+    } on SocketException catch (error) {
+      throw UpstreamException('Could not connect: ${error.message}');
+    } on TimeoutException {
+      throw const UpstreamException('No answer in time.');
+    }
+  }
+
+  /// POSTs [body] (of [contentType]) to [url] as one of [provider]'s
+  /// accounts, by its balance ([session]'s, if any): its token refreshed
+  /// once if refused, the next account asked when one is out of quota.
+  /// The status and text answered. Throws [UpstreamException].
+  Future<(int, String)> post(
+    ModelProvider provider,
+    Uri url,
+    List<int> body, {
+    required ContentType contentType,
+    String? session,
+    bool events = false,
+    Duration timeout = const Duration(minutes: 5),
+  }) async {
+    final tried = <String>{};
+    final reset = <String>{};
+    while (true) {
+      final account = pick(provider, session: session, exclude: tried);
+      if (account == null) {
+        throw UpstreamException(
+          provider.accounts.isEmpty
+              ? 'Sign in to a ChatGPT account first.'
+              : 'No account can be used now.',
+        );
+      }
+      tried.add(account.id);
+      try {
+        String? rejected;
+        for (var attempt = 0; ; attempt++) {
+          final token = await accessToken(
+            provider,
+            account,
+            rejected: rejected,
+          );
+          final request = await _http.postUrl(url);
+          codexHeaders(
+            token,
+            accountId: account.accountId,
+            session: session,
+            events: events,
+            version: codexVersionOf(provider),
+          ).forEach(request.headers.set);
+          request.headers.contentType = contentType;
+          request.add(body);
+          final response = await request.close().timeout(timeout);
+          final text = await utf8.decodeStream(response).timeout(timeout);
+          if (response.statusCode == 401 && attempt == 0) {
+            rejected = token;
+            continue;
+          }
+          record(provider, account, response.headers.value);
+          // Out of quota: the next account's turn.
+          if (codexLimitReset(response.statusCode, text, _now())
+              case final until?) {
+            markLimited(provider, account, until);
+            // A reset credit used up for it: it goes on, once.
+            if (reset.add(account.id) &&
+                await _resetAfterLimit(provider, account)) {
+              tried.remove(account.id);
+            }
+            break;
+          }
+          return (response.statusCode, text);
+        }
+      } on CodexException catch (error) {
+        throw UpstreamException(error.message);
+      } on SocketException catch (error) {
+        throw UpstreamException('Could not connect: ${error.message}');
+      } on TimeoutException {
+        throw const UpstreamException('No answer in time.');
+      } on HttpException catch (error) {
+        throw UpstreamException(error.message);
+      }
+    }
+  }
+
+  /// Whether [account], out of quota, can take a request again: a reset
+  /// credit of its own used up, if [provider] is to.
+  Future<bool> _resetAfterLimit(
+    ModelProvider provider,
+    ProviderAccount account,
+  ) async {
+    if (!(_providers().provider(provider.id)?.autoResetCredits ?? false)) {
+      return false;
+    }
+    // Its quota as it is now (asked by [markLimited]), then the credit.
+    await _fetchUsage(provider.id, account);
+    await _autoReset(provider.id, account);
+    return limitedUntil(provider.id, account.id) == null &&
+        !signedOut(provider.id, account.id);
+  }
+
+  /// GETs [url] as [account], its token refreshed once if refused.
+  Future<(int, String)> _get(
+    ModelProvider provider,
+    ProviderAccount account,
+    Uri url,
+  ) => _send(provider, account, url);
+
+  /// GETs [url] as [account], or POSTs [body] (JSON) when given; its token
+  /// refreshed once if refused.
+  Future<(int, String)> _send(
+    ModelProvider provider,
+    ProviderAccount account,
+    Uri url, {
+    List<int>? body,
+  }) async {
+    String? rejected;
+    for (var attempt = 0; ; attempt++) {
+      final token = await accessToken(provider, account, rejected: rejected);
+      final request = body == null
+          ? await _http.getUrl(url)
+          : await _http.postUrl(url);
+      codexHeaders(
+        token,
+        accountId: account.accountId,
+        version: codexVersionOf(provider),
+      ).forEach(request.headers.set);
+      if (body != null) {
+        request.headers.contentType = ContentType.json;
+        request.add(body);
+      }
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+      final text = await utf8.decodeStream(response);
+      if (response.statusCode == 401 && attempt == 0) {
+        rejected = token;
+        continue;
+      }
+      return (response.statusCode, text);
+    }
+  }
+
+  Future<(int, String)> _postForm(Uri url, Map<String, String> form) async {
+    try {
+      final request = await _http.postUrl(url);
+      request.headers
+        ..contentType = ContentType(
+          'application',
+          'x-www-form-urlencoded',
+          charset: 'utf-8',
+        )
+        ..set(HttpHeaders.acceptHeader, 'application/json');
+      request.write(Uri(queryParameters: form).query);
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+      return (response.statusCode, await utf8.decodeStream(response));
+    } on SocketException catch (error) {
+      throw CodexException('Could not reach ${url.host}: ${error.message}');
+    } on TimeoutException {
+      throw CodexException('${url.host} did not answer in time.');
+    } on HandshakeException catch (error) {
+      throw CodexException('TLS failed: ${error.message}');
+    }
+  }
+
+  static Object? _decode(String text) {
+    try {
+      return jsonDecode(text);
+    } on FormatException {
+      return null;
+    }
+  }
+}
+
+/// Requests belong to one sign-in, not a later account with the same id.
+class _AccountRequests {
+  Future<String>? token;
+  Future<void>? usage;
+  DateTime? usageAttemptedAt;
+
+  /// A reset credit being used; when one last was tried.
+  Future<void>? reset;
+  DateTime? resetTriedAt;
+}
+
+/// A sign-in waiting for the browser to come back to this machine.
+class _Login implements CodexLogin {
+  _Login(this.url, this._servers, this._state, Duration timeout) {
+    for (final server in _servers) {
+      server.listen((request) => unawaited(_handle(request)));
+    }
+    _timer = Timer(timeout, () {
+      _finish(const CodexException('Sign-in took too long.'));
+    });
+  }
+
+  @override
+  final Uri url;
+  final List<HttpServer> _servers;
+  final String _state;
+  final Completer<String> _code = Completer();
+  late final Timer _timer;
+  late Future<ProviderAccount> _result;
+
+  @override
+  Future<ProviderAccount> get result => _result;
+
+  @override
+  bool get listening => _servers.isNotEmpty;
+
+  @override
+  void submit(String callback) {
+    final uri = Uri.tryParse(callback.trim());
+    final query = uri?.queryParameters ?? const {};
+    if (uri == null || !query.containsKey('state')) {
+      throw const CodexException(
+        'That is not the address sign-in came back to: it has no state.',
+      );
+    }
+    if (query['state'] != _state) {
+      throw const CodexException(
+        'That address is of another sign-in: start again.',
+      );
+    }
+    final code = query['code'];
+    if (code == null || code.isEmpty) {
+      final reason =
+          query['error_description'] ?? query['error'] ?? 'No code was given.';
+      _finish(CodexException('Sign-in failed: $reason'));
+      return;
+    }
+    _finish(code);
+  }
+
+  @override
+  void cancel() => _finish(const CodexCancelled());
+
+  void _finish(Object outcome) {
+    _timer.cancel();
+    if (!_code.isCompleted) {
+      if (outcome is String) {
+        _code.complete(outcome);
+      } else {
+        _code.completeError(outcome);
+      }
+    }
+    // After the page is answered.
+    Future<void>.delayed(const Duration(milliseconds: 200), () {
+      for (final server in _servers) {
+        unawaited(server.close(force: true));
+      }
+    });
+  }
+
+  Future<void> _handle(HttpRequest request) async {
+    final response = request.response;
+    if (request.uri.path != '/auth/callback') {
+      response.statusCode = HttpStatus.notFound;
+      return response.close();
+    }
+    final query = request.uri.queryParameters;
+    final error = query['error'];
+    final code = query['code'];
+    final String page;
+    if (query['state'] != _state) {
+      response.statusCode = HttpStatus.badRequest;
+      page = _page('Sign-in did not match', 'Start it again from AgileGeek.');
+    } else if (error != null || code == null || code.isEmpty) {
+      response.statusCode = HttpStatus.badRequest;
+      final reason =
+          query['error_description'] ?? error ?? 'No code was given.';
+      page = _page('Sign-in failed', reason);
+      _finish(CodexException('Sign-in failed: $reason'));
+    } else {
+      page = _page(
+        'Signed in',
+        'You can close this page and go back to AgileGeek.',
+      );
+      _finish(code);
+    }
+    response.headers.contentType = ContentType.html;
+    response.write(page);
+    await response.close();
+  }
+
+  static String _page(String title, String detail) {
+    const escape = HtmlEscape();
+    return '<!doctype html><meta charset="utf-8"><title>AgileGeek</title>'
+        '<body style="font-family:system-ui;text-align:center;margin-top:20vh">'
+        '<h2>${escape.convert(title)}</h2><p>${escape.convert(detail)}</p>';
+  }
+}

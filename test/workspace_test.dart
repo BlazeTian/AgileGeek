@@ -1,0 +1,1213 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/chat/chat_models.dart';
+import 'package:agilegeek/chat/chat_screen.dart';
+import 'package:agilegeek/chat/chat_session.dart';
+import 'package:agilegeek/chat/composer/composer_embeds.dart';
+import 'package:agilegeek/kernel/agent_kernel.dart';
+import 'package:agilegeek/kernel/claude_code/claude_code_kernel.dart';
+import 'package:agilegeek/kernel/claude_code/mock_claude_code_transport.dart';
+import 'package:agilegeek/main.dart';
+import 'package:agilegeek/models/model_provider.dart';
+import 'package:agilegeek/models/model_providers.dart';
+import 'package:agilegeek/sidebar/sidebar.dart';
+import 'package:agilegeek/kernel/claude_code/claude_code_transport.dart';
+import 'package:agilegeek/workspace/agent_title.dart';
+import 'package:agilegeek/workspace/chat_grid.dart';
+import 'package:agilegeek/workspace/editor_launcher.dart';
+import 'package:agilegeek/workspace/preference_store.dart';
+import 'package:agilegeek/workspace/workspace.dart';
+
+/// Sessions as Claude Code keeps them: one recorded, in one project, and
+/// any [started] since (e.g. in a terminal).
+class _CountingPreferenceStore extends MemoryPreferenceStore {
+  int writes = 0;
+
+  @override
+  Future<void> write(Map<String, Object?> preferences) async {
+    writes++;
+    await super.write(preferences);
+  }
+}
+
+class FakeCatalog implements SessionCatalog {
+  static final List<SessionRecord> started = [];
+
+  static final kept = SessionRecord(
+    id: 'eafc328b',
+    title: 'Write a.txt and read it back',
+    updatedAt: DateTime(2026, 9, 27, 16),
+    cwd: '/tmp/project',
+    path: 'test/fixtures/claude_code/history.jsonl',
+  );
+
+  /// [kept] as listed now, once talked in elsewhere.
+  static SessionRecord? keptNow;
+
+  @override
+  Future<List<ProjectRecord>> projects() async => [
+    for (final session in started)
+      ProjectRecord(path: session.cwd, sessions: [session]),
+    ProjectRecord(path: '/tmp/project', sessions: [keptNow ?? kept]),
+  ];
+
+  @override
+  Future<List<SessionRecord>> sessionsIn(String cwd) async => const [];
+
+  /// Sessions deleted, in order.
+  static final List<String> deleted = [];
+
+  @override
+  Future<void> delete(String id) async => deleted.add(id);
+}
+
+final KernelDescriptor claude = KernelDescriptor(
+  id: 'claude-code',
+  label: 'Claude Code',
+  icon: Icons.auto_awesome_rounded,
+  description: '',
+  catalog: FakeCatalog(),
+  create: (context) => ClaudeCodeKernel(
+    claude,
+    context,
+    start: MockClaudeCodeTransport.start,
+    readHistory: _readHistory,
+  ),
+);
+
+Future<Workspace> pumpLoaded(
+  WidgetTester tester, {
+  PreferenceStore? preferences,
+  PreferenceStore? drafts,
+  KernelDescriptor? kernel,
+  AgentTitler? titler,
+}) async {
+  tester.view.physicalSize = const Size(1400, 900);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.reset);
+  final workspace = Workspace(
+    kernels: [kernel ?? claude],
+    preferences: preferences,
+    drafts: drafts,
+    titler: titler,
+  );
+  await tester.pumpWidget(AgileGeekApp(workspace: workspace));
+  await tester.runAsync(workspace.load);
+  await tester.pump();
+  return workspace;
+}
+
+Finder inSidebar(Finder finder) =>
+    find.descendant(of: find.byType(Sidebar), matching: finder);
+
+/// Claude Code (the mock) keeping the titles it is given in [renames].
+KernelDescriptor titledClaude(List<String> renames) {
+  late final KernelDescriptor kernel;
+  return kernel = KernelDescriptor(
+    id: 'claude-code',
+    label: 'Claude Code',
+    icon: Icons.auto_awesome_rounded,
+    description: '',
+    catalog: FakeCatalog(),
+    create: (context) => ClaudeCodeKernel(
+      kernel,
+      context,
+      start: (launch) async =>
+          _Renames(await MockClaudeCodeTransport.start(launch), renames),
+      readHistory: _readHistory,
+    ),
+  );
+}
+
+Future<List<Map<String, Object?>>> _readHistory(SessionRecord session) async =>
+    [
+      for (final line in File(session.path!).readAsLinesSync())
+        if (line.isNotEmpty) (jsonDecode(line) as Map).cast<String, Object?>(),
+    ];
+
+/// The CLI's own messages and [say]'s; each name it is given told back,
+/// as Claude Code does.
+class _Renames implements ClaudeCodeTransport {
+  _Renames(this._cli, this._renames) {
+    last = this;
+    _cli.messages.listen(say, onDone: _out.close);
+  }
+
+  /// The one started last.
+  static _Renames? last;
+
+  final ClaudeCodeTransport _cli;
+  final List<String> _renames;
+  final _out = StreamController<Map<String, Object?>>();
+
+  void say(Map<String, Object?> message) {
+    if (!_out.isClosed) _out.add(message);
+  }
+
+  @override
+  Stream<Map<String, Object?>> get messages => _out.stream;
+
+  @override
+  void write(Map<String, Object?> message) {
+    if (message case {
+      'type': 'control_request',
+      'request': {'subtype': 'rename_session', 'title': final String title},
+    }) {
+      _renames.add(title);
+      scheduleMicrotask(
+        () => say({
+          'type': 'system',
+          'subtype': 'session_title_changed',
+          'title': title,
+        }),
+      );
+    }
+    _cli.write(message);
+  }
+
+  @override
+  void close() => _cli.close();
+
+  @override
+  Future<void> get exited => _cli.exited;
+}
+
+void main() {
+  testWidgets('a kept session talked in elsewhere is read anew, in place', (
+    tester,
+  ) async {
+    final workspace = await pumpLoaded(tester);
+    await tester.tap(inSidebar(find.text('Write a.txt and read it back')));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    final thread = workspace.selected;
+    final was = thread.session;
+    expect(thread.record, FakeCatalog.kept);
+    Finder reload() => find.byWidgetPredicate(
+      (widget) =>
+          widget is SidebarIconButton &&
+          widget.tooltip == 'Reload (continued elsewhere)',
+    );
+
+    // Nothing said elsewhere: nothing to read anew.
+    await tester.runAsync(workspace.refresh);
+    await tester.pump();
+    expect(thread.goneOnElsewhere, isFalse);
+    expect(reload(), findsNothing);
+
+    // Gone on with in a terminal: the session's file grew, its last
+    // message after the conversation here was read.
+    final file = File(FakeCatalog.kept.path!);
+    final original = file.readAsStringSync();
+    addTearDown(() => file.writeAsStringSync(original));
+    // In fake async, only synchronous IO runs: the lines go in as text.
+    const since =
+        '\n'
+        '{"parentUuid":"d23f2137-f51f-4a22-af0c-05760c529c4e","isSidechain":'
+        'false,"type":"user","uuid":"11111111-2222-4333-8444-555555555555",'
+        '"message":{"role":"user","content":[{"type":"text","text":'
+        '"Said in a terminal since"}]},"cwd":"/tmp/project","sessionId":'
+        '"eafc328b-0be0-4b23-bbaa-962b545ecb51","version":"2.0.0"}\n'
+        '{"parentUuid":"11111111-2222-4333-8444-555555555555","isSidechain":'
+        'false,"type":"assistant","uuid":"22222222-3333-4444-8555-666666666666"'
+        ',"message":{"id":"msg_terminal_since","type":"message","role":'
+        '"assistant","model":"claude-sonnet-5","content":[{"type":"text",'
+        '"text":"Answered there and then."}]},"cwd":"/tmp/project",'
+        '"sessionId":"eafc328b-0be0-4b23-bbaa-962b545ecb51","version":"2.0.0"}'
+        '\n';
+    file.writeAsStringSync('$original$since', flush: true);
+    final kept = FakeCatalog.kept;
+    FakeCatalog.keptNow = SessionRecord(
+      id: kept.id,
+      title: kept.title,
+      updatedAt: DateTime.now().add(const Duration(minutes: 1)),
+      cwd: kept.cwd,
+      path: kept.path,
+    );
+    addTearDown(() => FakeCatalog.keptNow = null);
+    await tester.runAsync(workspace.refresh);
+    await tester.pump();
+    expect(thread.goneOnElsewhere, isTrue);
+    expect(reload(), findsOneWidget);
+
+    // Typed and not sent: goes on in the conversation read anew.
+    was.draft.save(
+      'Half a question',
+      const TextSelection.collapsed(offset: 4),
+      const [],
+    );
+    await tester.tap(reload());
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    await tester.pump();
+
+    // The same thread in its place, its conversation read anew.
+    expect(identical(workspace.selected, thread), isTrue);
+    expect(identical(thread.session, was), isFalse);
+    expect(thread.record, kept);
+    expect(
+      tester.widget<ChatScreen>(find.byType(ChatScreen)).session,
+      thread.session,
+    );
+    expect(find.textContaining('Said in a terminal since'), findsOneWidget);
+    expect(find.textContaining('Answered there and then.'), findsOneWidget);
+    expect(thread.session.draft.content, 'Half a question');
+    expect(thread.goneOnElsewhere, isFalse);
+    expect(reload(), findsNothing);
+    thread.session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('lists the kept sessions; one opens with its history', (
+    tester,
+  ) async {
+    final workspace = await pumpLoaded(tester);
+    expect(workspace.projects.map((p) => p.name), ['project']);
+    // A new agent in the most recent project, beside the kept session.
+    expect(workspace.selected.record, isNull);
+    expect(
+      inSidebar(find.text('Write a.txt and read it back')),
+      findsOneWidget,
+    );
+
+    await tester.tap(inSidebar(find.text('Write a.txt and read it back')));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    final thread = workspace.selected;
+    expect(thread.record, FakeCatalog.kept);
+    expect(
+      tester.widget<ChatScreen>(find.byType(ChatScreen)).session,
+      thread.session,
+    );
+    expect(thread.session.itemCount, greaterThan(3));
+    await tester.pump();
+    await tester.pump();
+    expect(find.textContaining('No dedicated todo tool'), findsOneWidget);
+    // Continuing it keeps its kernel.
+    expect(thread.session.kernelLocked, isTrue);
+
+    // Deleted, it goes from Claude Code too, once its agent has stopped.
+    addTearDown(FakeCatalog.deleted.clear);
+    await tester.tap(
+      inSidebar(find.text('Write a.txt and read it back')),
+      buttons: kSecondaryButton,
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Delete'));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.textContaining('from Claude Code too'), findsOneWidget);
+    await tester.tap(find.text('Delete').last);
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect(FakeCatalog.deleted, ['eafc328b']);
+    expect(inSidebar(find.text('Write a.txt and read it back')), findsNothing);
+    // Listed again by the kernel meanwhile, it stays deleted.
+    await tester.runAsync(workspace.refresh);
+    await tester.pump();
+    expect(inSidebar(find.text('Write a.txt and read it back')), findsNothing);
+  });
+
+  testWidgets('what is typed and not sent is there the next run', (
+    tester,
+  ) async {
+    final drafts = MemoryPreferenceStore();
+    var workspace = await pumpLoaded(tester, drafts: drafts);
+    AgentThread keptThread() => workspace.threads.firstWhere(
+      (thread) => thread.id == FakeCatalog.kept.id,
+    );
+    AgentThread newThread() =>
+        workspace.threads.firstWhere((thread) => thread.id == null);
+    final image = ImageAttachment(
+      bytes: Uint8List.fromList([1, 2, 3]),
+      mediaType: 'image/png',
+      name: 'shot.png',
+      number: 1,
+    );
+    keptThread().session.draft.save(
+      'Half a question',
+      const TextSelection.collapsed(offset: 4),
+      [image],
+    );
+    workspace.create(project: keptThread().project);
+    newThread().session.draft.save(
+      'Not asked yet',
+      const TextSelection(baseOffset: 0, extentOffset: 3),
+      const [],
+    );
+    // Written once typing stops.
+    await tester.pump(const Duration(milliseconds: 600));
+    expect((await drafts.read()).keys, {
+      FakeCatalog.kept.id,
+      'new:/tmp/project',
+    });
+
+    await tester.pumpWidget(const SizedBox());
+    workspace = await pumpLoaded(tester, drafts: drafts);
+    final kept = keptThread().session.draft;
+    expect(kept.content, 'Half a question');
+    expect(kept.selection, const TextSelection.collapsed(offset: 4));
+    expect(kept.images.single.bytes, [1, 2, 3]);
+    expect(kept.images.single.name, 'shot.png');
+    expect(kept.images.single.number, 1);
+    workspace.create(project: keptThread().project);
+    final draft = newThread().session.draft;
+    expect(draft.content, 'Not asked yet');
+    expect(
+      draft.selection,
+      const TextSelection(baseOffset: 0, extentOffset: 3),
+    );
+
+    // Emptied: not kept.
+    keptThread().session.draft.save(
+      '',
+      const TextSelection.collapsed(offset: 0),
+      const [],
+    );
+    await tester.pump(const Duration(milliseconds: 600));
+    expect((await drafts.read()).keys, {'new:/tmp/project'});
+  });
+
+  testWidgets('a draft kept by a version before, as the old editor\'s '
+      'operations, comes back as text, its tags tags', (tester) async {
+    final tag = ComposerTokenEmbed.file('/tmp/project/lib/main.dart');
+    final drafts = MemoryPreferenceStore({
+      FakeCatalog.kept.id: {
+        'content': [
+          {'insert': 'see '},
+          {
+            'insert': {tag.type: tag.data},
+          },
+          {
+            'insert': ' now',
+            'attributes': {'header': 2},
+          },
+          {'insert': '\n'},
+        ],
+        // After the tag: one character of the old text.
+        'base': 5,
+        'extent': 5,
+        'images': const [],
+      },
+    });
+    final workspace = await pumpLoaded(tester, drafts: drafts);
+    final draft = workspace.threads
+        .firstWhere((thread) => thread.id == FakeCatalog.kept.id)
+        .session
+        .draft;
+    expect(draft.content, 'see ${tag.atom} now');
+    expect(
+      draft.selection,
+      TextSelection.collapsed(offset: 'see ${tag.atom}'.length),
+    );
+    expect(composerPlainText(draft.content!), 'see ${tag.plainText} now');
+  });
+
+  testWidgets('an opened folder becomes the first project', (tester) async {
+    final workspace = await pumpLoaded(tester);
+    await tester.runAsync(() => workspace.openFolder('/tmp/other'));
+    await tester.pump();
+    expect(workspace.projects.first.path, '/tmp/other');
+    expect(workspace.selected.project.path, '/tmp/other');
+    expect(workspace.selected.session.kernelContext.cwd, '/tmp/other');
+  });
+
+  testWidgets('a new agent is titled after its first message, and the '
+      'title is kept with its session', (tester) async {
+    final renames = <String>[];
+    final asked = <String>[];
+    final titledIn = <String?>[];
+    final generated = Completer<String?>();
+    final workspace = await pumpLoaded(
+      tester,
+      kernel: titledClaude(renames),
+      titler: (message, {model, location, session}) {
+        asked.add(message);
+        titledIn.add(session);
+        return generated.future;
+      },
+    );
+    final thread = workspace.selected;
+    final session = thread.session;
+
+    // Its first line is the title meanwhile.
+    session.send(const ComposerMessage(text: 'hi'));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    // Once its CLI told its id, the call kept under it.
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(asked, ['hi']);
+    expect(titledIn, ['mock-claude-session']);
+    expect(thread.title, 'hi');
+    generated.complete('Greeting');
+    await tester.pump();
+    expect(thread.title, 'Greeting');
+    expect(inSidebar(find.text('Greeting')), findsOneWidget);
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect(renames, ['Greeting']);
+
+    // Once.
+    session.send(const ComposerMessage(text: 'Fix the flaky login test'));
+    await tester.pump();
+    expect(asked, hasLength(1));
+    session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('a new agent asked with images alone is titled after the '
+      'file, without the model', (tester) async {
+    final renames = <String>[];
+    final asked = <String>[];
+    final workspace = await pumpLoaded(
+      tester,
+      kernel: titledClaude(renames),
+      titler: (message, {model, location, session}) async {
+        asked.add(message);
+        return 'Generated';
+      },
+    );
+    final thread = workspace.selected;
+    thread.session.send(
+      ComposerMessage(
+        text: '[Image #1]',
+        images: [
+          ImageAttachment(
+            bytes: Uint8List(0),
+            mediaType: 'image/png',
+            name: 'shot.png',
+          ),
+        ],
+      ),
+    );
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(asked, isEmpty);
+    expect(thread.title, 'Image: shot.png');
+    expect(inSidebar(find.text('Image: shot.png')), findsOneWidget);
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect(renames, ['Image: shot.png']);
+    thread.session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('a name the user gives stands over one generated meanwhile', (
+    tester,
+  ) async {
+    final renames = <String>[];
+    final generated = Completer<String?>();
+    final workspace = await pumpLoaded(
+      tester,
+      kernel: titledClaude(renames),
+      titler: (_, {model, location, session}) => generated.future,
+    );
+    final thread = workspace.selected;
+    thread.session.send(
+      const ComposerMessage(text: 'Fix the flaky login test in CI'),
+    );
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    workspace.rename(thread, 'Login');
+    generated.complete('Flaky login test');
+    await tester.pump();
+    expect(thread.title, 'Login');
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect(renames, ['Login']);
+    thread.session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('a title summed up on request is from all that was asked, '
+      'and left to the user to keep', (tester) async {
+    final renames = <String>[];
+    final asked = <String>[];
+    final workspace = await pumpLoaded(
+      tester,
+      kernel: titledClaude(renames),
+      titler: (message, {model, location, session}) async {
+        asked.add(message);
+        return 'Generated ${asked.length}';
+      },
+    );
+    final thread = workspace.selected;
+    thread.session.send(const ComposerMessage(text: 'Fix the login test'));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect(thread.title, 'Generated 1');
+
+    expect(askedTitles(thread.session), ['Fix the login test']);
+    final summary = await workspace.summarizeTitle(thread);
+    expect(summary, 'Generated 2');
+    expect(asked.last, 'Fix the login test');
+    expect(thread.title, 'Generated 1');
+    thread.session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('renamed in Claude Code (/rename), it is named so here too '
+      '(#171)', (tester) async {
+    final renames = <String>[];
+    final workspace = await pumpLoaded(
+      tester,
+      kernel: titledClaude(renames),
+      titler: (_, {model, location, session}) async => 'Generated',
+    );
+    final thread = workspace.selected;
+    thread.session.send(const ComposerMessage(text: 'Fix the login test'));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect(thread.title, 'Generated');
+
+    _Renames.last!.say({
+      'type': 'system',
+      'subtype': 'session_title_changed',
+      'title': 'Login fix',
+    });
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(thread.title, 'Login fix');
+    expect(inSidebar(find.text('Login fix')), findsOneWidget);
+    // Kept as a name given here is; its echo not taken for another.
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(renames, ['Generated', 'Login fix']);
+    expect(thread.title, 'Login fix');
+    thread.session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('a kept session keeps its title', (tester) async {
+    final asked = <String>[];
+    final workspace = await pumpLoaded(
+      tester,
+      titler: (message, {model, location, session}) async {
+        asked.add(message);
+        return 'Generated';
+      },
+    );
+    await tester.tap(inSidebar(find.text('Write a.txt and read it back')));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(workspace.selected.record, FakeCatalog.kept);
+    expect(workspace.selected.session.itemCount, greaterThan(3));
+    expect(asked, isEmpty);
+    expect(workspace.selected.title, 'Write a.txt and read it back');
+  });
+
+  testWidgets('a new agent starts in the mode and approvals picked last', (
+    tester,
+  ) async {
+    final workspace = await pumpLoaded(tester);
+    final first = workspace.selected.session;
+    await tester.pump();
+    expect(first.modes!.selected.id, 'agent');
+    expect(first.permissions!.selected.id, 'default');
+    first.modes!.onSelected(
+      first.modes!.options.firstWhere((mode) => mode.id == 'ask'),
+    );
+    first.permissions!.onSelected(
+      first.permissions!.options.firstWhere((p) => p.id == 'acceptEdits'),
+    );
+    await tester.pump();
+
+    first.send(const ComposerMessage(text: 'hi'));
+    await tester.pump();
+    workspace.create();
+    await tester.pump();
+    final second = workspace.selected.session;
+    expect(second, isNot(first));
+    expect(second.kernelContext.settings, {
+      KernelChoiceKind.mode.name: 'ask',
+      KernelChoiceKind.permission.name: 'acceptEdits',
+    });
+    expect(second.modes!.selected.id, 'ask');
+    expect(second.permissions!.selected.id, 'acceptEdits');
+    first.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('the file manager, kept by its old name, is still the one '
+      'picked', (tester) async {
+    final store = MemoryPreferenceStore({'editor': 'finder'});
+    final workspace = await pumpLoaded(tester, preferences: store);
+    expect(workspace.preferredEditor, Editor.folder);
+  });
+
+  testWidgets('the Fast Ide is kept as the editor like the apps are', (
+    tester,
+  ) async {
+    final store = MemoryPreferenceStore({'editor': 'fastIde'});
+    final workspace = await pumpLoaded(tester, preferences: store);
+    expect(workspace.preferredEditor, Editor.fastIde);
+  });
+
+  testWidgets('choices are kept between runs: a new agent starts with the '
+      'last ones, a kept session with its own', (tester) async {
+    final store = MemoryPreferenceStore({
+      'editor': 'zed',
+      'settings': {'mode': 'plan', 'permission': 'bypassPermissions'},
+      'agents': {
+        FakeCatalog.kept.id: {'mode': 'ask', 'permission': 'acceptEdits'},
+      },
+    });
+    final workspace = await pumpLoaded(tester, preferences: store);
+    expect(workspace.preferredEditor, Editor.zed);
+    final first = workspace.selected.session;
+    await tester.pump();
+    expect(first.modes!.selected.id, 'plan');
+    expect(first.permissions!.selected.id, 'bypassPermissions');
+
+    // Picked again: kept for the next run.
+    first.permissions!.onSelected(
+      first.permissions!.options.firstWhere((p) => p.id == 'default'),
+    );
+    await tester.pump();
+    expect((store.preferences['settings'] as Map)['permission'], 'default');
+
+    // Reopened, a kept session is as it was left.
+    final kept = workspace.threads.firstWhere(
+      (thread) => thread.record?.id == FakeCatalog.kept.id,
+    );
+    expect(kept.session.kernelContext.settings, {
+      KernelChoiceKind.mode.name: 'ask',
+      KernelChoiceKind.permission.name: 'acceptEdits',
+    });
+    first.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('Fast stays with its conversation, not the next agent', (
+    tester,
+  ) async {
+    final previous = ModelProviders.current;
+    ModelProviders.current = ModelProviders.memory(
+      providers: const [
+        ModelProvider(
+          id: 'cx',
+          name: 'Codex',
+          protocol: ProviderProtocol.codex,
+          models: [ProviderModel(id: 'gpt-5')],
+        ),
+      ],
+    );
+    addTearDown(() => ModelProviders.current = previous);
+    await ModelProviders.current.setDefaultModel('@cx/gpt-5');
+    late final KernelDescriptor local;
+    local = KernelDescriptor(
+      id: 'claude-code',
+      label: 'Claude Code',
+      icon: Icons.auto_awesome_rounded,
+      description: '',
+      catalog: FakeCatalog(),
+      create: (context) => ClaudeCodeKernel(
+        local,
+        context,
+        start: MockClaudeCodeTransport.start,
+        readHistory: _readHistory,
+        providerEnvironment: (_, _) async => const {},
+      ),
+    );
+    final store = MemoryPreferenceStore({
+      'agents': {
+        FakeCatalog.kept.id: {'model': '@cx/gpt-5'},
+      },
+    });
+    final workspace = await pumpLoaded(
+      tester,
+      preferences: store,
+      kernel: local,
+    );
+    final kept = workspace.threads.firstWhere(
+      (thread) => thread.record?.id == FakeCatalog.kept.id,
+    );
+    final session = kept.session;
+    final fast = session.modelSettings('@cx/gpt-5').last;
+    expect(fast.kind, KernelChoiceKind.fast);
+    expect(fast.selected, isNull);
+    fast.onSelected(fast.options.single);
+    await tester.pump();
+    final choices =
+        (store.preferences['agents'] as Map)[FakeCatalog.kept.id] as Map;
+    expect(choices['fast'], 'fast');
+    expect(
+      choices[modelSettingKey(KernelChoiceKind.fast, '@cx/gpt-5')],
+      'fast',
+    );
+    expect(
+      (store.preferences['settings'] as Map?)?.containsKey('fast'),
+      isNot(true),
+    );
+
+    workspace.create();
+    await tester.pump();
+    final fresh = workspace.selected.session;
+    expect(fresh.models?.selected.id, '@cx/gpt-5');
+    expect(fresh.selected(KernelChoiceKind.fast), 'standard');
+    expect(fresh.modelSettings('@cx/gpt-5').last.selected, isNull);
+    expect(kept.session.selected(KernelChoiceKind.fast), 'fast');
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    final reopened = await pumpLoaded(
+      tester,
+      preferences: store,
+      kernel: local,
+    );
+    final restored = reopened.threads.firstWhere(
+      (thread) => thread.record?.id == FakeCatalog.kept.id,
+    );
+    expect(restored.session.selected(KernelChoiceKind.fast), 'fast');
+    expect(
+      restored.session.modelSettings('@cx/gpt-5').last.selected?.id,
+      'fast',
+    );
+    expect(
+      reopened.selected.session.selected(KernelChoiceKind.fast),
+      'standard',
+    );
+  });
+
+  testWidgets('batch pinning preserves the supplied order', (tester) async {
+    addTearDown(FakeCatalog.started.clear);
+    FakeCatalog.started.add(
+      SessionRecord(
+        id: 'other',
+        title: 'Another',
+        updatedAt: DateTime(2026, 9, 26),
+        cwd: '/tmp/other',
+      ),
+    );
+    final store = MemoryPreferenceStore();
+    final workspace = await pumpLoaded(tester, preferences: store);
+    AgentThread thread(String id) =>
+        workspace.threads.firstWhere((thread) => thread.record?.id == id);
+
+    workspace.setPinnedAll([
+      thread('other'),
+      thread(FakeCatalog.kept.id),
+    ], true);
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    expect((store.preferences['sidebar'] as Map)['pinned'], [
+      'other',
+      FakeCatalog.kept.id,
+    ]);
+  });
+
+  testWidgets('batch archive and delete save and notify once', (tester) async {
+    addTearDown(FakeCatalog.started.clear);
+    FakeCatalog.started.addAll([
+      SessionRecord(
+        id: 'archive-a',
+        title: 'Archive A',
+        updatedAt: DateTime(2026, 9, 28),
+        cwd: '/tmp/project',
+      ),
+      SessionRecord(
+        id: 'archive-b',
+        title: 'Archive B',
+        updatedAt: DateTime(2026, 9, 27),
+        cwd: '/tmp/project',
+      ),
+    ]);
+    final store = _CountingPreferenceStore();
+    final workspace = await pumpLoaded(tester, preferences: store);
+    final selected = workspace.threads.where(
+      (thread) =>
+          thread.record?.id == 'archive-a' || thread.record?.id == 'archive-b',
+    );
+    var notifications = 0;
+    workspace.addListener(() => notifications++);
+    final beforeArchive = store.writes;
+    workspace.setArchivedAll(selected, true);
+    expect(notifications, 1);
+    expect(store.writes, beforeArchive + 1);
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+
+    final toDelete = workspace.threads.where(
+      (thread) =>
+          thread.record?.id == 'archive-a' || thread.record?.id == 'archive-b',
+    );
+    notifications = 0;
+    final beforeDelete = store.writes;
+    workspace.deleteAll(toDelete);
+    expect(notifications, 1);
+    expect(store.writes, beforeDelete + 1);
+    // The remaining chat may subsequently sync new state, which must be saved.
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+  });
+
+  testWidgets('what the sidebar shows is kept between runs', (tester) async {
+    addTearDown(FakeCatalog.started.clear);
+    FakeCatalog.started.add(
+      SessionRecord(
+        id: 'other',
+        title: 'Another',
+        updatedAt: DateTime(2026, 9, 26),
+        cwd: '/tmp/other',
+      ),
+    );
+    final store = MemoryPreferenceStore();
+    var workspace = await pumpLoaded(tester, preferences: store);
+    AgentThread thread(String id) =>
+        workspace.threads.firstWhere((thread) => thread.record?.id == id);
+    workspace
+      ..setPinned(thread(FakeCatalog.kept.id), true)
+      ..rename(thread(FakeCatalog.kept.id), 'Renamed')
+      ..setArchived(thread('other'), true)
+      ..sidebarGrouping = SidebarGrouping.time.name
+      ..toggleCollapsed('today')
+      ..showArchived = true;
+    await tester.runAsync(() => workspace.openFolder('/tmp/opened'));
+
+    // The next run.
+    await tester.pumpWidget(const SizedBox());
+    final renames = <String>[];
+    workspace = await pumpLoaded(
+      tester,
+      preferences: store,
+      kernel: titledClaude(renames),
+    );
+    final kept = thread(FakeCatalog.kept.id);
+    expect(kept.pinned, isTrue);
+    expect(kept.title, 'Renamed');
+    expect(thread('other').archived, isTrue);
+    expect(thread('other').pinned, isFalse);
+    expect(workspace.sidebarGrouping, SidebarGrouping.time.name);
+    expect(workspace.isCollapsed('today'), isTrue);
+    expect(workspace.showArchived, isTrue);
+    expect(
+      workspace.projects.map((project) => project.path),
+      contains('/tmp/opened'),
+    );
+
+    // Its CLI takes the name once running.
+    workspace.select(kept);
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(renames, ['Renamed']);
+    kept.session.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('marks are dropped with the sessions gone, not when the '
+      'catalog could not be read', (tester) async {
+    final store = MemoryPreferenceStore({
+      'sidebar': {
+        'pinned': [FakeCatalog.kept.id, 'gone'],
+        'archived': ['gone'],
+        'names': {FakeCatalog.kept.id: FakeCatalog.kept.title, 'gone': 'x'},
+        'folders': ['/tmp/project', '/tmp/opened'],
+      },
+    });
+    late final KernelDescriptor failing;
+    failing = KernelDescriptor(
+      id: 'claude-code',
+      label: 'Claude Code',
+      icon: Icons.auto_awesome_rounded,
+      description: '',
+      catalog: _FailingCatalog(),
+      create: (context) => ClaudeCodeKernel(
+        failing,
+        context,
+        start: MockClaudeCodeTransport.start,
+      ),
+    );
+    await pumpLoaded(tester, preferences: store, kernel: failing);
+    expect((store.preferences['sidebar'] as Map)['pinned'], [
+      FakeCatalog.kept.id,
+      'gone',
+    ]);
+
+    await tester.pumpWidget(const SizedBox());
+    await pumpLoaded(tester, preferences: store);
+    final sidebar = store.preferences['sidebar'] as Map;
+    expect(sidebar['pinned'], [FakeCatalog.kept.id]);
+    expect(sidebar['archived'], isEmpty);
+    // The catalog lists the name now: it is the CLI's.
+    expect(sidebar['names'], isEmpty);
+    // Listed by the catalog now.
+    expect(sidebar['folders'], ['/tmp/opened']);
+  });
+
+  testWidgets('back in the app, sessions started elsewhere are listed', (
+    tester,
+  ) async {
+    addTearDown(FakeCatalog.started.clear);
+    final workspace = await pumpLoaded(tester);
+    final before = workspace.threads.length;
+    // This run's agent, once the CLI named its session.
+    final ours = workspace.selected.session;
+    ours.send(const ComposerMessage(text: 'hi'));
+    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    await tester.pump();
+    expect(ours.sessionId, isNotNull);
+
+    SessionRecord record(String id, String cwd) => SessionRecord(
+      id: id,
+      title: 'Started in a terminal ($id)',
+      updatedAt: DateTime(2026, 9, 28),
+      cwd: cwd,
+    );
+    FakeCatalog.started.addAll([
+      record('terminal-1', '/tmp/project'),
+      record('terminal-2', '/tmp/elsewhere'),
+      record(ours.sessionId!, '/tmp/project'),
+    ]);
+    await tester.runAsync(workspace.refresh);
+    await tester.pump();
+    expect(workspace.threads.length, before + 2);
+    expect(
+      inSidebar(find.text('Started in a terminal (terminal-1)')),
+      findsOneWidget,
+    );
+    expect(workspace.projects.first.path, '/tmp/elsewhere');
+
+    // Taken off the list, it stays off.
+    workspace.delete(
+      workspace.threads.firstWhere((t) => t.record?.id == 'terminal-1'),
+    );
+    await tester.runAsync(workspace.refresh);
+    await tester.pump();
+    expect(workspace.threads.length, before + 1);
+    ours.stop();
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  group('the IDE', () {
+    testWidgets('opens a folder apart from the chat: no agent there is '
+        'listed, and the chat keeps its own', (tester) async {
+      final workspace = await pumpLoaded(tester);
+      final selected = workspace.selected;
+      final projects = [...workspace.projects];
+
+      workspace.openIdeFolder('/tmp/ide');
+      await tester.pump();
+      expect(workspace.ideFolder, '/tmp/ide');
+      expect(workspace.recentFolders, ['/tmp/ide']);
+      expect(workspace.projects, projects);
+      expect(workspace.selected, same(selected));
+      // A chat of its own there, which the sidebar does not list.
+      final chat = workspace.ideChat('/tmp/ide')!;
+      expect(chat.project.path, '/tmp/ide');
+      expect(workspace.ideChats('/tmp/ide'), [chat]);
+      expect(workspace.listsInSidebar(chat), isFalse);
+
+      workspace.closeIdeFolder();
+      expect(workspace.ideFolder, isNull);
+      expect(workspace.recentFolders, ['/tmp/ide']);
+    });
+
+    testWidgets('lists a folder once an agent there is sent something', (
+      tester,
+    ) async {
+      final workspace = await pumpLoaded(tester);
+      workspace.openIdeFolder('/tmp/ide');
+      final chat = workspace.ideChat('/tmp/ide')!;
+      chat.session.send(const ComposerMessage(text: 'hi'));
+      await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+      await tester.pump();
+      expect(workspace.projects.first.path, '/tmp/ide');
+      expect(workspace.listsInSidebar(chat), isTrue);
+      chat.session.stop();
+      await tester.pump(const Duration(seconds: 1));
+    });
+
+    test('hidden projects are removed from IDE recents', () {
+      final workspace = Workspace(projects: const [Project('ide', '/tmp/ide')]);
+      addTearDown(workspace.dispose);
+
+      workspace.openIdeFolder('/tmp/ide');
+      expect(workspace.recentFolders, ['/tmp/ide']);
+      workspace.hideProject(workspace.projects.single);
+      expect(workspace.recentFolders, isEmpty);
+    });
+
+    testWidgets('chats are tabs: a new one beside the shown, a closed one '
+        'nothing was sent to dropped, the last replaced', (tester) async {
+      final workspace = await pumpLoaded(tester);
+      workspace.openIdeFolder('/tmp/ide');
+      final first = workspace.ideChat('/tmp/ide')!;
+      // An untouched one is reused, not another made.
+      expect(workspace.newIdeChat('/tmp/ide'), same(first));
+
+      final kept = workspace.threads.firstWhere(
+        (thread) => thread.record?.id == FakeCatalog.kept.id,
+      );
+      workspace.openIdeChat('/tmp/ide', kept);
+      expect(workspace.ideChats('/tmp/ide'), [first, kept]);
+      expect(workspace.ideChat('/tmp/ide'), same(kept));
+
+      workspace.closeIdeChat('/tmp/ide', first);
+      expect(workspace.threads, isNot(contains(first)));
+      expect(workspace.ideChats('/tmp/ide'), [kept]);
+
+      // The agent goes on, out of the tabs; a new one takes their place.
+      workspace.closeIdeChat('/tmp/ide', kept);
+      expect(workspace.threads, contains(kept));
+      final replaced = workspace.ideChats('/tmp/ide');
+      expect(replaced, hasLength(1));
+      expect(replaced.single.untouched, isTrue);
+    });
+
+    testWidgets("an agent opened in the IDE shows its folder, with it the "
+        "chat's tab; kept between runs", (tester) async {
+      final store = MemoryPreferenceStore();
+      var workspace = await pumpLoaded(tester, preferences: store);
+      final kept = workspace.threads.firstWhere(
+        (thread) => thread.record?.id == FakeCatalog.kept.id,
+      );
+      final selected = workspace.selected;
+      workspace
+        ..openInIde(kept)
+        ..addRecentFile('/tmp/project/a.txt');
+      expect(workspace.layout, WorkspaceLayout.ide);
+      expect(workspace.ideFolder, '/tmp/project');
+      expect(workspace.ideChat('/tmp/project'), same(kept));
+      expect(workspace.selected, same(selected));
+
+      // The next run.
+      await tester.pumpWidget(const SizedBox());
+      workspace = await pumpLoaded(tester, preferences: store);
+      expect(workspace.ideFolder, '/tmp/project');
+      expect(workspace.recentFolders, ['/tmp/project']);
+      expect(workspace.recentFiles, ['/tmp/project/a.txt']);
+      expect(
+        workspace.ideChat('/tmp/project')?.record?.id,
+        FakeCatalog.kept.id,
+      );
+
+      workspace.clearRecent();
+      expect(workspace.recentFolders, isEmpty);
+      expect(workspace.recentFiles, isEmpty);
+    });
+  });
+
+  group('the chat panes', () {
+    testWidgets(
+      'rearranged panes and the moved agent focused survive a restart',
+      (tester) async {
+        final store = MemoryPreferenceStore();
+        var workspace = await pumpLoaded(tester, preferences: store);
+        final draft = workspace.selected;
+        final kept = workspace.threads.firstWhere(
+          (thread) => thread.record?.id == FakeCatalog.kept.id,
+        );
+        workspace.openBeside(kept, draft, PaneSide.right);
+        workspace.rearrangePane(kept, draft, side: PaneSide.bottom);
+        expect(workspace.grid.rowsSplit, isTrue);
+        expect(workspace.grid.columnsSplit, isFalse);
+        expect(workspace.current, same(kept));
+
+        await tester.pumpWidget(const SizedBox());
+        workspace = await pumpLoaded(tester, preferences: store);
+        expect(workspace.grid.panes, hasLength(2));
+        expect(workspace.grid.at(0)?.id, isNull);
+        expect(workspace.grid.at(2)?.id, FakeCatalog.kept.id);
+        expect(workspace.grid.rowsSplit, isTrue);
+        expect(workspace.grid.columnsSplit, isFalse);
+        expect(workspace.current?.id, FakeCatalog.kept.id);
+      },
+    );
+
+    testWidgets('the agents open, where they were, and the one focused are '
+        'kept between runs', (tester) async {
+      final store = MemoryPreferenceStore();
+      var workspace = await pumpLoaded(tester, preferences: store);
+      final draft = workspace.selected;
+      final kept = workspace.threads.firstWhere(
+        (thread) => thread.record?.id == FakeCatalog.kept.id,
+      );
+      workspace.openBeside(kept, draft, PaneSide.right);
+      workspace.grid.setColumnRatioIn(0, .3);
+      workspace.keepGridLines();
+
+      // The next run.
+      await tester.pumpWidget(const SizedBox());
+      workspace = await pumpLoaded(tester, preferences: store);
+      final panes = workspace.grid.panes;
+      expect(panes, hasLength(2));
+      // The new agent is one again, in its project.
+      expect(panes.first.id, isNull);
+      expect(panes.first.project.path, '/tmp/project');
+      expect(panes.last.record?.id, FakeCatalog.kept.id);
+      expect(workspace.grid.at(0), same(panes.first));
+      expect(workspace.grid.at(1), same(panes.last));
+      expect(workspace.selected, same(panes.last));
+      expect(workspace.grid.columnRatios, [.3, .3]);
+    });
+
+    testWidgets("each pane's tabs, and the one shown, survive a restart", (
+      tester,
+    ) async {
+      addTearDown(FakeCatalog.started.clear);
+      FakeCatalog.started.addAll([
+        for (final id in ['tab-a', 'tab-b'])
+          SessionRecord(
+            id: id,
+            title: id,
+            updatedAt: DateTime(2026, 9, 28),
+            cwd: '/tmp/project',
+          ),
+      ]);
+      final store = MemoryPreferenceStore();
+      var workspace = await pumpLoaded(tester, preferences: store);
+      AgentThread byId(String id) =>
+          workspace.threads.firstWhere((thread) => thread.id == id);
+      final draft = workspace.selected;
+      final kept = byId(FakeCatalog.kept.id);
+      workspace
+        ..openBeside(kept, draft, PaneSide.right)
+        ..openInPlaceOf(kept, byId('tab-a'))
+        ..openInPlaceOf(byId('tab-a'), byId('tab-b'))
+        ..raiseCovered(byId('tab-b'), byId('tab-a'));
+      List<String?> tabs() => [
+        for (final tab in workspace.grid.tabs(workspace.grid.at(1)!)) tab.id,
+      ];
+      expect(tabs(), [FakeCatalog.kept.id, 'tab-a', 'tab-b']);
+      expect(workspace.grid.at(1)?.id, 'tab-a');
+
+      await tester.pumpWidget(const SizedBox());
+      workspace = await pumpLoaded(tester, preferences: store);
+      expect(workspace.grid.panes, hasLength(2));
+      expect(tabs(), [FakeCatalog.kept.id, 'tab-a', 'tab-b']);
+      expect(workspace.grid.at(1)?.id, 'tab-a');
+      expect(workspace.grid.tabs(workspace.grid.at(0)!), hasLength(1));
+      // The one covered last shows when the shown one closes.
+      expect(workspace.grid.uncover(workspace.grid.at(1)!)?.id, 'tab-b');
+    });
+
+    testWidgets("an agent that is no more leaves its pane to the others", (
+      tester,
+    ) async {
+      final store = MemoryPreferenceStore({
+        'chat': {
+          'panes': ['gone', FakeCatalog.kept.id],
+          'cells': [0, 1, 0, 1],
+          'focused': 0,
+          'columnRatio': .3,
+        },
+      });
+      final workspace = await pumpLoaded(tester, preferences: store);
+      expect(workspace.grid.panes.single.record?.id, FakeCatalog.kept.id);
+      expect(workspace.grid.at(3), same(workspace.grid.panes.single));
+      expect(workspace.selected, same(workspace.grid.panes.single));
+    });
+  });
+}
+
+class _FailingCatalog implements SessionCatalog {
+  @override
+  Future<List<ProjectRecord>> projects() async => throw StateError('locked');
+
+  @override
+  Future<List<SessionRecord>> sessionsIn(String cwd) async => const [];
+
+  @override
+  Future<void> delete(String id) async {}
+}

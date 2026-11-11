@@ -1,0 +1,278 @@
+import 'package:agilegeek/ide/git/git_model.dart';
+import 'package:agilegeek/ide/git/git_repository.dart';
+import 'package:agilegeek/ide/git/git_service.dart';
+
+/// Git as widget tests need it: no processes, canned output, and the
+/// commands it was asked to run.
+class FakeGit {
+  FakeGit(this.root);
+
+  final String root;
+
+  /// Whether [root] is in a repository (`rev-parse --show-toplevel`).
+  bool isRepository = true;
+
+  /// `git status -z --porcelain --branch` output.
+  String status = '## main\x00';
+
+  /// `git log` output ([ideGitLogFormat] records).
+  String log = '';
+
+  /// The commit messages `git log --format=%B%x1e` gives, the newest first.
+  List<String> messages = [];
+
+  /// `git ls-files --others --ignored --directory -z` output's paths.
+  List<String> ignored = [];
+
+  /// `git show` output: by commit for `--name-status -z`, by `ref:path`
+  /// for a file's text (which, not there, fails as a missing path does).
+  final Map<String, String> show = {};
+
+  /// `git diff` output (of the index, or with `--cached` of HEAD).
+  String diff = '';
+
+  /// `git diff --no-index -- /dev/null <path>` output, by relative path.
+  final Map<String, String> newFileDiffs = {};
+
+  /// `git remote` output.
+  String remotes = 'origin\n';
+
+  /// `git remote -v`'s URLs, by remote.
+  final Map<String, String> remoteUrls = {};
+
+  /// The pseudo-ref of the operation under way (`REBASE_HEAD`), if any.
+  String? operation;
+
+  /// `git --version` output (the service reads it to pick `restore` or the
+  /// older `reset` for unstaging).
+  String version = 'git version 2.39.0';
+
+  /// `git blame --incremental` output, by relative path (which, not there,
+  /// fails as an untracked path does).
+  final Map<String, String> blame = {};
+
+  /// Resolved refs (`rev-parse --verify -q <ref>`).
+  final Map<String, String> refs = {};
+
+  /// `git for-each-ref --format=<ideGitRefsFormat>` output: [gitRefRecord]
+  /// lines.
+  String forEachRef = '';
+
+  /// The local branches' upstreams (`for-each-ref` of `refs/heads`), by
+  /// branch.
+  final Map<String, String> upstreams = {};
+
+  /// `git worktree list --porcelain` output.
+  String worktrees = '';
+
+  /// Every command run, without `git`.
+  final List<List<String>> calls = [];
+
+  /// Runs before a command answers: may change [status] as the command
+  /// would have.
+  void Function(List<String> arguments)? onCommand;
+
+  /// Answers by command, over the canned ones: e.g. a push that fails.
+  final Map<String, IdeGitOutput> answers = {};
+
+  /// What a command waits for before it answers, e.g. a push under way.
+  Future<void>? Function(List<String> arguments)? hold;
+
+  /// What was written to Git, and the environments it was given, in order.
+  final List<String> stdins = [];
+  final List<Map<String, String>> environments = [];
+
+  List<List<String>> callsTo(String command) => [
+    for (final call in calls)
+      if (call.first == command) call,
+  ];
+
+  Future<IdeGitOutput> run(
+    List<String> arguments, {
+    required String workingDirectory,
+    int? limit,
+    String? stdin,
+    Map<String, String>? environment,
+  }) async {
+    // The operation under way, read with each status: not counted.
+    if (arguments case ['log', '--no-walk', '--source', ...]) {
+      return IdeGitOutput(0, operation == null ? '' : '$operation\n');
+    }
+    // A rebase's folder, there while REBASE_HEAD is: not counted either.
+    if (arguments case [
+      'rev-parse',
+      '--git-path',
+      'rebase-merge/head-name',
+      ...,
+    ]) {
+      return const IdeGitOutput(0, '.git/rebase-merge/head-name\n');
+    }
+    if (arguments case ['hash-object', '--', '.git/rebase-merge/head-name']) {
+      return operation == 'REBASE_HEAD'
+          ? const IdeGitOutput(0, '0000\n')
+          : const IdeGitOutput(128, '', 'fatal: could not open');
+    }
+    calls.add(arguments);
+    if (stdin != null) stdins.add(stdin);
+    if (environment != null) environments.add(environment);
+    await hold?.call(arguments);
+    onCommand?.call(arguments);
+    if (answers[arguments.first] case final answer?) return answer;
+    switch (arguments) {
+      case ['rev-parse', '--show-toplevel']:
+        return isRepository
+            ? IdeGitOutput(0, '$root\n')
+            : const IdeGitOutput(128, '', 'fatal: not a git repository');
+      case ['rev-parse', '--verify', '-q', final ref]:
+        final resolved = refs[ref];
+        return resolved == null
+            ? const IdeGitOutput(1, '')
+            : IdeGitOutput(0, '$resolved\n');
+      case ['status', ...]:
+        return limited(status, limit);
+      case ['for-each-ref', '--format', _, 'refs/heads']:
+        return IdeGitOutput(
+          0,
+          [
+            for (final MapEntry(:key, :value) in upstreams.entries)
+              '$key\x00$value',
+          ].join('\n'),
+        );
+      case ['for-each-ref', ...]:
+        return IdeGitOutput(0, forEachRef);
+      case ['log', '-n', _, '--format=%B%x1e', ...]:
+        return IdeGitOutput(0, [for (final m in messages) '$m\n\x1e'].join());
+      case ['log', ...]:
+        return IdeGitOutput(0, log);
+      case ['ls-files', '--others', '--ignored', ...]:
+        return IdeGitOutput(
+          0,
+          [for (final path in ignored) '$path\x00'].join(),
+        );
+      case ['diff', ..., '--no-index', '--', '/dev/null', final path]:
+        final added = newFileDiffs[path];
+        return IdeGitOutput(added == null ? 0 : 1, added ?? '');
+      case ['diff', ...]:
+        return IdeGitOutput(0, diff);
+      case ['show', ..., final object] when object.contains(':'):
+        final text = show[object];
+        if (text == null) {
+          return IdeGitOutput(128, '', "fatal: path '$object' does not exist");
+        }
+        return IdeGitOutput(0, text);
+      case ['show', ..., final commit]:
+        return IdeGitOutput(0, show[commit] ?? '');
+      case ['remote']:
+        return IdeGitOutput(0, remotes);
+      case ['remote', '-v']:
+        return IdeGitOutput(
+          0,
+          [
+            for (final MapEntry(:key, :value) in remoteUrls.entries)
+              '$key\t$value (fetch)\n$key\t$value (push)\n',
+          ].join(),
+        );
+      case ['worktree', 'list', '--porcelain']:
+        return IdeGitOutput(0, worktrees);
+      case [..., 'blame', '--root', '--incremental', '--', final path]:
+        final output = blame[path];
+        if (output == null) {
+          return IdeGitOutput(128, '', "fatal: no such path '$path' in HEAD");
+        }
+        return IdeGitOutput(0, output);
+      case ['--version']:
+        return IdeGitOutput(0, '$version\n');
+      case ['init']:
+        isRepository = true;
+        return const IdeGitOutput(0, '');
+    }
+    return const IdeGitOutput(0, '');
+  }
+
+  IdeGitRepository repository() => IdeGitRepository(
+    IdeGitService(root, runner: run, watcher: (_) => const Stream.empty()),
+    refreshDelay: Duration.zero,
+  );
+}
+
+/// A `git blame --incremental` entry: [count] lines from [line] last
+/// changed by [hash]; with [author] and [summary], the commit's first.
+String gitBlameEntry(
+  String hash,
+  int line,
+  int count, {
+  String path = 'a.dart',
+  String? author,
+  String? summary,
+  int time = 1767225600,
+}) => [
+  '$hash $line $line $count',
+  if (author != null) ...[
+    'author $author',
+    'author-mail <${author.toLowerCase()}@example.com>',
+    'author-time $time',
+    'author-tz +0000',
+    'committer $author',
+    'committer-mail <${author.toLowerCase()}@example.com>',
+    'committer-time $time',
+    'committer-tz +0000',
+  ],
+  if (summary != null) 'summary $summary',
+  'filename $path',
+  '',
+].join('\n');
+
+/// A [ideGitRefsFormat] line: [ref] at [commit] (40 hex digits), which
+/// [author] committed at [time] with [subject]; [track] its upstream's
+/// tracking (`[ahead 1]`), [upstream] its upstream (`origin/main`).
+String gitRefRecord(
+  String ref,
+  String commit, {
+  String author = 'Ada',
+  String subject = 'Change',
+  int time = 1767225600,
+  String track = '',
+  String upstream = '',
+}) => [
+  ref,
+  commit,
+  '',
+  'f' * 40,
+  '',
+  author,
+  '',
+  // `%(committerdate:raw)`.
+  '$time +0000',
+  '',
+  subject,
+  '',
+  track,
+  upstream,
+].join('\x00');
+
+/// A [ideGitLogFormat] record.
+String gitLogRecord(
+  String id,
+  List<String> parents,
+  String message, {
+  String author = 'Ada',
+  String refs = '',
+  int time = 1767225600,
+}) =>
+    '$id\x1f${parents.join(' ')}\x1f$author\x1fada@example.com\x1f$time\x1f'
+    '$refs\x1f$message\n\x1e';
+
+/// [output]'s first [limit] NUL-terminated records, as `runGit` reads
+/// them: truncated when there were more.
+IdeGitOutput limited(String output, int? limit) {
+  if (limit == null) return IdeGitOutput(0, output);
+  var end = 0;
+  for (var records = 0; records < limit; records++) {
+    final at = output.indexOf('\x00', end);
+    if (at < 0) return IdeGitOutput(0, output);
+    end = at + 1;
+  }
+  return end < output.length && output.indexOf('\x00', end) >= 0
+      ? IdeGitOutput.truncated(output.substring(0, end))
+      : IdeGitOutput(0, output);
+}

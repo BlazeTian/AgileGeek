@@ -1,0 +1,9 @@
+{
+  "name": "dev.agilegeek.browser",
+  "description": "AgileGeek",
+  "path": "agilegeek-browser-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://eomblcfeplinnfjnflcplniphhnjmakc/"
+  ]
+}

@@ -1,0 +1,399 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/ide/ide_notifications.dart';
+import 'package:agilegeek/kernel/commit_attribution.dart';
+import 'package:agilegeek/keybindings/import_dialog.dart';
+import 'package:agile_editor/monaco/flutter/keybinding_entry.dart';
+import 'package:agilegeek/keybindings/keybinding_service.dart';
+import 'package:agilegeek/keybindings/keybindings_sync.dart';
+import 'package:agilegeek/keybindings/default_keybindings.dart';
+import 'package:agilegeek/keybindings/keymap.dart';
+import 'package:agilegeek/keybindings/vscode_import.dart';
+import 'package:agilegeek/main.dart';
+import 'package:agilegeek/platform/data_dir.dart';
+import 'package:agilegeek/settings/app_locale.dart';
+import 'package:agilegeek/settings/app_settings.dart';
+import 'package:agilegeek/settings/pages/general_page.dart';
+import 'package:agilegeek/settings/pages/settings_dropdown.dart';
+import 'package:agilegeek/settings/pages/keybindings_page.dart';
+import 'package:agilegeek/settings/user_settings.dart';
+import 'package:agilegeek/tips/builtin_tips.dart';
+import 'package:agilegeek/tips/feature_tips_view.dart';
+import 'package:agilegeek/l10n/l10n.dart';
+import 'package:agilegeek/workspace/main_window.dart';
+import 'package:agilegeek/workspace/window_controls.dart';
+import 'package:agilegeek/workspace/workspace.dart';
+import 'package:path/path.dart' as p;
+
+import '../keybindings/fake_home.dart';
+
+/// The app as main() makes it, its data folder and the user's home (VS Code
+/// and Cursor installed) in temporary folders.
+void main() {
+  late Directory data;
+  late Directory home;
+  late SettingsFiles files;
+  late KeybindingsSync sync;
+  late AppSettings settings;
+
+  setUp(() async {
+    data = await Directory.systemTemp.createTemp('agilegeek-settings-wiring');
+    home = await createFakeHome();
+    KeybindingService.instance = KeybindingService()
+      ..debugPlatform = KeybindingPlatform.mac;
+  });
+
+  tearDown(() async {
+    sync.dispose();
+    files.dispose();
+    KeybindingService.instance = KeybindingService();
+    await data.delete(recursive: true);
+    await home.delete(recursive: true);
+  });
+
+  /// Makes the settings over the data folder, its files as they are now.
+  Future<void> start() async {
+    files = SettingsFiles(DataDirectory(data.path));
+    await files.load();
+    final catalog = KeymapCatalog(
+      keymapsDir: DataDirectory(data.path).keymapsDir,
+    );
+    sync = KeybindingsSync(
+      keybindings: files.keybindings,
+      settings: files.settings,
+      catalog: catalog,
+    )..start();
+    await sync.ready;
+    settings = AppSettings(
+      locale: AppLocale(),
+      files: files,
+      catalog: catalog,
+      sync: sync,
+      installs: VsCodeInstalls(
+        home: home.path,
+        environment: {'HOME': home.path},
+        platform: KeybindingPlatform.mac,
+      ),
+    );
+  }
+
+  Future<void> write(String path, String text) async {
+    await File(path).parent.create(recursive: true);
+    await File(path).writeAsString(text);
+  }
+
+  Future<void> pumpApp(WidgetTester tester, {Workspace? workspace}) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      AgileGeekApp(workspace: workspace ?? Workspace.mock(), settings: settings),
+    );
+    await tester.pump();
+  }
+
+  /// Lets the disk catch up (the files are real ones) until [done]; a
+  /// launch's checklist reads and writes a few, slow beside other tests.
+  Future<void> settle(WidgetTester tester, bool Function() done) async {
+    for (var i = 0; i < 250; i++) {
+      if (done()) return;
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+    }
+    fail('timed out');
+  }
+
+  Finder toast(String text) => find.descendant(
+    of: find.byType(IdeNotificationToasts),
+    matching: find.textContaining(text, findRichText: true),
+  );
+
+  /// The setup checklist's import item.
+  Finder importTip() => find.descendant(
+    of: find.byType(FeatureTipsCard),
+    matching: find.byKey(const ValueKey(FeatureTipIds.importKeybindings)),
+  );
+
+  testWidgets('the launch lists the import in the setup checklist, no '
+      'dialog; turned on, it imports to keybindings.json and selects the '
+      'keymap', (tester) async {
+    await tester.runAsync(start);
+    await pumpApp(tester, workspace: Workspace.mock()..create());
+    final dialog = find.byType(KeybindingsImportDialog);
+    await settle(tester, () => importTip().evaluate().isNotEmpty);
+    expect(dialog, findsNothing);
+
+    await tester.tap(
+      find.descendant(
+        of: importTip(),
+        matching: find.text(englishLocalizations.tipsTurnOn),
+      ),
+    );
+    await settle(tester, () => dialog.evaluate().isNotEmpty);
+
+    final offer = tester.widget<KeybindingsImportDialog>(dialog);
+    final cursor = offer.detection.sources.firstWhere(
+      (source) => source.product == VsCodeProduct.cursor,
+    );
+    final report = (await tester.runAsync(
+      () => offer.importKeybindings(cursor, KeybindingsImportMode.replace),
+    ))!;
+    // Cursor's own command is kept in the file, and reported.
+    expect(report.unsupported.map((entry) => entry.command), [
+      'workbench.action.toggleAgentsFromKeyboard',
+    ]);
+    final text = File(files.keybindings.path).readAsStringSync();
+    expect(text, contains("// Cursor's agents pane."));
+    final service = KeybindingService.instance;
+    expect(
+      service.userEntries.map((entry) => entry.command),
+      contains('workbench.action.toggleAgentsFromKeyboard'),
+    );
+    expect(
+      service.isSupported('workbench.action.toggleAgentsFromKeyboard'),
+      isFalse,
+    );
+    expect(service.labelFor('workbench.action.navigateBack'), '⌘E');
+
+    final atom = offer.detection.keymaps.firstWhere(
+      (keymap) => keymap.id == 'ms-vscode.atom-keybindings',
+    );
+    final keymap = (await tester.runAsync(() async {
+      final result = await offer.importKeymap(atom);
+      await offer.selectKeymap(result.id);
+      return result;
+    }))!;
+    expect(keymap.builtIn, isTrue);
+    expect(service.keymapName, 'Atom');
+    expect(files.settings['agilegeek.keymap'], 'ms-vscode.atom-keybindings');
+
+    Navigator.of(tester.element(dialog)).pop();
+    await tester.pumpAndSettle();
+    expect(dialog, findsNothing);
+
+    // Done: ticked, and no dialog again.
+    await settle(
+      tester,
+      () => find
+          .descendant(
+            of: importTip(),
+            matching: find.bySemanticsLabel(englishLocalizations.tipsDone),
+          )
+          .evaluate()
+          .isNotEmpty,
+    );
+    await tester.pumpWidget(const SizedBox());
+    await pumpApp(tester);
+    for (var i = 0; i < 10; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+    }
+    expect(dialog, findsNothing);
+  });
+
+  testWidgets('hidden, the checklist is the sidebar\'s entry; Show Setup '
+      'Guide brings it back, over a new agent', (tester) async {
+    await tester.runAsync(start);
+    final workspace = Workspace.mock()..create();
+    await pumpApp(tester, workspace: workspace);
+    final l10n = englishLocalizations;
+    final card = find.descendant(
+      of: find.byType(FeatureTipsCard),
+      matching: find.text(l10n.tipsSetupTitle),
+    );
+    await settle(tester, () => card.evaluate().isNotEmpty);
+    final entry = find.descendant(
+      of: find.byType(FeatureTipsEntry),
+      matching: find.textContaining('Setup 0/'),
+    );
+    expect(entry, findsNothing);
+
+    await tester.tap(find.text(l10n.tipsHide));
+    await settle(tester, () => card.evaluate().isEmpty);
+    await settle(tester, () => entry.evaluate().isNotEmpty);
+    expect(
+      files.storage.get<Map<String, Object?>>('featureTips')?['collapsed'],
+      isTrue,
+    );
+
+    // From an agent that has talked, where the card does not show.
+    workspace.select(
+      workspace.threads.firstWhere((thread) => thread.session.itemCount > 0),
+    );
+    await tester.pump();
+    WindowControls.menuCommandsOf(0)!(showSetupGuideCommandId);
+    await settle(tester, () => card.evaluate().isNotEmpty);
+    expect(entry, findsNothing);
+    expect(workspace.current?.session.itemCount, 0);
+  });
+
+  testWidgets('a keybindings.json that stops parsing is told of, the last '
+      'good one kept; fixed, the notice goes', (tester) async {
+    await tester.runAsync(() async {
+      await write(
+        DataDirectory(data.path).keybindingsFile,
+        '[{ "key": "cmd+e", "command": "workbench.action.navigateBack" }]',
+      );
+      await start();
+    });
+    await pumpApp(tester);
+    expect(toast('keybindings.json'), findsNothing);
+    final service = KeybindingService.instance;
+    expect(service.userEntries, hasLength(1));
+
+    await tester.runAsync(() async {
+      await write(files.keybindings.path, '[{ "key": "cmd+e", ');
+      await files.keybindings.load();
+    });
+    await settle(tester, () => toast('keybindings.json').evaluate().isNotEmpty);
+    expect(service.userEntries, const [
+      KeybindingEntry(command: 'workbench.action.navigateBack', key: 'cmd+e'),
+    ]);
+
+    await tester.runAsync(() async {
+      await write(files.keybindings.path, '[]');
+      await files.keybindings.load();
+    });
+    await settle(tester, () => toast('keybindings.json').evaluate().isEmpty);
+    expect(service.userEntries, isEmpty);
+  });
+
+  testWidgets('⌘K ⌘S opens the keyboard page, over the files', (tester) async {
+    await tester.runAsync(() async {
+      await write(
+        DataDirectory(data.path).settingsFile,
+        '{ "agilegeek.keymap": "ms-vscode.atom-keybindings" }',
+      );
+      await start();
+    });
+    expect(KeybindingService.instance.keymapName, 'Atom');
+    await pumpApp(tester);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyK);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyS);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pump();
+    final page = find.byType(KeybindingsSettingsPage);
+    await settle(
+      tester,
+      () =>
+          page.evaluate().isNotEmpty &&
+          tester.widget<KeybindingsSettingsPage>(page).keymaps.length >= 3,
+    );
+    final keyboard = tester.widget<KeybindingsSettingsPage>(page);
+    expect(keyboard.keymaps.map((keymap) => keymap.name), [
+      'Atom',
+      'IntelliJ IDEA',
+      'Sublime Text',
+    ]);
+    expect(p.basename(keyboard.editing.file.path), 'keybindings.json');
+    expect(keyboard.editing.file, same(files.keybindings));
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+  testWidgets('the commit attribution is kept in settings.json, the '
+      'default unwritten', (tester) async {
+    await tester.runAsync(start);
+    await pumpApp(tester);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pumpAndSettle();
+    expect(find.byType(GeneralSettingsPage), findsOneWidget);
+    // The main window's comes first.
+    final dropdown = find.byType(SettingsDropdown).at(1);
+    expect(tester.widget<SettingsDropdown>(dropdown).current, 'AgileGeek');
+    expect(find.text(CommitAttribution.agileGeekCommit), findsOneWidget);
+
+    Future<void> choose(String label) async {
+      await tester.tap(dropdown);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(label).last);
+      await tester.pumpAndSettle();
+    }
+
+    await choose('None');
+    await settle(
+      tester,
+      () => files.settings[CommitAttribution.settingKey] == 'none',
+    );
+    // The page rebuilds a frame after the file is read back.
+    await tester.pump();
+    expect(tester.widget<SettingsDropdown>(dropdown).current, 'None');
+    expect(
+      File(files.settings.path).readAsStringSync(),
+      contains('"chat.commitAttribution": "none"'),
+    );
+
+    await choose('AgileGeek');
+    await settle(
+      tester,
+      () => !files.settings.values.containsKey(CommitAttribution.settingKey),
+    );
+    await tester.pump();
+    expect(tester.widget<SettingsDropdown>(dropdown).current, 'AgileGeek');
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+  testWidgets('the main window is kept in settings.json, the default '
+      'unwritten', (tester) async {
+    await tester.runAsync(start);
+    await pumpApp(tester);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.comma);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await tester.pumpAndSettle();
+    final dropdown = find.byType(SettingsDropdown).first;
+    expect(
+      tester.widget<SettingsDropdown>(dropdown).current,
+      'Where you left off',
+    );
+
+    Future<void> choose(String label) async {
+      await tester.tap(dropdown);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(label).last);
+      await tester.pumpAndSettle();
+    }
+
+    await choose('Always IDE');
+    await settle(tester, () => files.settings[MainWindow.settingKey] == 'ide');
+    await tester.pump();
+    expect(tester.widget<SettingsDropdown>(dropdown).current, 'Always IDE');
+
+    await choose('Where you left off');
+    await settle(
+      tester,
+      () => !files.settings.values.containsKey(MainWindow.settingKey),
+    );
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+  test('the language is kept in argv.json, its comments too, and read back '
+      'at the next start; an edit by hand applies at once', () async {
+    final argv = DataDirectory(data.path).argvFile;
+    await write(argv, '// VS Code reads this before its window opens\n{\n}\n');
+    await start();
+    final locale = AppLocale(storage: files.argv);
+    addTearDown(locale.dispose);
+    expect(locale.setting, isNull);
+    await locale.select('zh-cn');
+    expect(locale.locale, const Locale('zh', 'CN'));
+    final text = File(argv).readAsStringSync();
+    expect(text, startsWith('// VS Code reads this'));
+    expect(text, contains('"locale": "zh-cn"'));
+
+    final next = ArgvSettings(argv);
+    addTearDown(next.dispose);
+    await next.load();
+    expect(AppLocale(storage: next).setting, 'zh-cn');
+
+    await write(argv, '{ "locale": "en" }');
+    await files.argv.load();
+    expect(locale.setting, 'en');
+  });
+}

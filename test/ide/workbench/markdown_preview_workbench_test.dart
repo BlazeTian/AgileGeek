@@ -1,0 +1,260 @@
+import 'package:agilegeek/chat/chat_models.dart';
+import 'package:agilegeek/chat/composer/composer_files.dart';
+import 'package:agilegeek/chat/composer/file_drop.dart';
+import 'package:agilegeek/ide/ide_editor.dart';
+import 'package:agilegeek/ide/ide_tab_bar.dart';
+import 'package:agilegeek/ide/ide_workbench.dart';
+import 'package:agilegeek/ide/markdown/markdown_paste.dart';
+import 'package:agilegeek/ide/markdown/markdown_preview.dart';
+import 'package:agilegeek/keybindings/keybinding_service.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'fake_files.dart';
+
+class _Clipboard implements MarkdownClipboard {
+  List<ComposerFile> copied = const [];
+  List<ImageAttachment> pictures = const [];
+
+  @override
+  Future<List<ComposerFile>> files() async => copied;
+
+  @override
+  Future<List<ImageAttachment>> images() async => pictures;
+
+  @override
+  Future<bool> hasText() async => false;
+}
+
+/// A markdown file's tab: its preview first, its source a switch (or a key,
+/// or a command) away, and which one each file showed kept.
+void main() {
+  const files = {'README.md': '# Readme\n\nSome text.\n', 'notes.txt': 'x'};
+
+  setUp(() => KeybindingService.instance = KeybindingService());
+  tearDown(() => KeybindingService.instance = KeybindingService());
+
+  final preview = find.byType(IdeMarkdownPreview);
+  final editor = find.byType(IdeEditor);
+  Finder inTabBar(String text) =>
+      find.descendant(of: find.byType(IdeTabBar), matching: find.text(text));
+
+  IdeWorkbenchState workbench(WidgetTester tester) =>
+      tester.state<IdeWorkbenchState>(find.byType(IdeWorkbench));
+
+  testWidgets('markdown opens as its preview; the switch and Ctrl+Shift+V '
+      'show its source and back, kept with the window', (tester) async {
+    Map<String, Object?>? kept;
+    await pumpWorkbench(
+      tester,
+      files,
+      open: ['README.md'],
+      onViewState: (state) => kept = state,
+    );
+    await tester.pumpAndSettle();
+    expect(preview, findsOneWidget);
+    expect(editor, findsNothing);
+    expect(find.text('Readme', findRichText: true), findsOneWidget);
+
+    expect(inTabBar('Preview'), findsOneWidget);
+    await tester.tap(inTabBar('Markdown'));
+    await tester.pumpAndSettle();
+    expect(preview, findsNothing);
+    expect(editor, findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(kept?['markdownSource'], [inRoot('README.md')]);
+
+    await chord(tester, LogicalKeyboardKey.keyV, control: true, shift: true);
+    await tester.pumpAndSettle();
+    expect(preview, findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(kept?.containsKey('markdownSource'), isFalse);
+
+    await chord(tester, LogicalKeyboardKey.keyV, control: true, shift: true);
+    await tester.pumpAndSettle();
+    expect(editor, findsOneWidget);
+
+    // Other files have no switch.
+    await tester.tap(find.text('notes.txt').first);
+    await tester.pumpAndSettle();
+    expect(inTabBar('Preview'), findsNothing);
+  });
+
+  testWidgets('a file kept as its source opens as its source', (tester) async {
+    await pumpWorkbench(
+      tester,
+      files,
+      open: ['README.md'],
+      viewState: {
+        'markdownSource': [inRoot('README.md')],
+      },
+    );
+    await tester.pumpAndSettle();
+    expect(editor, findsOneWidget);
+    expect(preview, findsNothing);
+    final state = workbench(tester);
+    expect(
+      state.commands.firstWhere((c) => c.id == 'markdown.showPreview').enabled,
+      isTrue,
+    );
+    expect(
+      state.commands.firstWhere((c) => c.id == 'markdown.showSource').enabled,
+      isFalse,
+    );
+  });
+
+  testWidgets('Find in the preview finds in the source', (tester) async {
+    await pumpWorkbench(tester, files, open: ['README.md']);
+    await tester.pumpAndSettle();
+    workbench(tester).commands.firstWhere((c) => c.id == 'actions.find').run();
+    await tester.pumpAndSettle();
+    expect(editor, findsOneWidget);
+    expect(
+      find.text(
+        'Find is not available in the preview: showing the Markdown '
+        'source.',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('typed in the preview, the source opens at its caret, the '
+      'tab dirty; Undo in the source takes it back', (tester) async {
+    final workspace = await pumpWorkbench(tester, files, open: ['README.md']);
+    await tester.pumpAndSettle();
+    final paragraph = tester.renderObject<RenderParagraph>(
+      find.text('Some text.', findRichText: true),
+    );
+    // Before `text`: after `Some `.
+    final box = paragraph
+        .getBoxesForSelection(
+          const TextSelection(baseOffset: 5, extentOffset: 6),
+        )
+        .first
+        .toRect();
+    await tester.tapAt(
+      paragraph.localToGlobal(box.centerLeft + const Offset(1, 0)),
+    );
+    await tester.pumpAndSettle();
+    // Typed as the platform's input tells it.
+    final told = tester.testTextInput.editingState!;
+    final caret = told['selectionBase'] as int;
+    tester.testTextInput.updateEditingValue(
+      TextEditingValue(
+        text: (told['text'] as String).replaceRange(caret, caret, 'x'),
+        selection: TextSelection.collapsed(offset: caret + 1),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final doc = workspace.active!;
+    expect(doc.text, '# Readme\n\nSome xtext.\n');
+    expect(doc.dirty, isTrue);
+
+    await chord(tester, LogicalKeyboardKey.keyV, control: true, shift: true);
+    await tester.pumpAndSettle();
+    expect(preview, findsNothing);
+    expect(editor, findsOneWidget);
+    expect(find.textContaining('Ln 3, Col 7'), findsOneWidget);
+    doc.model.undo();
+    await tester.pumpAndSettle();
+    expect(doc.text, '# Readme\n\nSome text.\n');
+  });
+
+  group('pasting files', () {
+    late _Clipboard clipboard;
+    final picture = ImageAttachment(
+      bytes: Uint8List.fromList([137, 80, 78, 71]),
+      mediaType: 'image/png',
+    );
+
+    setUp(() {
+      clipboard = _Clipboard();
+      IdeWorkbench.markdownClipboard = clipboard;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.getData') return {'text': 'plain '};
+            if (call.method == 'Clipboard.hasStrings') return {'value': true};
+            return null;
+          });
+    });
+    tearDown(() {
+      IdeWorkbench.markdownClipboard = const SystemMarkdownClipboard();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null);
+    });
+
+    Future<void> paste(WidgetTester tester) async {
+      await chord(tester, LogicalKeyboardKey.keyV, control: true);
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a picture pasted in the source goes beside the document, '
+        'linked where the caret is; other files paste text', (tester) async {
+      final workspace = await pumpWorkbench(
+        tester,
+        files,
+        open: ['notes.txt', 'README.md'],
+        nativeEditor: true,
+        viewState: {
+          'markdownSource': [inRoot('README.md')],
+        },
+      );
+      await tester.pumpAndSettle();
+      final tree = workspace.files as TreeFiles;
+      clipboard.pictures = [picture];
+      await tester.state<IdeEditorState>(find.byType(IdeEditor)).revealLine(3);
+      await tester.pump();
+      await paste(tester);
+      expect(workspace.active!.text, '# Readme\n\n![](image.png)Some text.\n');
+      expect(tree.bytes.keys, [inRoot('image.png')]);
+      expect(workspace.active!.dirty, isTrue);
+
+      // Not markdown: the clipboard's text, as ever.
+      await tester.tap(find.text('notes.txt').first);
+      await tester.pumpAndSettle();
+      await tester.state<IdeEditorState>(find.byType(IdeEditor)).revealLine(1);
+      await tester.pump();
+      await paste(tester);
+      expect(workspace.active!.text, 'plain x');
+      expect(tree.bytes, hasLength(1));
+    });
+
+    testWidgets('a file dropped on the preview goes after the block it is '
+        'let go on', (tester) async {
+      final workspace = await pumpWorkbench(
+        tester,
+        {...files, '../elsewhere/shot.png': 'png'},
+        open: ['README.md'],
+      );
+      await tester.pumpAndSettle();
+      final tree = workspace.files as TreeFiles;
+
+      // A file dropped from another app, after the block it is let go on.
+      final shot = inRoot('../elsewhere/shot.png');
+      final at = tester.getCenter(find.text('Readme', findRichText: true));
+      final taken = await tester.runAsync(
+        () => FileDrops.handle(
+          MethodCall('drop', {
+            'x': at.dx,
+            'y': at.dy,
+            'files': [
+              {'path': shot},
+            ],
+          }),
+        ),
+      );
+      expect(taken, isTrue);
+      // Its size is read from the disk, for real.
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        workspace.active!.text,
+        '# Readme\n\n![](shot.png)\n\nSome text.\n',
+      );
+      expect(tree.contents[inRoot('shot.png')], 'png');
+    });
+  });
+}

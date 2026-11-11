@@ -1,0 +1,75 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/l10n/l10n.dart';
+import 'package:agilegeek/sidebar/sidebar.dart';
+import 'package:agilegeek/update/update_service.dart';
+import 'package:agilegeek/workspace/workspace.dart';
+
+import 'update_fakes.dart';
+
+void main() {
+  final l10n = englishLocalizations;
+
+  Future<void> show(
+    WidgetTester tester,
+    UpdateService service,
+    VoidCallback onUpdate,
+  ) async {
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 260,
+            child: Sidebar(
+              workspace: Workspace.mock(),
+              onCollapse: () {},
+              onOpenSettings: () {},
+              updates: service,
+              onUpdate: onUpdate,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+  }
+
+  Finder update() => find.text(l10n.updateButton);
+
+  testWidgets('Update shows beside the gear while an update waits', (
+    tester,
+  ) async {
+    final backend = FakeBackend(manifestOf('1.2.0'));
+    final service = serviceOf(backend);
+    var updates = 0;
+    await show(tester, service, () => updates++);
+    expect(update(), findsNothing);
+
+    await tester.runAsync(() async {
+      await service.check(manual: true);
+      await service.download();
+    });
+    await tester.pump();
+    expect(update(), findsOneWidget);
+
+    await tester.tap(update());
+    expect(updates, 1);
+
+    // Skipped: not offered again, but still there to install.
+    service.skip(service.release!);
+    await tester.pump();
+    expect(update(), findsOneWidget);
+
+    // Up to date: it goes.
+    await tester.runAsync(() async {
+      backend.manifest = manifestOf('1.0.0+1');
+      await service.check(manual: true);
+    });
+    await tester.pump();
+    expect(update(), findsNothing);
+    service.dispose();
+  });
+}

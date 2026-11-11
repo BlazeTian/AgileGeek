@@ -1,0 +1,101 @@
+import 'dart:async';
+import 'dart:io';
+
+import '../protocol.dart';
+import '../rpc/rpc_peer.dart';
+import 'remote_server.dart';
+
+/// Ports of this machine forwarded to the app's: what connects to one is
+/// told to the app ([RemoteProtocol.tcpOpen]), which connects on its side;
+/// the bytes go both ways as [RemoteProtocol.tcpData] until either side
+/// closes ([RemoteProtocol.tcpClose]). The other way, the app connects to a
+/// port here ([RemoteProtocol.tcpConnect]: the server connects for it).
+class ServerTcp {
+  ServerTcp(this._peer) {
+    final handlers = _peer.handlers;
+    handlers[RemoteProtocol.tcpListen] = (params, _) async {
+      // A port asked for (the user's own forward), else any.
+      final port = params is Map ? params['port'] as int? ?? 0 : 0;
+      final server = await ServerSocket.bind(
+        InternetAddress.loopbackIPv4,
+        port,
+      );
+      final id = ++_nextId;
+      _listeners[id] = server;
+      server.listen((socket) => _accepted(id, socket), onError: (Object _) {});
+      return {'id': id, 'port': server.port};
+    };
+    handlers[RemoteProtocol.tcpConnect] = (params, _) async {
+      final args = paramsOf(params);
+      final socket = await Socket.connect(
+        args['host'] as String? ?? '127.0.0.1',
+        args['port'] as int,
+        timeout: const Duration(seconds: 10),
+      );
+      final conn = ++_nextConnection;
+      _connections[conn] = socket;
+      _relay(conn, socket);
+      return {'conn': conn};
+    };
+    handlers[RemoteProtocol.tcpUnlisten] = (params, _) async {
+      await _listeners.remove(paramsOf(params)['id'])?.close();
+      return null;
+    };
+    _peer.notificationHandlers[RemoteProtocol.tcpData] = (params) {
+      final args = paramsOf(params);
+      final socket = _connections[args['conn']];
+      if (socket == null) return;
+      try {
+        socket.add(decodeBytes(args['data']));
+      } on Object {
+        _close(args['conn'] as int, tell: true);
+      }
+    };
+    _peer.notificationHandlers[RemoteProtocol.tcpClose] = (params) =>
+        _close(paramsOf(params)['conn'] as int, tell: false);
+  }
+
+  final RpcPeer _peer;
+  final Map<int, ServerSocket> _listeners = {};
+  final Map<int, Socket> _connections = {};
+  int _nextId = 0;
+  int _nextConnection = 0;
+
+  void _accepted(int listener, Socket socket) {
+    final conn = ++_nextConnection;
+    _connections[conn] = socket;
+    _peer.notify(RemoteProtocol.tcpOpen, {'listener': listener, 'conn': conn});
+    _relay(conn, socket);
+  }
+
+  /// [socket]'s bytes to the app as [conn]'s, until it closes.
+  void _relay(int conn, Socket socket) {
+    // Reset by the other end: told by listen's onError, not to go unhandled
+    // (which would end the server, and with it a session's all).
+    unawaited(socket.done.then<void>((_) {}, onError: (Object _) {}));
+    socket.listen(
+      (data) => _peer.notify(RemoteProtocol.tcpData, {
+        'conn': conn,
+        'data': encodeBytes(data),
+      }),
+      onError: (Object _) => _close(conn, tell: true),
+      onDone: () => _close(conn, tell: true),
+    );
+  }
+
+  void _close(int conn, {required bool tell}) {
+    final socket = _connections.remove(conn);
+    if (socket == null) return;
+    socket.destroy();
+    if (tell) _peer.notify(RemoteProtocol.tcpClose, {'conn': conn});
+  }
+
+  Future<void> closeAll() async {
+    for (final conn in [..._connections.keys]) {
+      _close(conn, tell: false);
+    }
+    final listeners = [..._listeners.values];
+    _listeners.clear();
+    await Future.wait([for (final server in listeners) server.close()]);
+  }
+}

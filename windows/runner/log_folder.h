@@ -1,0 +1,42 @@
+#ifndef RUNNER_LOG_FOLDER_H_
+#define RUNNER_LOG_FOLDER_H_
+
+#include <flutter/binary_messenger.h>
+#include <flutter/encodable_value.h>
+#include <flutter/method_channel.h>
+
+#include <memory>
+#include <string>
+
+// Where the app's logs go: the data folder's logs\, beside Flutter's
+// errors.log (see lib/platform/error_log.dart) — window.log (see
+// Win32Window::SizeContent) and the hang reports (see hang_watchdog.h).
+//
+// Only Flutter knows the data folder, which the user can move (the
+// AGILEGEEK_DATA_DIR variable, ~/.agilegeek/config-dir.json). It names the
+// folder over `agilegeek/logs` as it starts:
+//
+//   setFolder (path)  the logs folder, absolute
+//
+// and the folder is kept (HKCU\Software\AgileGeek, LogsFolder) for what is
+// written before that, in a later run or by another copy of the app (see
+// hang_watchdog::ReportRunningCopy); %APPDATA%\agilegeek\logs, the data
+// folder's default place, before the first time.
+namespace log_folder {
+
+// Answers `agilegeek/logs` on |messenger| for as long as the channel is kept.
+std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> Listen(
+    flutter::BinaryMessenger* messenger);
+
+// The folder, made if need be; empty if there is none. From any thread.
+std::wstring Path();
+
+// Writes how the app is ending to the event log (lib/platform/
+// event_log.dart's events.log), as Flutter's lines: "<time> [exit] |how|".
+// For the ends Flutter is not told of: the session's, a crash. From any
+// thread.
+void AppendExit(const char* how);
+
+}  // namespace log_folder
+
+#endif  // RUNNER_LOG_FOLDER_H_

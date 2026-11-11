@@ -1,0 +1,3189 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
+
+import '../chat/composer/composer_files.dart';
+import '../diagnostics/input_lag.dart';
+import '../keybindings/key_chord.dart';
+import '../keybindings/keybinding_service.dart';
+import '../l10n/command_titles.dart';
+import '../l10n/l10n.dart';
+import '../theme/app_theme.dart';
+import '../theme/workbench_theme.dart' hide ColorScheme;
+
+import 'package:agile_editor/monaco/flutter/diff_editor.dart';
+import 'package:agile_editor/monaco/flutter/diff_editor_model.dart';
+import 'package:agile_editor/monaco/flutter/document_snapshot.dart';
+import 'package:agile_editor/monaco/vs/editor/common/diff/range_mapping.dart'
+    show DetailedLineRangeMapping, LineRangeMapping;
+import 'package:agile_editor/monaco/flutter/editor_surface.dart';
+import 'package:agile_editor/monaco/flutter/editor_surface_controller.dart';
+import 'package:agile_editor/monaco/flutter/editor_view_painters.dart'
+    show EditorViewGeometry;
+import 'package:agile_editor/monaco/flutter/monaco_syntax.dart';
+import 'package:agile_editor/monaco/flutter/selection_adapter.dart';
+import 'package:agile_editor/monaco/flutter/theme_assets.dart';
+import 'package:agile_editor/monaco/vs/editor/common/core/cursor_columns.dart';
+import 'package:agile_editor/monaco/vs/editor/common/core/position.dart';
+import 'package:agile_editor/monaco/vs/editor/contrib/find/browser/replace_pattern.dart';
+import 'package:agile_editor/monaco/vs/editor/contrib/gotoError/browser/marker_navigation.dart';
+import 'package:agile_editor/monaco/vs/editor/common/model/search/piece_tree_search.dart';
+import 'package:agile_editor/monaco/flutter/editor_document_model.dart';
+import 'package:agile_editor/monaco/flutter/editor_keybindings.dart';
+import 'package:agile_editor/monaco/flutter/language_configuration_assets.dart';
+import 'package:agile_editor/monaco/flutter/language_overrides.dart';
+import 'package:agile_editor/monaco/vs/editor/common/languages/language_configuration_registry.dart'
+    show plainTextLanguageConfiguration;
+import 'package:agile_editor/monaco/vs/workbench/services/themes/common/color_theme_data.dart';
+import 'package:agile_editor/textmate/textmate_syntax.dart';
+
+import '../base/uri.dart' show VsUri;
+
+import '../debug/base/event.dart' show DisposableStore;
+import '../debug/service/debug_service.dart';
+import 'debug_editor_glue.dart';
+import 'editor_minimap_setting.dart';
+import 'editor_word_wrap.dart';
+import 'git/git_annotations.dart';
+import 'git/git_blame.dart';
+import 'git/git_line_changes.dart';
+import 'git/git_model.dart' show IdeGitBlameInformation, IdeGitLogLines;
+import 'ide_agent_edits.dart';
+import 'ide_line_change_popup.dart';
+import 'ide_code_diff.dart'
+    show
+        IdeDiffRevertArrow,
+        ideDiffArrowLeft,
+        ideDiffArrowTop,
+        ideDiffRevertEdit;
+import 'ide_diff_options.dart';
+import 'ide_commands.dart';
+import 'ide_find_widget.dart';
+import 'ide_dates.dart';
+import 'ide_hover.dart';
+import 'ide_menu.dart';
+import 'ide_notifications.dart';
+import 'ide_original_diff.dart';
+import 'ide_status_bar.dart' show IdeLanguageNames, ideEolEdits;
+import 'ide_workspace.dart';
+import 'lsp/language_features.dart';
+import 'lsp/lsp_protocol.dart';
+import 'lsp_ui/diagnostics.dart' show ideMarkerList;
+import 'lsp_ui/editor_language_session.dart';
+import 'lsp_ui/language_widgets.dart';
+import 'lsp_ui/semantic_tokens.dart';
+import 'lsp_ui/lsp_convert.dart';
+import 'lsp_ui/workspace_edit.dart';
+
+/// How the editor takes a key with the app's keybindings: the [command] it
+/// runs, else [other], the workbench's answer (a command it runs,
+/// [editorChordPrefix], or null when no keybinding has the key).
+typedef _EditorKey = ({String? command, String? other});
+
+/// Where the caret is, as the status bar shows it. [selectionLength] is the
+/// selected UTF-16 length (0 for a caret); [selectionLines] the lines the
+/// selection takes, as VS Code counts them: not one it ends at the start of.
+typedef IdeEditorPosition = ({
+  Position position,
+  int statusColumn,
+  int selectionLength,
+  int selectionLines,
+});
+
+/// What a file is compared with (JetBrains' Compare with…).
+enum IdeCompareWith { branch, revision, clipboard, localHistory }
+
+/// The Fast IDE editor: the painted Monaco port by default, with the Flutter
+/// TextField kept as a fallback (`--dart-define=AGILEGEEK_NATIVE_EDITOR=false`).
+class IdeEditor extends StatefulWidget {
+  const IdeEditor({
+    super.key,
+    required this.workspace,
+    required this.active,
+    required this.onError,
+    required this.onLspStatus,
+    required this.onPositionChanged,
+    this.onScrolled,
+    this.nativeEditorEnabled = const bool.fromEnvironment(
+      'AGILEGEEK_NATIVE_EDITOR',
+      defaultValue: true,
+    ),
+    this.onOpenLocation,
+    this.onShowReferences,
+    this.onShowCommands,
+    this.formatOnSave = false,
+    this.gitBlame = true,
+    this.onShowCommit,
+    this.onShowHistory,
+    this.onCompare,
+    this.keyResolver,
+    this.onPaste,
+    this.debug,
+    this.agentEdits,
+  });
+
+  final IdeWorkspace workspace;
+  final IdeDocument active;
+  final ValueChanged<Object> onError;
+  final ValueChanged<String> onLspStatus;
+  final ValueChanged<IdeEditorPosition> onPositionChanged;
+
+  /// Told as the text scrolls: where it is, for the workspace to keep
+  /// ([IdeEditorState.keepViewStates]).
+  final VoidCallback? onScrolled;
+
+  /// Opt out with --dart-define=AGILEGEEK_NATIVE_EDITOR=false, or override in
+  /// tests. The painted surface is a partial Monaco port; see PARITY.md.
+  final bool nativeEditorEnabled;
+
+  /// Opens a go-to target (the workbench records navigation history and
+  /// opens other files); without it only targets in the active document
+  /// are revealed, centered even when already in view (where Go to
+  /// Definition lands is what one reads next).
+  final Future<void> Function(IdeLocation location)? onOpenLocation;
+
+  /// Lists references (or several definitions) in the workbench's panel.
+  final void Function(String title, List<IdeLocation> locations)?
+  onShowReferences;
+
+  /// Opens the Command Palette: the context menu's last item.
+  final VoidCallback? onShowCommands;
+
+  /// Formats the document before saving (`editor.formatOnSave`, off by
+  /// default) when a language server can.
+  final bool formatOnSave;
+
+  /// Shows who last changed each line with a caret, when, and why, after
+  /// its end (`git.blame.editorDecoration.enabled`), in a repository.
+  final bool gitBlame;
+
+  /// Shows a commit in the Git log: Annotate's pressed.
+  final ValueChanged<String>? onShowCommit;
+
+  /// Shows the Git log of a file, or of some of its lines (their numbers
+  /// at HEAD): Show History, and Show History for Selection.
+  final void Function(String path, IdeGitLogLines? lines)? onShowHistory;
+
+  /// Compares a file with a branch or tag, a revision of it or the
+  /// clipboard, in a diff tab (JetBrains' Compare with…).
+  final void Function(String path, IdeCompareWith what)? onCompare;
+
+  /// The app's keybindings (the workbench resolves them with its context):
+  /// which command a key runs, the editor's own included. Without it the
+  /// editor's default keybindings apply.
+  ///
+  /// With it, the editor resolves the keys pressed in it (its text, find
+  /// widget and rename input) with the same keybindings in its own context
+  /// ([contextKey]) and runs its commands, the cursor keys' and its
+  /// widgets' included; a key whose keybinding is one of this resolver's
+  /// other commands (or none) goes on to the workbench.
+  final EditorKeyResolver? keyResolver;
+
+  /// Takes a paste in [IdeDocument]'s editor before its text is pasted (a
+  /// markdown document's files): whether it pasted.
+  final Future<bool> Function(IdeDocument doc, EditorSurfaceController editor)?
+  onPaste;
+
+  /// The debugger, when there is one: its breakpoints and stopped frames in
+  /// the glyph margin, a click there adding or removing one.
+  final DebugService? debug;
+
+  /// The agents' changes pending in the files: shown in each file, the
+  /// deleted lines above the added, with Undo and Keep by each change.
+  final IdeAgentEdits? agentEdits;
+
+  @override
+  State<IdeEditor> createState() => IdeEditorState();
+}
+
+class IdeEditorState extends State<IdeEditor> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.active.text,
+  );
+  late final FocusNode _focusNode = FocusNode(debugLabel: 'ide editor');
+  // The surface's state implements EditorViewHost, which editor commands use.
+  final GlobalKey _surfaceKey = GlobalKey();
+  late final ScrollController _scrollController = ScrollController();
+  final TextEditingController _findController = TextEditingController();
+  final TextEditingController _replaceController = TextEditingController();
+  final FocusNode _findFocusNode = FocusNode(debugLabel: 'ide find');
+  final FocusNode _replaceFocusNode = FocusNode(debugLabel: 'ide replace');
+  late DocumentSnapshot _snapshot = widget.active.model.snapshot;
+  // Controllers own selection; the workspace documents own text and undo.
+  // Cache by document identity so closing/reopening a path starts a new session.
+  final Map<IdeDocument, EditorSurfaceController> _nativeControllers = {};
+  EditorSurfaceController? _nativeController;
+  final MonacoSyntaxService _syntax = MonacoSyntaxService();
+  final Map<IdeDocument, TokenizedDocument> _tokenizedDocuments = {};
+  // VS Code's grammars and theme where the platform has them; Monarch
+  // highlights the rest (the web, language packs, languages without one).
+  final TextMateSyntax _textMate = TextMateSyntax(
+    themes: WorkbenchThemeService.instance,
+  );
+  // Each by the path its language was picked for.
+  final Map<IdeDocument, (String, TextMateDocument)> _textMateDocuments = {};
+  bool _textMateRequested = false;
+  final WorkbenchThemeService _themes = WorkbenchThemeService.instance;
+  ThemeTypeSelector? _monarchTheme;
+  late Future<MonacoBuiltinTheme> _theme = _loadMonarchTheme();
+  Map<int, List<TextSpan>>? _styledLines;
+  IdeDocument? _styledDocument;
+  DocumentSnapshot? _styledSnapshot;
+  IdeDocument? _syntaxDocument;
+  String? _syntaxText;
+  int _syntaxRequest = 0;
+  EditorLanguageSession? _language;
+
+  /// Each open document's last semantic tokens, for its next session to
+  /// paint at once when its tab is shown again.
+  final Map<IdeDocument, SemanticTokensSource> _semanticSources = {};
+
+  /// Each open diff tab's diff and original side.
+  final Map<IdeDocument, IdeOriginalDiff> _diffs = {};
+
+  /// Each open file's agent change, shown in it ([IdeEditor.agentEdits]).
+  final Map<IdeDocument, IdeAgentDiff> _agentDiffs = {};
+
+  /// Each open file's lines changed since HEAD, marked by its line numbers.
+  final Map<IdeDocument, IdeGitLineChanges> _lineChanges = {};
+
+  /// The files annotated with their Git blame (JetBrains' Annotate).
+  final Map<IdeDocument, IdeGitAnnotations> _annotations = {};
+
+  /// The line whose annotation the pointer has been on a while, and where
+  /// (global); the commit's details hover by it.
+  (int, Offset)? _annotationHover;
+  Timer? _annotationHoverTimer;
+
+  /// The change shown under its lines (its mark pressed), of the active
+  /// file's [_lineChanges].
+  DetailedLineRangeMapping? _lineChangeShown;
+
+  /// Bumped as the text scrolls or is laid out again: the agent changes'
+  /// buttons follow it.
+  final ValueNotifier<int> _viewTick = ValueNotifier(0);
+
+  /// The Git blame shown after the lines with a caret.
+  late final IdeGitBlameController _blame = IdeGitBlameController()
+    ..addListener(_rebuildSoon);
+
+  /// The carets last moved without an edit ([IdeGitBlameController.update]).
+  bool _caretsNavigated = false;
+  EditorKeyChord? _pendingChord;
+  bool _languageRebuildScheduled = false;
+
+  /// Has the focus while anything the editor shows has it (its text, the
+  /// find widget, the rename input): upstream's `editorFocus`.
+  final FocusNode _areaFocusNode = FocusNode(
+    debugLabel: 'ide editor area',
+    canRequestFocus: false,
+    skipTraversal: true,
+  );
+
+  /// The key [_onTextKey] resolved last, for the surface's resolver.
+  (KeyEvent, _EditorKey)? _textKey;
+
+  /// Problem navigation in this file (editor.action.marker.next / prev):
+  /// the problems it goes through, of [diagnostics], and where it left the
+  /// caret; a move from elsewhere starts again from the caret.
+  ({
+    String path,
+    List<LspDiagnostic> diagnostics,
+    MarkerList<LspDiagnostic> list,
+    int caret,
+  })?
+  _markers;
+
+  /// The selection in the active document's text.
+  TextSelection get selection => _editingValue.selection;
+
+  TextEditingValue get _editingValue =>
+      _nativeController?.value ?? _controller.value;
+
+  String get _editorStatus =>
+      widget.nativeEditorEnabled ? 'Monaco editor' : 'Text editor';
+  bool _findVisible = false;
+  bool _replaceVisible = false;
+  bool _findMatchCase = false;
+  bool _findWholeWord = false;
+  bool _findRegex = false;
+  List<FindMatch> _findResults = [];
+  int _findIndex = -1;
+
+  /// The find widget's keys and clicks, timed to the frame that shows them
+  /// (2MSCSKQ2): what the editor had then, in sizes and counts.
+  late final InputLag _findLag = InputLag(
+    'ide find',
+    describe: () {
+      final text = widget.active.model.snapshot;
+      return [
+        'text ${text.text.length} chars, ${text.lineCount} lines',
+        '${_findResults.length} matches of ${_findController.text.length} '
+            'chars${_findRegex ? ', regex' : ''}',
+        '${_nativeControllers.length} editors, '
+            '${widget.workspace.documents.length} documents open',
+      ].join('; ');
+    },
+  );
+  String _path = '';
+  bool _syncing = false;
+  bool _positionUpdatePending = false;
+  Position? _reportedPosition;
+  int? _reportedStatusColumn;
+  int? _reportedSelectionLength;
+  int? _reportedSelectionLines;
+
+  /// The language of the language session's messages.
+  AppLocalizations _l10n = englishLocalizations;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _l10n = context.l10n;
+    _language?.l10n = _l10n;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _path = widget.active.path;
+    _controller.addListener(_selectionChanged);
+    _findController.addListener(_refreshFindResults);
+    widget.workspace.addListener(_workspaceChanged);
+    _themes.addListener(_colorThemeChanged);
+    EditorLanguageOverrides.instance.addListener(_languageModesChanged);
+    widget.agentEdits?.addListener(_rebuildSoon);
+    IdeDiffOptions.instance.addListener(_diffOptionsChanged);
+    EditorWordWrap.on.addListener(_rebuildSoon);
+    EditorMinimap.on.addListener(_rebuildSoon);
+    if (widget.nativeEditorEnabled) _activateNativeController();
+    _selectionChanged();
+    _updateBlame(navigated: false);
+    _listenToDebug();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) widget.onLspStatus(_editorStatus);
+    });
+  }
+
+  /// What [IdeEditor.debug] shows changes with.
+  DisposableStore? _debugListeners;
+
+  void _listenToDebug() {
+    _debugListeners?.dispose();
+    _debugListeners = null;
+    final debug = widget.debug;
+    if (debug == null) return;
+    void changed() => _rebuildSoon();
+    _debugListeners = DisposableStore()
+      ..add(debug.model.onDidChangeBreakpoints((_) => changed()))
+      ..add(debug.model.onDidChangeCallStack(changed))
+      ..add(debug.viewModel.onDidFocusStackFrame((_) => changed()))
+      ..add(debug.onDidChangeState((_) => changed()));
+  }
+
+  /// Over the editor's glyph margin, where a click adds a breakpoint to a
+  /// file a debugger takes them in (`canSetBreakpointsIn`) or removes one.
+  Widget? _debugGlyphMargin() {
+    final debug = widget.debug;
+    if (debug == null ||
+        !widget.nativeEditorEnabled ||
+        _nativeController == null ||
+        _diffOf(widget.active) != null) {
+      return null;
+    }
+    final uri = VsUri.file(widget.active.path);
+    final languageId = _textMateDocuments[widget.active]?.$2.languageId;
+    if (!debugCanSetBreakpoints(debug, languageId) &&
+        debug.model.getBreakpoints(uri: uri).isEmpty) {
+      return null;
+    }
+    return DebugGlyphMargin(
+      key: ValueKey(widget.active.path),
+      service: debug,
+      uri: uri,
+      surfaceKey: _surfaceKey,
+    );
+  }
+
+  /// The debugger's decorations of the active document.
+  List<EditorDecoration> _debugDecorations() {
+    final debug = widget.debug;
+    final controller = _nativeController;
+    if (debug == null || controller == null) return const [];
+    final snapshot = controller.document.snapshot;
+    return debugEditorDecorations(
+      debug,
+      VsUri.file(widget.active.path),
+      lineStarts: snapshot.lineStarts,
+      documentEnd: snapshot.text.length,
+    );
+  }
+
+  /// Shows [_blame] for the active document's carets, where it can be.
+  void _updateBlame({bool? navigated}) {
+    if (navigated != null) _caretsNavigated = navigated;
+    final controller = _nativeController;
+    final doc = widget.active;
+    if (!widget.gitBlame || controller == null || !doc.isFile) {
+      _blame.clear();
+      return;
+    }
+    _blame.update(
+      repository: widget.workspace.gitAt(doc.path),
+      path: doc.path,
+      model: doc.model,
+      selections: controller.selections,
+      navigated: _caretsNavigated,
+    );
+  }
+
+  void _activateNativeController() {
+    if (!_textMateRequested) {
+      _textMateRequested = true;
+      unawaited(_textMate.theme);
+    }
+    final doc = widget.active;
+    _nativeController = _nativeControllers.putIfAbsent(doc, () {
+      final controller = EditorSurfaceController(document: doc.model)
+        ..detectIndentation();
+      // Where it was left, while it still fits the text.
+      final view = widget.workspace.viewStateOf(doc);
+      final length = doc.model.text.length;
+      if (view.selections case final kept?
+          when kept.isNotEmpty &&
+              kept.every((s) => s.isValid && s.start >= 0 && s.end <= length)) {
+        controller.setSelections(kept);
+      }
+      controller.viewState = view.editor;
+      // Its lines pasted into the chat go in as a reference to them; not
+      // so a revision's, whose lines are not the file's.
+      if (doc.readRevision == null) {
+        controller.onCopy = (text, start, end) => CopiedCode.record(
+          path: doc.path,
+          start: start,
+          end: end,
+          code: text,
+        );
+      }
+      controller.onPaste = () async =>
+          await widget.onPaste?.call(doc, controller) ?? false;
+      unawaited(_loadLanguageConfiguration(doc, controller));
+      var previousText = controller.value.text;
+      controller.addListener(() {
+        final textChanged = previousText != controller.value.text;
+        previousText = controller.value.text;
+        if (_syncing) return;
+        if (identical(_nativeController, controller)) {
+          _snapshot = doc.model.snapshot;
+          _selectionChanged(now: true);
+          if (textChanged) _refreshFindResults();
+          _updateBlame(navigated: !textChanged);
+        }
+        if (textChanged) {
+          widget.workspace.notifyDocumentEdited(doc);
+          if (identical(_nativeController, controller)) _scheduleSyntax();
+        }
+      });
+      return controller;
+    });
+    _workspaceChanged();
+    _snapshot = doc.model.snapshot;
+    _selectionChanged();
+    _scheduleSyntax();
+    _syncLanguageSession();
+  }
+
+  /// Keeps one [EditorLanguageSession] for the active document when the
+  /// workspace has language services.
+  void _syncLanguageSession() {
+    final languages = widget.workspace.languages;
+    final controller = _nativeController;
+    final doc = widget.active;
+    if (languages == null ||
+        controller == null ||
+        !widget.nativeEditorEnabled ||
+        doc.readOnly ||
+        doc.isUntitled) {
+      _disposeLanguageSession();
+      return;
+    }
+    final current = _language;
+    if (current != null &&
+        identical(current.controller, controller) &&
+        identical(current.document, doc) &&
+        identical(current.languages, languages)) {
+      return;
+    }
+    _disposeLanguageSession();
+    _language = EditorLanguageSession(
+      languages: languages,
+      document: doc,
+      controller: controller,
+      onError: (error) {
+        if (mounted) widget.onError(error);
+      },
+      onOpenLocation: _openLocation,
+      onShowReferences: (title, locations) =>
+          widget.onShowReferences?.call(title, locations),
+      onApplyWorkspaceEdit: applyWorkspaceEdit,
+      onFocusEditor: focus,
+      onFormatterMissing: _formatterMissing,
+      onNavigationUnavailable: _navigationUnavailable,
+      paths: widget.workspace.paths,
+      semanticTokenStyler: _semanticTokenStyler,
+      languageId: _textMateDocuments[doc]?.$2.languageId ?? 'plaintext',
+      semanticSource: _semanticSources[doc],
+    )..addListener(_languageChanged);
+    _language!.l10n = _l10n;
+  }
+
+  /// No formatter for [path], but [serverId] would be one: installed from
+  /// a notification.
+  void _formatterMissing(String path, String serverId) {
+    final languages = widget.workspace.languages;
+    if (!mounted || languages == null) return;
+    final notifications = IdeNotificationsScope.maybeOf(context);
+    final l10n = context.l10n;
+    notifications?.notify(
+      IdeSeverity.info,
+      l10n.langNoFormatterInstall(serverId, IdeLanguageNames.forPath(path)),
+      primary: [
+        IdeNotificationAction(l10n.extInstall, () async {
+          try {
+            await languages.install(serverId, path: path);
+          } catch (error) {
+            if (mounted) widget.onError(error);
+          }
+        }),
+      ],
+    );
+  }
+
+  bool _navigationUnavailable(String path) {
+    final languages = widget.workspace.languages;
+    if (!mounted || languages == null) return false;
+    final notifications = IdeNotificationsScope.maybeOf(context);
+    if (notifications == null) return false;
+    final l10n = context.l10n;
+    for (final status in languages.statusFor(path)) {
+      final id = status.serverId;
+      final String message;
+      final actions = <IdeNotificationAction>[];
+      switch (status.state) {
+        case LanguageServerState.missing:
+          if (status.missingRuntime case final runtime?) {
+            message = l10n.extMissingRuntime(id, runtime);
+          } else if (status.installable) {
+            message = l10n.langNavigationInstall(id);
+            actions.add(
+              IdeNotificationAction(l10n.extInstall, () async {
+                try {
+                  await languages.install(id, path: path);
+                } catch (error) {
+                  if (mounted) widget.onError(error);
+                }
+              }),
+            );
+          } else {
+            message = l10n.extUnavailable(id);
+          }
+        case LanguageServerState.failed || LanguageServerState.restarting:
+          message = [l10n.langFailed(id), ?status.message].join('\n');
+          actions.add(
+            IdeNotificationAction(
+              l10n.cmdRetryLanguageServices,
+              () => languages.retry(id, path: path),
+            ),
+          );
+        default:
+          continue;
+      }
+      notifications.notify(IdeSeverity.warning, message, primary: actions);
+      return true;
+    }
+    return false;
+  }
+
+  void _disposeLanguageSession() {
+    final session = _language;
+    if (session == null) return;
+    _language = null;
+    if (session.semanticSource case final source?
+        when widget.workspace.documents.contains(session.document)) {
+      _semanticSources[session.document] = source;
+    }
+    session
+      ..removeListener(_languageChanged)
+      ..dispose();
+  }
+
+  void _languageChanged() => _rebuildSoon();
+
+  /// setState, after this frame when called while building.
+  void _rebuildSoon() {
+    if (!mounted) return;
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      if (_languageRebuildScheduled) return;
+      _languageRebuildScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _languageRebuildScheduled = false;
+        if (mounted) setState(() {});
+      });
+      return;
+    }
+    setState(() {});
+  }
+
+  Future<void> _openLocation(IdeLocation location) async {
+    if (widget.onOpenLocation case final open?) return open(location);
+    if (location.path == widget.active.path) {
+      revealRange(location.range, center: true);
+    }
+  }
+
+  /// The language session of the active document (tests and the
+  /// workbench read its state).
+  @visibleForTesting
+  EditorLanguageSession? get languageSession => _language;
+
+  /// Applies a workspace edit (rename, code actions, `workspace/applyEdit`):
+  /// one undo step per document, cursors mapped in open editors. See
+  /// [applyLspWorkspaceEdit] for unopened files.
+  Future<bool> applyWorkspaceEdit(LspWorkspaceEdit edit) =>
+      applyLspWorkspaceEdit(
+        widget.workspace,
+        edit,
+        applyTo: (doc, edits) {
+          final controller = _nativeControllers[doc];
+          if (controller == null) return false;
+          controller.applyEdits(edits);
+          return true;
+        },
+      );
+
+  /// Selects the protocol [range] (or places the caret at its start unless
+  /// [select]) in the active document and scrolls it into view, centered
+  /// when it was outside the viewport, or always when [center].
+  void revealRange(LspRange range, {bool select = false, bool center = false}) {
+    final snapshot = widget.active.model.snapshot;
+    final (start, end) = lspOffsetsOf(snapshot, range);
+    if (widget.nativeEditorEnabled) {
+      final controller = _nativeController;
+      if (controller == null) return;
+      if (select) {
+        controller.select(start, end);
+      } else {
+        controller.select(start, start);
+      }
+      controller.revealSelection();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final view = _surfaceKey.currentState;
+        if (mounted && view is EditorSurfaceView) {
+          (view as EditorSurfaceView).revealRange(start, end, center: center);
+        }
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    } else {
+      _controller.selection = TextSelection(
+        baseOffset: start,
+        extentOffset: select ? end : start,
+      );
+    }
+    focus();
+  }
+
+  /// Keys the language widgets and language commands take before the
+  /// editor's own bindings; everything else (e.g. F8, workbench shortcuts)
+  /// keeps bubbling.
+  KeyEventResult _onEditorKey(KeyEvent event) {
+    if (_lineChangeShown != null &&
+        event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      _hideLineChange();
+      return KeyEventResult.handled;
+    }
+    if (widget.keyResolver != null) return _onTextKey(event);
+    final session = _language;
+    if (session == null) return KeyEventResult.ignored;
+    final result = session.handleKey(event);
+    if (result != KeyEventResult.ignored) return result;
+    if (_modifierKeys.contains(event.logicalKey)) return KeyEventResult.ignored;
+    final chord = editorKeyChordOf(event);
+    if (chord == null) return KeyEventResult.ignored;
+    if (_pendingChord case final pending?) {
+      _pendingChord = null;
+      final id = matchEditorLanguageKey(chord, pending: pending);
+      // Upstream swallows unbound second keys too.
+      if (id != null && id != editorChordPrefix) session.run(id);
+      return KeyEventResult.handled;
+    }
+    final id = matchEditorLanguageKey(chord);
+    if (id == null || id.startsWith('editor.action.marker.')) {
+      return KeyEventResult.ignored;
+    }
+    if (id == editorChordPrefix) {
+      _pendingChord = chord;
+      return KeyEventResult.handled;
+    }
+    return session.run(id) ? KeyEventResult.handled : KeyEventResult.ignored;
+  }
+
+  /// A key in the text, with the app's keybindings: the language widgets'
+  /// own keys first (see [EditorLanguageSession.handleKey]), then the
+  /// command [_resolveKey] finds. The surface runs the editor commands of
+  /// [runEditorCommand] (its resolver is [_resolveTextKey]); a key that is
+  /// the workbench's, or no keybinding's, goes on.
+  KeyEventResult _onTextKey(KeyEvent event) {
+    _textKey = null;
+    // Keys go to the input method while it composes.
+    final composing = _nativeController?.value.composing;
+    if (composing != null && composing.isValid && !composing.isCollapsed) {
+      return KeyEventResult.ignored;
+    }
+    if (_language case final session?) {
+      final result = session.handleKey(event, commandKeys: false);
+      if (result != KeyEventResult.ignored) return result;
+    }
+    if (event is KeyUpEvent || _modifierKeys.contains(event.logicalKey)) {
+      return KeyEventResult.ignored;
+    }
+    final key = _resolveKey(event);
+    _textKey = (event, key);
+    final command = key.command;
+    if (command == null || isEditorCommand(command)) {
+      return KeyEventResult.ignored;
+    }
+    _runCommand(command);
+    return KeyEventResult.handled;
+  }
+
+  /// The surface's resolver with the app's keybindings: the editor command
+  /// [_onTextKey] found for [event] (the surface runs it), else the
+  /// workbench's answer.
+  String? _resolveTextKey(KeyEvent event) {
+    final key = switch (_textKey) {
+      (final pressed, final key) when identical(pressed, event) => key,
+      _ => _resolveKey(event),
+    };
+    return key.command ?? key.other;
+  }
+
+  /// A key pressed elsewhere in the editor than its text (the find widget,
+  /// the rename input), with the app's keybindings: the editor's commands
+  /// run here, other keys go on.
+  KeyEventResult _onAreaKey(FocusNode node, KeyEvent event) {
+    if (widget.keyResolver == null ||
+        event is KeyUpEvent ||
+        _focusNode.hasPrimaryFocus ||
+        _modifierKeys.contains(event.logicalKey)) {
+      return KeyEventResult.ignored;
+    }
+    final input = FocusManager.instance.primaryFocus?.context
+        ?.findAncestorStateOfType<EditableTextState>();
+    final composing = input?.textEditingValue.composing;
+    if (composing != null && composing.isValid && !composing.isCollapsed) {
+      return KeyEventResult.ignored;
+    }
+    final command = _resolveKey(event).command;
+    if (command == null) return KeyEventResult.ignored;
+    _runCommand(command);
+    return KeyEventResult.handled;
+  }
+
+  /// What [event] does in the editor, by the app's keybindings (the
+  /// defaults', the keymap's and the user's; the last one that applies
+  /// wins, as upstream's `KeybindingResolver.resolve`): the [command] the
+  /// editor runs ([_runsHere]), when its keybinding's `when` holds in the
+  /// editor's context ([_keyContext]); else [other], what
+  /// [IdeEditor.keyResolver] (the workbench, in its context and with its
+  /// commands) makes of it. A keybinding of the workbench's command ranking
+  /// above the editor's takes the key; sequences (⌘K …) are the
+  /// workbench's.
+  _EditorKey _resolveKey(KeyEvent event) {
+    final other = widget.keyResolver?.call(event);
+    final service = KeybindingService.instance;
+    final resolver = service.resolver();
+    final context = service.withPlatformKeys(_keyContext);
+    for (final chord in [
+      KeyChord.fromEvent(event),
+      KeyChord.characterChordOf(event),
+    ]) {
+      if (chord == null) continue;
+      for (final item
+          in resolver.itemsWithKeys(KeySequence([chord])).reversed) {
+        final command = item.command;
+        if (!service.isSupported(command)) continue;
+        if (item.keys!.chords.length > 1) {
+          if (other == editorChordPrefix) return (command: null, other: other);
+          continue;
+        }
+        if (_runsHere(command) &&
+            resolver.appliesIn(item, context) &&
+            _canRun(command)) {
+          return (command: command, other: other);
+        }
+        if (command == other) return (command: null, other: other);
+      }
+    }
+    return (command: null, other: other);
+  }
+
+  /// Whether the editor runs [id]: its commands of [runEditorCommand], its
+  /// widgets' and language commands (not problem navigation across files,
+  /// the workbench's).
+  static bool _runsHere(String id) =>
+      isEditorCommand(id) ||
+      editorKeyboardCommandLabels.containsKey(id) ||
+      (editorLanguageCommandLabels.containsKey(id) &&
+          !id.startsWith('editor.action.marker.'));
+
+  /// Whether [id] (one [_runsHere]) can run now.
+  bool _canRun(String id) {
+    if (isEditorCommand(id)) return _nativeController != null;
+    if (editorLanguageCommandLabels.containsKey(id)) {
+      return _language != null && _languageCommandEnabled(id);
+    }
+    return switch (id) {
+      'editor.action.marker.next' ||
+      'editor.action.marker.prev' => widget.workspace.languages != null,
+      'editor.action.format' => _language != null,
+      'editor.action.showContextMenu' => _nativeController != null,
+      'workbench.action.editor.nextChange' ||
+      'workbench.action.editor.previousChange' ||
+      'editor.action.dirtydiff.next' ||
+      'editor.action.dirtydiff.previous' =>
+        _nativeController != null &&
+            (_lineChangesOf(widget.active)?.changes.isNotEmpty ?? false),
+      _ when _findCommands.contains(id) => true,
+      _ => _language != null,
+    };
+  }
+
+  static const _findCommands = {
+    'editor.action.nextMatchFindAction',
+    'editor.action.previousMatchFindAction',
+    'editor.action.nextSelectionMatchFindAction',
+    'editor.action.previousSelectionMatchFindAction',
+    'actions.findWithSelection',
+    'closeFindWidget',
+    'toggleFindCaseSensitive',
+    'toggleFindWholeWord',
+    'toggleFindRegex',
+    'editor.action.replaceOne',
+    'editor.action.replaceAll',
+    'editor.action.selectAllMatches',
+  };
+
+  /// Runs [id], a command [_runsHere]: those of [runEditorCommand] and the
+  /// language commands with the text focused.
+  void _runCommand(String id) {
+    if (isEditorCommand(id)) {
+      final controller = _nativeController;
+      final host = _surfaceKey.currentState;
+      if (_focusNode.hasPrimaryFocus &&
+          controller != null &&
+          host is EditorViewHost) {
+        runEditorCommand(id, controller, host as EditorViewHost);
+      } else {
+        _runEditorCommand(id);
+      }
+      return;
+    }
+    if (_runWidgetCommand(id)) return;
+    if (editorLanguageCommandLabels.containsKey(id)) {
+      if (_focusNode.hasPrimaryFocus) {
+        _language?.run(id);
+      } else {
+        _runLanguageCommand(id);
+      }
+    }
+  }
+
+  /// Runs a command of the editor's widgets (find, suggest, parameter
+  /// hints, rename, messages), problem navigation in the file, the context
+  /// menu or `editor.action.format`; false for other ids.
+  bool _runWidgetCommand(String id) {
+    final session = _language;
+    final suggest = session?.suggest;
+    switch (id) {
+      case 'editor.action.nextMatchFindAction':
+        _findMatch(backwards: false);
+      case 'editor.action.previousMatchFindAction':
+        _findMatch(backwards: true);
+      case 'editor.action.nextSelectionMatchFindAction':
+        _findSelectionMatch(backwards: false);
+      case 'editor.action.previousSelectionMatchFindAction':
+        _findSelectionMatch(backwards: true);
+      case 'actions.findWithSelection':
+        _revealFind(seed: _selectionSearchString(multiline: true));
+      case 'closeFindWidget':
+        if (_findVisible) closeFind();
+      case 'toggleFindCaseSensitive':
+        _toggleFindOption(() => _findMatchCase = !_findMatchCase);
+      case 'toggleFindWholeWord':
+        _toggleFindOption(() => _findWholeWord = !_findWholeWord);
+      case 'toggleFindRegex':
+        _toggleFindOption(() => _findRegex = !_findRegex);
+      case 'editor.action.replaceOne':
+        if (_findVisible) _replaceCurrent();
+      case 'editor.action.replaceAll':
+        if (_findVisible) _replaceAll();
+      case 'editor.action.selectAllMatches':
+        _selectAllMatches();
+      case 'editor.action.marker.next':
+        _gotoMarker(next: true);
+      case 'editor.action.marker.prev':
+        _gotoMarker(next: false);
+      case 'editor.action.showContextMenu':
+        _showContextMenuAtCaret();
+      case 'workbench.action.editor.nextChange':
+        _goToLineChange(1);
+      case 'workbench.action.editor.previousChange':
+        _goToLineChange(-1);
+      case 'editor.action.dirtydiff.next':
+        _goToLineChange(1, from: _lineChangeShown, show: true);
+      case 'editor.action.dirtydiff.previous':
+        _goToLineChange(-1, from: _lineChangeShown, show: true);
+      case 'editor.action.format':
+        // Upstream: the selection's when there is one, else the document's.
+        final selected =
+            _nativeController?.selections.any((s) => !s.isCollapsed) ?? false;
+        if (session != null) unawaited(session.format(selection: selected));
+      case 'acceptSelectedSuggestion':
+        suggest?.acceptSelected();
+      case 'acceptAlternativeSelectedSuggestion':
+        suggest?.acceptSelected(alternative: true);
+      case 'hideSuggestWidget':
+        suggest?.cancel();
+      case 'selectNextSuggestion':
+        suggest?.selectNext();
+      case 'selectPrevSuggestion':
+        suggest?.selectPrevious();
+      case 'selectNextPageSuggestion':
+        suggest?.selectNextPage();
+      case 'selectPrevPageSuggestion':
+        suggest?.selectPreviousPage();
+      case 'toggleSuggestionDetails':
+        suggest?.toggleDetails();
+      case 'closeParameterHints':
+        session?.cancelSignatureHelp();
+      case 'showPrevParameterHint':
+        session?.cycleSignature(-1);
+      case 'showNextParameterHint':
+        session?.cycleSignature(1);
+      case 'acceptRenameInput':
+        if (session != null) unawaited(session.acceptRename());
+      case 'cancelRenameInput':
+        session?.cancelRename();
+      case 'leaveEditorMessage':
+        session?.hideMessage();
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  /// A palette command of the editor's widgets, once the text has the focus
+  /// (upstream runs them on the focused editor).
+  void _runPaletteWidgetCommand(String id) {
+    _focusNode.requestFocus();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _runWidgetCommand(id);
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  static final _modifierKeys = {
+    LogicalKeyboardKey.metaLeft,
+    LogicalKeyboardKey.metaRight,
+    LogicalKeyboardKey.controlLeft,
+    LogicalKeyboardKey.controlRight,
+    LogicalKeyboardKey.shiftLeft,
+    LogicalKeyboardKey.shiftRight,
+    LogicalKeyboardKey.altLeft,
+    LogicalKeyboardKey.altRight,
+  };
+
+  void _viewChanged() {
+    _viewTick.value++;
+    widget.onScrolled?.call();
+    _language?.onViewChanged();
+    _textMateViewportChanged();
+    _languageChanged();
+  }
+
+  /// The lines on screen go to the TextMate worker first.
+  void _textMateViewportChanged() {
+    final document = _textMateDocuments[widget.active]?.$2;
+    final view = _surfaceKey.currentState;
+    if (document == null || view is! EditorSurfaceView) return;
+    if ((view as EditorSurfaceView).visibleLineRange case final range?) {
+      document.setViewport(range.first, range.last);
+      _diffs[widget.active]?.textMate?.setViewport(range.first, range.last);
+      _agentDiffs[widget.active]?.diff.textMate?.setViewport(
+        range.first,
+        range.last,
+      );
+    }
+  }
+
+  /// Snippet placeholders (`editor.snippetTabstopHighlight*`).
+  List<EditorDecoration> _snippetDecorations(
+    EditorSurfaceController controller,
+    WorkbenchColors colors,
+  ) => [
+    for (final (start, end, _, isFinal) in controller.snippetPlaceholders)
+      if (isFinal)
+        EditorDecoration(
+          start: start,
+          end: end,
+          borderColor: colors['editor.snippetFinalTabstopHighlightBorder'],
+        )
+      else
+        EditorDecoration(
+          start: start,
+          end: end,
+          backgroundColor: colors['editor.snippetTabstopHighlightBackground'],
+        ),
+  ];
+
+  Future<void> _loadLanguageConfiguration(
+    IdeDocument doc,
+    EditorSurfaceController controller,
+  ) async {
+    try {
+      final snapshot = doc.model.snapshot;
+      final firstLine = snapshot.text.substring(0, snapshot.contentEnds.first);
+      final configuration = await languageConfigurationForPath(
+        doc.path,
+        firstLine: firstLine.startsWith('\uFEFF')
+            ? firstLine.substring(1)
+            : firstLine,
+      );
+      if (!mounted || !identical(_nativeControllers[doc], controller)) return;
+      setState(
+        () => controller.languageConfiguration =
+            configuration ?? plainTextLanguageConfiguration,
+      );
+    } catch (error) {
+      if (mounted) widget.onError(error);
+    }
+  }
+
+  /// Monaco's built-in theme of the workbench theme's type: the colors of
+  /// what Monarch highlights.
+  Future<MonacoBuiltinTheme> _loadMonarchTheme() {
+    final theme = _monarchTheme = getThemeTypeSelector(_themes.colorTheme.type);
+    return const MonacoThemeAssets().load(theme.value);
+  }
+
+  /// Semantic tokens in the current theme's rules (`getTokenStyleMetadata`).
+  IdeSemanticTokenStyler get _semanticTokenStyler {
+    final theme = _themes.colorTheme;
+    if (!identical(theme, _semanticStylerTheme)) {
+      _semanticStylerTheme = theme;
+      _semanticStyler = ideSemanticTokenStyler(theme);
+    }
+    return _semanticStyler!;
+  }
+
+  ColorThemeData? _semanticStylerTheme;
+  IdeSemanticTokenStyler? _semanticStyler;
+
+  /// TextMate recolors its documents itself; semantic tokens take the new
+  /// theme's rules; Monarch's lines are styled again when the theme type
+  /// changes.
+  void _colorThemeChanged() {
+    if (!mounted) return;
+    _language?.semanticTokenStyler = _semanticTokenStyler;
+    if (getThemeTypeSelector(_themes.colorTheme.type) == _monarchTheme) return;
+    _theme = _loadMonarchTheme();
+    _tokenizedDocuments.clear();
+    _syntaxDocument = null;
+    _scheduleSyntax();
+  }
+
+  /// A language picked for a file (Change Language Mode): every document
+  /// highlighted again as its language is now, the active one at once,
+  /// the others as they are shown.
+  void _languageModesChanged() {
+    if (!mounted) return;
+    for (final (_, document) in _textMateDocuments.values) {
+      document.dispose();
+    }
+    _textMateDocuments.clear();
+    _tokenizedDocuments.clear();
+    _syntaxDocument = null;
+    final doc = widget.active;
+    if (_nativeControllers[doc] case final controller?) {
+      unawaited(_loadLanguageConfiguration(doc, controller));
+    }
+    if (EditorLanguageOverrides.instance.of(doc.path) case final picked?) {
+      _language?.languageId = picked;
+    }
+    _scheduleSyntax();
+    setState(() {});
+  }
+
+  void _scheduleSyntax() {
+    if (!widget.nativeEditorEnabled || _nativeController == null) return;
+    final doc = widget.active;
+    final snapshot = doc.model.snapshot;
+    if (identical(_syntaxDocument, doc) && _syntaxText == snapshot.text) return;
+    _syntaxDocument = doc;
+    _syntaxText = snapshot.text;
+    final textMate = _textMateDocuments[doc];
+    if (textMate != null && textMate.$1 == doc.path) {
+      // Tokens follow the edit at once; the worker sends the lines it
+      // retokenizes.
+      _syntaxRequest++;
+      textMate.$2.update(snapshot);
+      _styledDocument = doc;
+      _styledSnapshot = null;
+      _styledLines = textMate.$2.styledLines;
+      _rebuildSoon();
+      return;
+    }
+    _textMateDocuments.remove(doc)?.$2.dispose();
+    // Keep painting the previous spans until the new ones arrive: lines whose
+    // text no longer matches fall back to plain text in the layout.
+    if (!identical(_tokenizedDocuments[doc]?.snapshot, _styledSnapshot) ||
+        !identical(_styledDocument, doc)) {
+      _styledLines = null;
+    }
+    final request = ++_syntaxRequest;
+    unawaited(_computeSyntax(request, doc, snapshot));
+  }
+
+  /// Code in hovers, in the editor's theme: TextMate's when it has the
+  /// language, else Monarch's.
+  Future<List<List<TextSpan>>?> _colorizeCode(
+    String language,
+    String code,
+  ) async =>
+      await _textMate.colorize(language, code) ??
+      await _syntax.colorize(
+        monarchLanguageIdFor(language),
+        code,
+        (await _theme).styleForToken,
+      );
+
+  Future<void> _computeSyntax(
+    int request,
+    IdeDocument doc,
+    DocumentSnapshot snapshot,
+  ) async {
+    try {
+      final firstLine = snapshot.text.substring(0, snapshot.contentEnds.first);
+      final textMateLanguage = await _textMate.languageIdForPath(
+        doc.path,
+        firstLine: firstLine.startsWith('\uFEFF')
+            ? firstLine.substring(1)
+            : firstLine,
+      );
+      if (!mounted ||
+          !widget.nativeEditorEnabled ||
+          !identical(widget.active, doc) ||
+          request != _syntaxRequest) {
+        return;
+      }
+      if (textMateLanguage != null) {
+        _openTextMate(doc, textMateLanguage);
+        return;
+      }
+      final theme = await _theme;
+      final tokenized = await _syntax.tokenizeFileIncremental(
+        snapshot,
+        doc.path,
+        previous: _tokenizedDocuments[doc],
+        isCancelled: () => !mounted || request != _syntaxRequest,
+      );
+      if (!mounted ||
+          !widget.nativeEditorEnabled ||
+          !identical(widget.active, doc) ||
+          doc.text != snapshot.text ||
+          request != _syntaxRequest) {
+        return;
+      }
+      setState(() {
+        if (tokenized != null) _tokenizedDocuments[doc] = tokenized;
+        _styledDocument = doc;
+        _styledSnapshot = tokenized?.snapshot;
+        _styledLines = tokenized == null
+            ? null
+            : _syntax.styledLines(
+                snapshot,
+                tokenized.lines,
+                theme.styleForToken,
+              );
+      });
+    } on TokenizationCancelled {
+      // A newer edit superseded this pass.
+    } catch (error) {
+      if (mounted && request == _syntaxRequest) widget.onError(error);
+    }
+  }
+
+  /// Highlights [doc] with TextMate from now on.
+  void _openTextMate(IdeDocument doc, String languageId) {
+    final snapshot = doc.model.snapshot;
+    final document = _textMate.open(languageId, snapshot);
+    if (document == null) return;
+    _textMateDocuments.remove(doc)?.$2.dispose();
+    _textMateDocuments[doc] = (doc.path, document);
+    if (identical(_language?.document, doc)) _language?.languageId = languageId;
+    document.addListener(() {
+      if (!mounted || !identical(widget.active, doc)) return;
+      if (!identical(_textMateDocuments[doc]?.$2, document)) return;
+      _styledLines = document.styledLines;
+      _rebuildSoon();
+    });
+    _tokenizedDocuments.remove(doc);
+    _syntaxText = snapshot.text;
+    _diffs[doc]?.highlight(_textMate, languageId);
+    _agentDiffs[doc]?.diff.highlight(_textMate, languageId);
+    setState(() {
+      _styledDocument = doc;
+      _styledSnapshot = null;
+      _styledLines = document.styledLines;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _textMateViewportChanged();
+    });
+  }
+
+  void _workspaceChanged() {
+    if (!widget.nativeEditorEnabled) return;
+    final open = widget.workspace.documents;
+    var activeChanged = false;
+    _syncing = true;
+    try {
+      for (final entry in _nativeControllers.entries.toList()) {
+        final controller = entry.value;
+        if (!open.contains(entry.key)) {
+          // Closed, or moved: shown where it was if it opens again.
+          _keepViewState(entry.key, controller);
+          _nativeControllers.remove(entry.key);
+          _diffs.remove(entry.key)?.dispose();
+          _agentDiffs.remove(entry.key)?.dispose();
+          _lineChanges.remove(entry.key)?.dispose();
+          _annotations.remove(entry.key)?.dispose();
+          _tokenizedDocuments.remove(entry.key);
+          _textMateDocuments.remove(entry.key)?.$2.dispose();
+          if (identical(_language?.controller, controller)) {
+            _disposeLanguageSession();
+          }
+          _semanticSources.remove(entry.key);
+          if (identical(_nativeController, controller)) {
+            _nativeController = null;
+            _focusNode.unfocus();
+          }
+          controller.dispose();
+        } else if (controller.value.text != entry.key.text) {
+          // External edits/undo already changed the shared model. Refresh the
+          // view without applying another edit or invalidating its history.
+          controller.syncFromDocument();
+          if (identical(_nativeController, controller)) {
+            _snapshot = entry.key.model.snapshot;
+            activeChanged = true;
+          }
+        }
+      }
+    } finally {
+      _syncing = false;
+    }
+    if (activeChanged) {
+      _selectionChanged();
+      _scheduleFindRefresh();
+    }
+    // A save changes what is blamed.
+    _updateBlame(navigated: activeChanged ? false : null);
+  }
+
+  /// The active document's surface.
+  EditorSurfaceView? get _surfaceView => switch (_surfaceKey.currentState) {
+    final EditorSurfaceView view => view,
+    _ => null,
+  };
+
+  /// Keeps where [doc]'s editor is ([controller]'s carets, its view, a
+  /// diff's scroll) in [workspace] (the editor's), for it to show again.
+  void _keepViewState(
+    IdeDocument doc,
+    EditorSurfaceController controller, [
+    IdeWorkspace? workspace,
+  ]) {
+    final diff = _diffs[doc];
+    // The surface showing it now has where it is; a diff's is its own.
+    final editor = diff == null && identical(controller, _nativeController)
+        ? _surfaceView?.viewState ?? controller.viewState
+        : controller.viewState;
+    (workspace ?? widget.workspace).keepViewState(
+      doc,
+      (kept) => kept.copyWith(
+        selections: controller.selections,
+        editor: diff == null ? editor : null,
+        diffScroll: diff?.scroll.value,
+      ),
+    );
+  }
+
+  /// Keeps where each open document's editor is in the workspace: see
+  /// [IdeWorkspace.viewStateOf].
+  void keepViewStates() {
+    for (final MapEntry(key: doc, value: controller)
+        in _nativeControllers.entries) {
+      _keepViewState(doc, controller);
+    }
+  }
+
+  void _disposeNativeControllers([IdeWorkspace? workspace]) {
+    _disposeLanguageSession();
+    _nativeController = null;
+    _syntaxRequest++;
+    _syntaxDocument = null;
+    _syntaxText = null;
+    _styledLines = null;
+    _tokenizedDocuments.clear();
+    for (final (_, document) in _textMateDocuments.values) {
+      document.dispose();
+    }
+    _textMateDocuments.clear();
+    for (final MapEntry(key: doc, value: controller)
+        in _nativeControllers.entries) {
+      _keepViewState(doc, controller, workspace);
+      controller.dispose();
+    }
+    _nativeControllers.clear();
+    for (final diff in _diffs.values) {
+      diff.dispose();
+    }
+    _diffs.clear();
+    for (final diff in _agentDiffs.values) {
+      diff.dispose();
+    }
+    _agentDiffs.clear();
+    for (final changes in _lineChanges.values) {
+      changes.dispose();
+    }
+    _lineChanges.clear();
+    for (final annotations in _annotations.values) {
+      annotations.dispose();
+    }
+    _annotations.clear();
+  }
+
+  /// Whether the active file shows its Git blame by its line numbers.
+  bool get annotated => _annotations.containsKey(widget.active);
+
+  /// Whether the active file can: a file in a repository, in its own tab.
+  bool get canAnnotate =>
+      widget.nativeEditorEnabled &&
+      widget.active.isFile &&
+      widget.active.diff == null &&
+      widget.workspace.gitAt(widget.active.path) != null;
+
+  /// Whether the active file's Git history can be shown.
+  bool get canShowHistory =>
+      widget.onShowHistory != null &&
+      widget.active.isFile &&
+      widget.active.diff == null &&
+      widget.workspace.gitAt(widget.active.path) != null;
+
+  /// The lines selected in the active file as they were at HEAD (Show
+  /// History for Selection's); null without a selection, or where it is
+  /// all new lines.
+  IdeGitLogLines? get selectionHistoryLines {
+    final controller = _nativeController;
+    if (!canShowHistory || controller == null) return null;
+    final selection = controller.value.selection;
+    if (selection.isCollapsed) return null;
+    final snapshot = widget.active.model.snapshot;
+    final from = snapshot.positionAtOffset(selection.start);
+    final to = snapshot.positionAtOffset(selection.end);
+    // Up to a line's start: that line is not selected.
+    final last = to.column == 1 && to.lineNumber > from.lineNumber
+        ? to.lineNumber - 1
+        : to.lineNumber;
+    final lines = ideGitHeadLines(
+      from.lineNumber,
+      last,
+      _lineChangesOf(widget.active)?.changes ?? const [],
+    );
+    if (lines == null) return null;
+    return (path: widget.active.path, start: lines.start, end: lines.end);
+  }
+
+  /// Show History: the active file's commits in the Git log; with
+  /// [selection], those that changed the lines selected.
+  void showHistory({bool selection = false}) {
+    if (!canShowHistory) return;
+    final lines = selection ? selectionHistoryLines : null;
+    if (selection && lines == null) return;
+    widget.onShowHistory!(widget.active.path, lines);
+  }
+
+  /// Annotate with Git Blame, or Close Annotations.
+  void toggleAnnotations() {
+    final doc = widget.active;
+    if (_annotations.remove(doc) case final shown?) {
+      shown.dispose();
+      _hideAnnotationHover();
+      setState(() {});
+      return;
+    }
+    if (!canAnnotate) return;
+    _annotations[doc] = IdeGitAnnotations(
+      repository: widget.workspace.gitAt(doc.path)!,
+      path: doc.path,
+      document: doc.model,
+    )..addListener(_rebuildSoon);
+    setState(() {});
+  }
+
+  /// The active file's annotation column: when each line was last changed
+  /// and by whom, the newer the stronger its colour; null while it shows
+  /// none.
+  EditorLineAnnotations? _lineAnnotations(WorkbenchColors colors) {
+    final annotations = _annotations[widget.active];
+    if (annotations == null) return null;
+    annotations.sync();
+    final snapshot = widget.active.model.snapshot;
+    final base =
+        colors.get('editorGutter.modifiedBackground') ??
+        colors['editorLineNumber.foreground'];
+    final foreground = colors['editorLineNumber.foreground'];
+    final cache = <int, EditorLineAnnotation?>{};
+    final texts = <String, String>{};
+    String textOf(IdeGitBlameInformation commit) =>
+        texts.putIfAbsent(commit.hash, () {
+          final date = commit.authorDate;
+          final day = date == null
+              ? ''
+              : '${date.year}/${'${date.month}'.padLeft(2, '0')}/'
+                    '${'${date.day}'.padLeft(2, '0')}';
+          var author = commit.authorName ?? '';
+          if (author.length > 14) author = '${author.substring(0, 13)}…';
+          return '$day  $author';
+        });
+    var longest = annotations.loaded ? '' : '0000/00/00';
+    for (var line = 1; line <= snapshot.lineCount; line++) {
+      if (annotations.at(line) case final commit?) {
+        final text = textOf(commit);
+        if (text.length > longest.length) longest = text;
+      }
+    }
+    final measure = TextPainter(
+      text: TextSpan(
+        text: longest,
+        style: _editorStyle(colors).copyWith(fontSize: 12),
+      ),
+      textDirection: TextDirection.ltr,
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    final width = measure.width + 14;
+    measure.dispose();
+    return EditorLineAnnotations(
+      width: width,
+      fontSize: 12,
+      of: (line) => cache.putIfAbsent(line, () {
+        final commit = annotations.at(line);
+        if (commit == null) return null;
+        final age = annotations.ageOf(commit);
+        return EditorLineAnnotation(
+          textOf(commit),
+          color: foreground,
+          background: base.withValues(alpha: 0.32 - 0.26 * age),
+        );
+      }),
+      onTap: widget.onShowCommit == null
+          ? null
+          : (line, _) {
+              if (annotations.at(line) case final commit?) {
+                _hideAnnotationHover();
+                widget.onShowCommit!(commit.hash);
+              }
+            },
+      onHover: (line, global) {
+        _annotationHoverTimer?.cancel();
+        if (line == null) {
+          _hideAnnotationHover();
+          return;
+        }
+        _annotationHoverTimer = Timer(ideHoverDelay, () {
+          if (mounted) setState(() => _annotationHover = (line, global));
+        });
+      },
+    );
+  }
+
+  void _hideAnnotationHover() {
+    _annotationHoverTimer?.cancel();
+    if (_annotationHover != null) setState(() => _annotationHover = null);
+  }
+
+  /// The commit of the annotation hovered: its id, author, date and
+  /// message, by the pointer.
+  Widget? _annotationHoverCard() {
+    final (line, global) = _annotationHover ?? (0, Offset.zero);
+    final commit = _annotations[widget.active]?.at(line);
+    final box = context.findRenderObject();
+    if (_annotationHover == null || commit == null || box is! RenderBox) {
+      return null;
+    }
+    final local = box.globalToLocal(global);
+    final date = commit.authorDate;
+    final short = commit.hash.length > 8
+        ? commit.hash.substring(0, 8)
+        : commit.hash;
+    return Positioned(
+      left: local.dx + 12,
+      top: local.dy + 12,
+      child: IgnorePointer(
+        child: IdeHoverBox(
+          compact: false,
+          maxWidth: 480,
+          child: Text(
+            [
+              '$short  ${commit.authorName ?? ''}'
+                  '${commit.authorEmail == null ? '' : ' <${commit.authorEmail}>'}',
+              if (date != null)
+                '${date.toString().split('.').first} '
+                    '(${ideFromNow(date, ago: true, fullWords: true, l10n: _l10n)})',
+              '',
+              commit.subject ?? '',
+            ].join('\n'),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// [doc]'s lines changed since HEAD, where it is a file in a repository
+  /// shown in its own tab.
+  IdeGitLineChanges? _lineChangesOf(IdeDocument doc) {
+    final repository = doc.isFile && doc.diff == null
+        ? widget.workspace.gitAt(doc.path)
+        : null;
+    final shown = _lineChanges[doc];
+    if (shown != null &&
+        identical(shown.repository, repository) &&
+        identical(shown.document, doc.model)) {
+      return shown;
+    }
+    _lineChanges.remove(doc)?.dispose();
+    if (repository == null) return null;
+    return _lineChanges[doc] = IdeGitLineChanges(
+      repository: repository,
+      path: doc.path,
+      document: doc.model,
+    )..addListener(_rebuildSoon);
+  }
+
+  /// The marks of the active file's changes since HEAD.
+  List<EditorDecoration> _lineChangeDecorations(WorkbenchColors colors) {
+    final changes = _lineChangesOf(widget.active)?.changes;
+    if (changes == null || changes.isEmpty) return const [];
+    return ideLineChangeDecorations(
+      changes,
+      widget.active.model.snapshot,
+      colors.get,
+    );
+  }
+
+  /// A change's mark pressed: the change under its lines, or hidden again.
+  void _lineChangeMarkPressed(int lineNumber, Offset _) {
+    final change = _lineChangesOf(widget.active)?.changeAt(lineNumber);
+    setState(
+      () => _lineChangeShown = identical(change, _lineChangeShown)
+          ? null
+          : change,
+    );
+  }
+
+  void _hideLineChange() {
+    if (_lineChangeShown != null) setState(() => _lineChangeShown = null);
+  }
+
+  /// The change [delta] on from [from] (or from the caret's line), round
+  /// past the ends: put the caret at its start and shown there; under its
+  /// lines too with [show] (or while one is).
+  void _goToLineChange(
+    int delta, {
+    DetailedLineRangeMapping? from,
+    bool? show,
+  }) {
+    final changes = _lineChangesOf(widget.active)?.changes;
+    final controller = _nativeController;
+    if (changes == null || changes.isEmpty || controller == null) return;
+    final snapshot = widget.active.model.snapshot;
+    int index;
+    if (from != null && changes.contains(from)) {
+      index = (changes.indexOf(from) + delta) % changes.length;
+    } else {
+      final line = snapshot
+          .positionAtOffset(controller.value.selection.extentOffset)
+          .lineNumber;
+      if (delta > 0) {
+        index = changes.indexWhere(
+          (change) => ideLineChangeLines(change).first > line,
+        );
+        if (index < 0) index = 0;
+      } else {
+        index = changes.lastIndexWhere(
+          (change) => ideLineChangeLines(change).last < line,
+        );
+        if (index < 0) index = changes.length - 1;
+      }
+    }
+    final change = changes[index];
+    final first = ideLineChangeLines(change).first.clamp(1, snapshot.lineCount);
+    final offset = snapshot.lineStarts[first - 1];
+    controller.select(offset, offset);
+    if (_surfaceKey.currentState case final EditorSurfaceView view) {
+      view.revealRange(offset, offset, center: true);
+    }
+    if (show ?? _lineChangeShown != null) {
+      setState(() => _lineChangeShown = change);
+    }
+  }
+
+  /// [change] taken out of the text: its lines as HEAD has them.
+  void _rollBackLineChange(LineRangeMapping change) {
+    final changes = _lineChangesOf(widget.active);
+    final original = changes?.model.originalSnapshot;
+    final controller = _nativeController;
+    if (changes == null || original == null || controller == null) return;
+    final spans = agentHunkSpans(
+      change,
+      original,
+      controller.document.snapshot,
+    );
+    controller.applyEdits([
+      EditorOffsetEdit(
+        spans.modifiedStart,
+        spans.modifiedEnd,
+        original.text.substring(spans.originalStart, spans.originalEnd),
+      ),
+    ]);
+    changes.model.refresh();
+    _hideLineChange();
+  }
+
+  /// The active file against HEAD in a diff tab.
+  void _showLineChangeDiff(IdeGitLineChanges changes) {
+    final original = changes.original;
+    if (original == null) return;
+    _hideLineChange();
+    unawaited(
+      widget.workspace.openDiff(
+        widget.active.path,
+        label: _l10n.gitChangeWorkingTree,
+        original: () async => original,
+      ),
+    );
+  }
+
+  /// [_lineChangeShown] under its lines; null while none is, or it is no
+  /// more (the text changed).
+  Widget? _lineChangePopup(WorkbenchColors colors) {
+    final change = _lineChangeShown;
+    if (change == null) return null;
+    final changes = _lineChangesOf(widget.active);
+    final original = changes?.model.originalSnapshot;
+    final index = changes?.changes.indexOf(change) ?? -1;
+    if (changes == null || original == null || index < 0) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && identical(_lineChangeShown, change)) _hideLineChange();
+      });
+      return null;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _viewTick.value++;
+    });
+    return TapRegion(
+      onTapOutside: (_) {
+        if (identical(_lineChangeShown, change)) _hideLineChange();
+      },
+      child: IdeLineChangePopup(
+        key: ObjectKey(change),
+        change: change,
+        index: index,
+        count: changes.changes.length,
+        text: widget.active.model.snapshot,
+        original: original,
+        view: () => switch (_surfaceKey.currentState) {
+          final EditorSurfaceView view => view,
+          _ => null,
+        },
+        repaint: _viewTick,
+        style: _editorStyle(colors),
+        onPrevious: () => _goToLineChange(-1, from: change, show: true),
+        onNext: () => _goToLineChange(1, from: change, show: true),
+        onRollback: () => _rollBackLineChange(change),
+        onShowDiff: () => _showLineChangeDiff(changes),
+        onCopy: () {
+          final popup = IdeLineChangePopup.originalOf(change, original);
+          unawaited(Clipboard.setData(ClipboardData(text: popup)));
+        },
+      ),
+    );
+  }
+
+  /// The diff tabs shown as now chosen: compared again where they ignore
+  /// other whitespace.
+  void _diffOptionsChanged() {
+    final whitespace = IdeDiffOptions.instance.whitespace;
+    final stale = <IdeOriginalDiff>[];
+    _diffs.removeWhere((doc, diff) {
+      final model = diff.model;
+      final ignored = model.ignoreAllWhitespace
+          ? IdeDiffWhitespace.all
+          : model.ignoreTrimWhitespace
+          ? IdeDiffWhitespace.trim
+          : IdeDiffWhitespace.none;
+      if (ignored == whitespace) return false;
+      // Its next diff where it was.
+      widget.workspace.keepViewState(
+        doc,
+        (kept) => kept.copyWith(diffScroll: diff.scroll.value),
+      );
+      stale.add(diff);
+      return true;
+    });
+    _rebuildSoon();
+    if (stale.isEmpty) return;
+    // Once the editors showing them are gone.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (final diff in stale) {
+        diff.dispose();
+      }
+    });
+  }
+
+  /// [doc]'s diff and original side, where it is a diff tab.
+  IdeOriginalDiff? _diffOf(IdeDocument doc) {
+    final original = doc.diff;
+    if (original == null) return null;
+    return _diffs.putIfAbsent(doc, () {
+      final whitespace = IdeDiffOptions.instance.whitespace;
+      final diff = IdeOriginalDiff(
+        original,
+        doc.model,
+        onChanged: _rebuildSoon,
+        ignoreTrimWhitespace: whitespace != IdeDiffWhitespace.none,
+        ignoreAllWhitespace: whitespace == IdeDiffWhitespace.all,
+        scroll: widget.workspace.viewStateOf(doc).diffScroll ?? Offset.zero,
+      );
+      if (_textMateDocuments[doc]?.$2.languageId case final language?) {
+        diff.highlight(_textMate, language);
+      }
+      return diff;
+    });
+  }
+
+  /// [doc]'s agent change, where it has one to show (a file's own tab).
+  IdeAgentDiff? _agentDiffOf(IdeDocument doc) {
+    final edit = doc.diff == null && !doc.readOnly
+        ? widget.agentEdits?.of(doc.path)
+        : null;
+    if (edit == null) {
+      _agentDiffs.remove(doc)?.dispose();
+      return null;
+    }
+    if (_agentDiffs[doc] case final shown?) return shown..edit = edit;
+    final controller = _nativeControllers[doc];
+    if (controller == null) return null;
+    final diff = _agentDiffs[doc] = IdeAgentDiff(
+      edit,
+      controller,
+      onChanged: _rebuildSoon,
+      save: () async {
+        if (doc.dirty) await widget.workspace.save(doc);
+      },
+      view: () => identical(widget.active, doc)
+          ? switch (_surfaceKey.currentState) {
+              final EditorSurfaceView view => view,
+              _ => null,
+            }
+          : null,
+      hunks: widget.agentEdits!.hunksOf(doc.path),
+    );
+    if (_textMateDocuments[doc]?.$2.languageId case final language?) {
+      diff.diff.highlight(_textMate, language);
+    }
+    return diff;
+  }
+
+  /// Keeps or undoes a part of an agent change (see [IdeAgentDiff]),
+  /// telling of what failed.
+  Future<void> _actOnAgentChange(Future<void> Function() act) async {
+    try {
+      await act();
+    } catch (error) {
+      if (mounted) widget.onError(error);
+    }
+  }
+
+  void _scheduleFindRefresh() {
+    if (!_findVisible) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _refreshFindResults();
+    });
+  }
+
+  /// The caret or the selection moved: the position is told once built,
+  /// or [now] for a move made in the editor in front (typing, a click),
+  /// which the status bar then shows in the frame the edit is drawn in.
+  void _selectionChanged({bool now = false}) {
+    if (widget.nativeEditorEnabled && _nativeController == null) return;
+    if (_snapshot.text != _editingValue.text) {
+      _snapshot = DocumentSnapshot(_editingValue.text);
+    }
+    if (_positionUpdatePending) return;
+    // While another file comes to the front, the workspace has it before
+    // this editor does: the position told then would be the old file's.
+    if (now &&
+        identical(widget.active, widget.workspace.active) &&
+        SchedulerBinding.instance.schedulerPhase == SchedulerPhase.idle) {
+      _reportPosition();
+      return;
+    }
+    _positionUpdatePending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _positionUpdatePending = false;
+      _reportPosition();
+    });
+  }
+
+  void _reportPosition() {
+    if (!mounted || (widget.nativeEditorEnabled && _nativeController == null)) {
+      return;
+    }
+    final (caret: position, :range) = editorSelectionOf(
+      _editingValue,
+      snapshot: _snapshot,
+    );
+    final lineIndex = position.lineNumber - 1;
+    final lineText = _snapshot.text.substring(
+      _snapshot.lineStarts[lineIndex],
+      _snapshot.contentEnds[lineIndex],
+    );
+    final statusColumn = CursorColumns.toStatusbarColumn(
+      lineText,
+      position.column,
+      4,
+    );
+    final selection = _editingValue.selection;
+    final selectionLength = selection.isValid
+        ? (selection.end - selection.start).abs()
+        : 0;
+    final selectionLines = selectionLength == 0
+        ? 0
+        : range.endLineNumber -
+              range.startLineNumber +
+              (range.endColumn == 1 &&
+                      range.endLineNumber > range.startLineNumber
+                  ? 0
+                  : 1);
+    if ((_reportedPosition?.equals(position) ?? false) &&
+        _reportedStatusColumn == statusColumn &&
+        _reportedSelectionLength == selectionLength &&
+        _reportedSelectionLines == selectionLines) {
+      return;
+    }
+    _reportedPosition = position;
+    _reportedStatusColumn = statusColumn;
+    _reportedSelectionLength = selectionLength;
+    _reportedSelectionLines = selectionLines;
+    widget.onPositionChanged((
+      position: position,
+      statusColumn: statusColumn,
+      selectionLength: selectionLength,
+      selectionLines: selectionLines,
+    ));
+  }
+
+  @override
+  void didUpdateWidget(IdeEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.debug != widget.debug) _listenToDebug();
+    if (!identical(oldWidget.agentEdits, widget.agentEdits)) {
+      oldWidget.agentEdits?.removeListener(_rebuildSoon);
+      widget.agentEdits?.addListener(_rebuildSoon);
+    }
+    final workspaceChanged = oldWidget.workspace != widget.workspace;
+    if (workspaceChanged) {
+      oldWidget.workspace.removeListener(_workspaceChanged);
+      _disposeNativeControllers(oldWidget.workspace);
+      widget.workspace.addListener(_workspaceChanged);
+    }
+    var changed = false;
+    if (widget.nativeEditorEnabled) {
+      changed =
+          oldWidget.active != widget.active ||
+          !oldWidget.nativeEditorEnabled ||
+          workspaceChanged;
+      _activateNativeController();
+    } else {
+      if (oldWidget.nativeEditorEnabled) {
+        _disposeNativeControllers(
+          workspaceChanged ? oldWidget.workspace : null,
+        );
+      }
+      if (oldWidget.active.path != widget.active.path ||
+          _controller.text != widget.active.text ||
+          oldWidget.nativeEditorEnabled ||
+          workspaceChanged) {
+        _replaceText(widget.active.text);
+        changed = true;
+      }
+    }
+    _path = widget.active.path;
+    if (changed) _scheduleFindRefresh();
+    if (changed || oldWidget.gitBlame != widget.gitBlame) {
+      _updateBlame(navigated: changed ? false : null);
+    }
+    if (oldWidget.nativeEditorEnabled != widget.nativeEditorEnabled) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) widget.onLspStatus(_editorStatus);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.workspace.removeListener(_workspaceChanged);
+    _themes.removeListener(_colorThemeChanged);
+    IdeDiffOptions.instance.removeListener(_diffOptionsChanged);
+    EditorWordWrap.on.removeListener(_rebuildSoon);
+    EditorMinimap.on.removeListener(_rebuildSoon);
+    EditorLanguageOverrides.instance.removeListener(_languageModesChanged);
+    widget.agentEdits?.removeListener(_rebuildSoon);
+    _debugListeners?.dispose();
+    _blame.dispose();
+    _annotationHoverTimer?.cancel();
+    _disposeNativeControllers();
+    _viewTick.dispose();
+    _textMate.dispose();
+    _findController.dispose();
+    _replaceController.dispose();
+    _findFocusNode.dispose();
+    _replaceFocusNode.dispose();
+    _controller.dispose();
+    _focusNode.dispose();
+    _areaFocusNode.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _replaceText(String text) {
+    _syncing = true;
+    _controller.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _snapshot = widget.active.model.snapshot;
+    _syncing = false;
+  }
+
+  void _changed(String text) {
+    if (!_syncing) {
+      widget.workspace.edit(_path, text);
+      _snapshot = widget.active.model.snapshot;
+      _refreshFindResults();
+    }
+  }
+
+  SearchParams get _searchParams => SearchParams(
+    _findController.text,
+    isRegex: _findRegex,
+    matchCase: _findMatchCase,
+    wordSeparators: _findWholeWord
+        ? '`~!@#\$%^&*()-=+[{]}\\|;:\'",.<>/?'
+        : null,
+  );
+
+  void _refreshFindResults() {
+    if (!_findVisible) return;
+    final results = _findLag.time(
+      'search',
+      () => widget.active.model.findMatches(_searchParams),
+    );
+    if (!mounted) return;
+    setState(() {
+      _findResults = results;
+      _findIndex = -1;
+    });
+  }
+
+  /// Whether the find widget is open.
+  bool get findVisible => _findVisible;
+
+  /// Whether the find widget shows its replace row.
+  bool get replaceVisible => _findVisible && _replaceVisible;
+
+  /// The current find matches (capped at 999, as the counter shows), for
+  /// painting as decorations. Empty while the find widget is closed.
+  List<FindMatch> get findMatches =>
+      _findVisible ? List.unmodifiable(_findResults) : const [];
+
+  /// Index into [findMatches] of the current match, or -1 when none.
+  int get findIndex => _findVisible ? _findIndex : -1;
+
+  /// Commands contributed by the editor to the workbench's command palette.
+  /// Their keybindings are only labels there: the editor dispatches its keys.
+  List<IdeCommand> get editorCommands => [
+    if (widget.nativeEditorEnabled)
+      for (final MapEntry(key: id, value: label) in editorCommandLabels.entries)
+        IdeCommand(
+          id: id,
+          label: label,
+          category: 'Editor',
+          enabled: _nativeController != null,
+          run: () => _runEditorCommand(id),
+        ),
+    if (widget.nativeEditorEnabled)
+      for (final id in editorKeyboardPaletteCommands)
+        if (widget.workspace.languages != null ||
+            !id.startsWith('editor.action.marker.'))
+          IdeCommand(
+            id: id,
+            label: editorKeyboardCommandLabels[id]!,
+            category: 'Editor',
+            enabled: _nativeController != null && _canRun(id),
+            run: () => _runPaletteWidgetCommand(id),
+          ),
+    if (widget.nativeEditorEnabled && widget.workspace.languages != null)
+      for (final MapEntry(key: id, value: label)
+          in editorLanguageCommandLabels.entries)
+        // Problem navigation spans files: the workbench owns it.
+        if (!id.startsWith('editor.action.marker.'))
+          IdeCommand(
+            id: id,
+            label: label,
+            category: 'Editor',
+            enabled: _language != null && _languageCommandEnabled(id),
+            run: () => _runLanguageCommand(id),
+          ),
+  ];
+
+  bool _languageCommandEnabled(String id) {
+    final session = _language;
+    if (session == null) return false;
+    // Explicit navigation waits for a starting server or explains how to
+    // install/retry a missing one, as formatting does without a formatter.
+    if (id == 'editor.action.revealDefinition' ||
+        id == 'editor.action.goToTypeDefinition' ||
+        id == 'editor.action.goToImplementation' ||
+        id == 'editor.action.goToReferences' ||
+        id == 'editor.action.referenceSearch.trigger' ||
+        id == 'editor.action.goToDeclaration' ||
+        id == 'editor.action.formatDocument' ||
+        id == 'editor.action.formatSelection') {
+      return true;
+    }
+    final request = switch (id) {
+      'editor.action.rename' => LanguageRequest.rename,
+      'editor.action.quickFix' ||
+      'editor.action.refactor' ||
+      'editor.action.sourceAction' => LanguageRequest.codeActions,
+      'editor.action.triggerSuggest' => LanguageRequest.completion,
+      'editor.action.triggerParameterHints' => LanguageRequest.signatureHelp,
+      _ => null,
+    };
+    return request == null || session.supports(request);
+  }
+
+  /// The editor's context menu (`MenuId.EditorContext`): go-to commands,
+  /// then modifications, then the clipboard, then the Command Palette; the
+  /// navigation stays available while a server starts or needs installing;
+  /// other language items follow the server's capabilities.
+  void _showContextMenu(Offset position) {
+    if (_nativeController == null) return;
+    final hasSelection = _nativeController!.selections.any(
+      (selection) => !selection.isCollapsed,
+    );
+    final language = _language != null;
+    final l10n = context.l10n;
+    IdeMenuAction languageItem(String id) => IdeMenuAction(
+      localizedCommandLabel(l10n, id, editorLanguageCommandLabels[id]!),
+      keybinding: KeybindingService.instance.labelFor(id),
+      onSelected: () => _runLanguageCommand(id),
+    );
+    IdeMenuAction editorItem(String id) => IdeMenuAction(
+      localizedCommandLabel(l10n, id, editorCommandLabels[id]!),
+      keybinding: KeybindingService.instance.labelFor(id),
+      onSelected: () => _runEditorCommand(id),
+    );
+    List<IdeMenuAction> languageItems(List<String> ids) => [
+      for (final id in ids)
+        if (language && _languageCommandEnabled(id)) languageItem(id),
+    ];
+    final showCommands = widget.onShowCommands;
+    unawaited(
+      showIdeMenu(
+        context,
+        position: position,
+        entries: ideMenuGroups([
+          languageItems(const [
+            'editor.action.revealDefinition',
+            'editor.action.goToTypeDefinition',
+            'editor.action.goToImplementation',
+            'editor.action.goToReferences',
+          ]),
+          [
+            ...languageItems(const ['editor.action.rename']),
+            editorItem('editor.action.changeAll'),
+            ...languageItems([
+              'editor.action.formatDocument',
+              if (hasSelection) 'editor.action.formatSelection',
+              'editor.action.refactor',
+              'editor.action.sourceAction',
+            ]),
+          ],
+          [
+            editorItem('editor.action.clipboardCutAction'),
+            editorItem('editor.action.clipboardCopyAction'),
+            editorItem('editor.action.clipboardPasteAction'),
+          ],
+          [
+            if (annotated)
+              IdeMenuAction(
+                l10n.gitCloseAnnotations,
+                onSelected: toggleAnnotations,
+              )
+            else if (canAnnotate)
+              IdeMenuAction(l10n.gitAnnotate, onSelected: toggleAnnotations),
+            if (canShowHistory)
+              IdeMenuAction(l10n.gitShowHistory, onSelected: showHistory),
+            if (hasSelection && selectionHistoryLines != null)
+              IdeMenuAction(
+                l10n.gitShowHistoryForSelection,
+                onSelected: () => showHistory(selection: true),
+              ),
+            if (widget.onCompare case final compare?
+                when widget.active.isFile && widget.active.diff == null)
+              IdeMenuAction(
+                l10n.compareWith,
+                submenu: [
+                  if (canShowHistory) ...[
+                    IdeMenuAction(
+                      l10n.gitCompareWithBranch,
+                      onSelected: () =>
+                          compare(widget.active.path, IdeCompareWith.branch),
+                    ),
+                    IdeMenuAction(
+                      l10n.gitCompareWithRevision,
+                      onSelected: () =>
+                          compare(widget.active.path, IdeCompareWith.revision),
+                    ),
+                  ],
+                  IdeMenuAction(
+                    l10n.compareWithClipboard,
+                    onSelected: () =>
+                        compare(widget.active.path, IdeCompareWith.clipboard),
+                  ),
+                  IdeMenuAction(
+                    l10n.compareWithLocalHistory,
+                    onSelected: () => compare(
+                      widget.active.path,
+                      IdeCompareWith.localHistory,
+                    ),
+                  ),
+                ],
+              ),
+          ],
+          [wordWrapMenuAction(l10n)],
+          [
+            if (showCommands != null)
+              IdeMenuAction(
+                l10n.editorCommandPalette,
+                keybinding: const IdeKeybinding(
+                  LogicalKeyboardKey.keyP,
+                  primary: true,
+                  shift: true,
+                ).label(),
+                onSelected: showCommands,
+              ),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  /// Palette language commands run once the editor has focus again.
+  void _runLanguageCommand(String id) {
+    _focusNode.requestFocus();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _language?.run(id);
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  /// Shows the hover (with the diagnostics) at the caret, e.g. after the
+  /// workbench moved to a problem.
+  void showHoverAtCaret() {
+    final session = _language;
+    if (session != null) unawaited(session.showHoverAtCaret());
+  }
+
+  /// The active document's indentation, as the status bar shows it.
+  String get indentationLabel =>
+      localizedIndentationLabel(englishLocalizations);
+
+  /// [indentationLabel] in [l10n]'s language.
+  String localizedIndentationLabel(AppLocalizations l10n) {
+    final controller = _nativeController;
+    if (controller == null) return l10n.wbSpaces(4);
+    return controller.insertSpaces
+        ? l10n.wbSpaces(controller.tabSize)
+        : l10n.wbTabSize(controller.tabSize);
+  }
+
+  /// Palette commands run once the editor has focus again, since the surface
+  /// only accepts edits while focused.
+  void _runEditorCommand(String id) {
+    _focusNode.requestFocus();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final controller = _nativeController;
+      final host = _surfaceKey.currentState;
+      if (!mounted || controller == null || host is! EditorViewHost) return;
+      runEditorCommand(id, controller, host as EditorViewHost);
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  /// Find matches as surface decorations; the current match is emphasized.
+  List<EditorDecoration> get _findDecorations {
+    if (!_findVisible || _findResults.isEmpty) return const [];
+    final snapshot = widget.active.model.snapshot;
+    return [
+      for (var i = 0; i < _findResults.length; i++)
+        if (i == _findIndex)
+          EditorDecoration.currentFindMatch(
+            snapshot.offsetAtPosition(_findResults[i].range.getStartPosition()),
+            snapshot.offsetAtPosition(_findResults[i].range.getEndPosition()),
+          )
+        else
+          EditorDecoration.findMatch(
+            snapshot.offsetAtPosition(_findResults[i].range.getStartPosition()),
+            snapshot.offsetAtPosition(_findResults[i].range.getEndPosition()),
+          ),
+    ];
+  }
+
+  /// Opens (or focuses) the find widget, showing the replace row when
+  /// [replace] is set. A single-line selection seeds the search text.
+  void openFind({bool replace = false}) {
+    final selection = _editingValue.selection;
+    if (selection.isValid && !selection.isCollapsed) {
+      final selected = selection.textInside(_editingValue.text);
+      if (!selected.contains('\n') && !selected.contains('\r')) {
+        _findController.text = selected;
+      }
+    }
+    setState(() {
+      _findVisible = true;
+      if (replace) _replaceVisible = true;
+    });
+    _refreshFindResults();
+    _findFocusNode.requestFocus();
+    _findController.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _findController.text.length,
+    );
+  }
+
+  /// Opens the find widget with its replace row (⌥⌘F / Ctrl+H).
+  void openReplace() => openFind(replace: true);
+
+  /// Closes the find widget and returns focus to the text.
+  void closeFind() {
+    if (_findVisible) setState(() => _findVisible = false);
+    focus();
+  }
+
+  /// Whether the text has the keyboard (upstream `editorTextFocus`).
+  bool get hasTextFocus => _focusNode.hasFocus;
+
+  /// The lines selected, each selection's, as references to them for the
+  /// chat (Add Selection to Chat); none of a revision's, whose lines are
+  /// not the file's.
+  List<CodeReference> selectedCode() {
+    final doc = widget.active;
+    final controller = _nativeController;
+    if (controller == null || doc.readRevision != null) return const [];
+    return [
+      for (final (:text, :startLine, :endLine) in controller.selectedLines())
+        CodeReference(
+          path: doc.path,
+          start: startLine,
+          end: endLine,
+          code: text,
+        ),
+    ];
+  }
+
+  /// Whether anything the editor shows has the keyboard: its text, the find
+  /// widget, the rename input (upstream `editorFocus`).
+  bool get hasFocus => _areaFocusNode.hasFocus;
+
+  /// The editor's context keys for keybindings ([editorContextKeys]) while
+  /// it [hasFocus] (upstream's are the focused editor's); null for other
+  /// keys, and while it has not.
+  Object? contextKey(String key) {
+    if (!_areaFocusNode.hasFocus || !editorContextKeys.contains(key)) {
+      return null;
+    }
+    return _keyContext(key);
+  }
+
+  /// The context the editor resolves its keys in: upstream's keys for an
+  /// editor (EditorContextKeys, and those of its find, snippet, suggest,
+  /// parameter hints, rename, message, folding and word highlight
+  /// contributions), and the workbench's that hold whenever the editor has
+  /// the focus. Deviation: the workbench's other keys (e.g.
+  /// `canNavigateBack`) are unknown here, so false.
+  Object? _keyContext(String key) {
+    final controller = _nativeController;
+    final session = _language;
+    final text = _focusNode.hasFocus;
+    return switch (key) {
+      'ideMode' => true,
+      'chatMode' => false,
+      'editorTextFocus' || 'textInputFocus' => text,
+      'editorFocus' => _areaFocusNode.hasFocus,
+      'inputFocus' =>
+        text ||
+            FocusManager.instance.primaryFocus?.context
+                    ?.findAncestorStateOfType<EditableTextState>() !=
+                null,
+      'editorHasSelection' =>
+        controller?.selections.any((s) => !s.isCollapsed) ??
+            !_controller.selection.isCollapsed,
+      'editorHasMultipleSelections' => controller?.hasMultipleSelections,
+      'editorReadonly' => widget.active.readOnly,
+      'editorTabMovesFocus' => false,
+      'editorHasFormattingProvider' => session?.canFormat(),
+      'editorHasCompletionItemProvider' => session?.supports(
+        LanguageRequest.completion,
+      ),
+      'foldingEnabled' => controller != null && _diffOf(widget.active) == null,
+      'hasWordHighlights' => controller?.hasWordHighlights,
+      'inSnippetMode' => controller?.inSnippetMode,
+      'inSnippetChoice' => controller?.snippetChoice != null,
+      'hasNextTabstop' => controller?.snippetHasNextTabstop,
+      'hasPrevTabstop' => controller?.snippetHasPrevTabstop,
+      'messageVisible' => session?.message != null,
+      'findWidgetVisible' => _findVisible,
+      'findInputFocussed' => _findVisible && _findFocusNode.hasFocus,
+      'replaceInputFocussed' => replaceVisible && _replaceFocusNode.hasFocus,
+      'suggestWidgetVisible' => session?.suggest.visible,
+      'suggestWidgetMultipleSuggestions' =>
+        (session?.suggest.items.length ?? 0) > 1,
+      'suggestWidgetHasFocusedSuggestion' ||
+      // `editor.acceptSuggestionOnEnter` is `on`: every item makes an edit.
+      'suggestionMakesTextEdit' => session?.suggest.selected != null,
+      'acceptSuggestionOnEnter' => true,
+      'parameterHintsVisible' => session?.signature != null,
+      'parameterHintsMultipleSignatures' =>
+        (session?.signature?.help.signatures.length ?? 0) > 1,
+      'renameInputVisible' => session?.rename != null,
+      _ => null,
+    };
+  }
+
+  /// Moves keyboard focus to the text.
+  void focus() {
+    if (_focusNode.canRequestFocus) _focusNode.requestFocus();
+  }
+
+  /// Puts [text] where the caret is, as a paste would (links to files
+  /// dropped on a markdown document).
+  void insertAtCaret(String text) {
+    if (widget.active.readOnly) return;
+    if (_nativeController case final controller?
+        when widget.nativeEditorEnabled) {
+      controller.pasteText(text);
+      return;
+    }
+    final value = _controller.value;
+    final selection = value.selection.isValid
+        ? value.selection
+        : TextSelection.collapsed(offset: value.text.length);
+    _controller.value = value.replaced(selection, text);
+  }
+
+  /// Ends every line of the active document with [eol] (`\n` or `\r\n`) as
+  /// one undo step, the cursors kept where they were (VS Code's `pushEOL`).
+  void setEndOfLine(String eol) {
+    final doc = widget.active;
+    if (doc.readOnly) return;
+    final edits = ideEolEdits(doc.model.snapshot, eol);
+    if (edits.isEmpty) return;
+    if (_nativeControllers[doc] case final controller?
+        when widget.nativeEditorEnabled) {
+      controller.applyEdits(edits);
+      return;
+    }
+    doc.model.closeUndoGroup();
+    final changed = doc.model.applyOffsetEdits(edits);
+    doc.model.closeUndoGroup();
+    if (changed) widget.workspace.notifyDocumentChanged(doc);
+  }
+
+  void _toggleFindOption(void Function() toggle) {
+    setState(toggle);
+    _refreshFindResults();
+  }
+
+  /// The search string a find command takes from the selection (upstream
+  /// `getSelectionSearchString`): the word at a caret, or the selected text
+  /// when it is on one line (any lines with [multiline]).
+  String? _selectionSearchString({bool multiline = false}) {
+    final value = _editingValue;
+    final selection = value.selection;
+    if (!selection.isValid) return null;
+    if (selection.isCollapsed) {
+      return _nativeController?.wordAt(selection.extentOffset);
+    }
+    final text = selection.textInside(value.text);
+    if (!multiline && (text.contains('\n') || text.contains('\r'))) {
+      return null;
+    }
+    return text.length < 524288 ? text : null;
+  }
+
+  /// Shows the find widget without moving the focus (upstream
+  /// `FindStartFocusAction.NoFocusChange`), searching for [seed] when
+  /// given (escaped in regular expression mode).
+  void _revealFind({String? seed}) {
+    final shown = !_findVisible;
+    if (shown) setState(() => _findVisible = true);
+    final text = seed == null
+        ? null
+        : _findRegex
+        ? RegExp.escape(seed)
+        : seed;
+    if (text != null && text != _findController.text) {
+      // Its listener searches again.
+      _findController.text = text;
+    } else if (shown) {
+      _refreshFindResults();
+    }
+  }
+
+  /// editor.action.nextMatchFindAction / previousMatchFindAction (F3,
+  /// ⇧F3): searches for the word at the caret (or the selection) when there
+  /// is nothing to search for yet, shows the widget, and moves.
+  void _findMatch({required bool backwards}) {
+    _revealFind(
+      seed: _findController.text.isEmpty ? _selectionSearchString() : null,
+    );
+    _selectFindResult(backwards: backwards);
+  }
+
+  /// editor.action.nextSelectionMatchFindAction / previous (⌘F3 / Ctrl+F3):
+  /// searches for the selection (or the word at the caret) and moves.
+  void _findSelectionMatch({required bool backwards}) {
+    _revealFind(seed: _selectionSearchString());
+    _selectFindResult(backwards: backwards);
+  }
+
+  /// editor.action.selectAllMatches (⌥Enter): a cursor on every match, the
+  /// selection's match first, and the text focused.
+  void _selectAllMatches() {
+    final controller = _nativeController;
+    if (!_findVisible || controller == null) return;
+    final snapshot = widget.active.model.snapshot;
+    final matches = widget.active.model.findMatches(
+      _searchParams,
+      limitResultCount: 0x1fffffffffffff,
+    );
+    if (matches.isEmpty) return;
+    var selections = [
+      for (final match in matches)
+        TextSelection(
+          baseOffset: snapshot.offsetAtPosition(match.range.getStartPosition()),
+          extentOffset: snapshot.offsetAtPosition(match.range.getEndPosition()),
+        ),
+    ];
+    final primary = controller.value.selection;
+    final index = selections.indexWhere(
+      (s) => s.start == primary.start && s.end == primary.end,
+    );
+    if (index > 0) {
+      selections = [
+        primary,
+        ...selections.sublist(0, index),
+        ...selections.sublist(index + 1),
+      ];
+    }
+    controller.setSelections(selections);
+    focus();
+  }
+
+  /// editor.action.marker.next / prev (⌥F8 / ⇧⌥F8): the next or previous
+  /// problem of this file (errors, warnings and infos, upstream's
+  /// `MarkerList` of the file), wrapping, and its hover. Deviation: the
+  /// hover stands in for upstream's peek widget.
+  void _gotoMarker({required bool next}) {
+    final languages = widget.workspace.languages;
+    final controller = _nativeController;
+    if (languages == null || controller == null) return;
+    final path = widget.active.path;
+    final diagnostics = languages.diagnosticsFor(path);
+    final caret = controller.value.selection.extentOffset;
+    var markers = _markers;
+    if (markers == null ||
+        markers.path != path ||
+        markers.caret != caret ||
+        !_sameProblems(markers.diagnostics, diagnostics)) {
+      markers = (
+        path: path,
+        diagnostics: diagnostics,
+        list: ideMarkerList({path: diagnostics}),
+        caret: caret,
+      );
+    }
+    _markers = markers;
+    final snapshot = widget.active.model.snapshot;
+    markers.list.move(next, path, snapshot.positionAtOffset(caret));
+    final selected = markers.list.selected;
+    if (selected == null) return;
+    revealRange(selected.marker.data.range);
+    _markers = (
+      path: path,
+      diagnostics: diagnostics,
+      list: markers.list,
+      caret: controller.value.selection.extentOffset,
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) showHoverAtCaret();
+    });
+  }
+
+  static bool _sameProblems(List<LspDiagnostic> a, List<LspDiagnostic> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (!identical(a[i], b[i]) &&
+          (a[i].range != b[i].range || a[i].message != b[i].message)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// editor.action.showContextMenu (⇧F10): the context menu below the
+  /// caret.
+  void _showContextMenuAtCaret() {
+    final controller = _nativeController;
+    final view = _surfaceKey.currentState;
+    final box = _surfaceKey.currentContext?.findRenderObject();
+    if (controller == null || view is! EditorSurfaceView || box is! RenderBox) {
+      return;
+    }
+    final caret = (view as EditorSurfaceView).caretRectAt(
+      controller.value.selection.extentOffset,
+    );
+    if (caret == null) return;
+    _showContextMenu(box.localToGlobal(caret.bottomLeft));
+  }
+
+  void _selectFindResult({bool backwards = false}) {
+    if (_findResults.isEmpty) return;
+    final selection = _editingValue.selection;
+    final offset = _findIndex >= 0
+        ? backwards
+              ? _snapshot.offsetAtPosition(
+                  _findResults[_findIndex].range.getStartPosition(),
+                )
+              : _snapshot.offsetAtPosition(
+                  _findResults[_findIndex].range.getEndPosition(),
+                )
+        // Upstream: from the selection's start backwards, else its end.
+        : backwards
+        ? selection.start
+        : selection.end;
+    var start = _snapshot.positionAtOffset(offset);
+    if (_findIndex >= 0 && _findResults[_findIndex].range.isEmpty()) {
+      final length = _snapshot.text.length;
+      if (backwards) {
+        start = _snapshot.positionAtOffset(offset == 0 ? length : offset - 1);
+      } else {
+        var next = offset < length ? offset + 1 : 0;
+        while (next < length &&
+            start.equals(_snapshot.positionAtOffset(next))) {
+          next++;
+        }
+        start = _snapshot.positionAtOffset(next);
+      }
+    }
+    final match = backwards
+        ? widget.active.model.findPreviousMatch(_searchParams, start)
+        : widget.active.model.findNextMatch(_searchParams, start);
+    if (match == null) return;
+    final index = _findResults.indexWhere(
+      (item) => item.range.equalsRange(match.range),
+    );
+    setState(() => _findIndex = index);
+    _selectOffsets(
+      _snapshot.offsetAtPosition(match.range.getStartPosition()),
+      _snapshot.offsetAtPosition(match.range.getEndPosition()),
+    );
+  }
+
+  ReplacePattern get _replacePattern => _findRegex
+      ? parseReplaceString(_replaceController.text)
+      : ReplacePattern.fromStaticValue(_replaceController.text);
+
+  void _replaceCurrent() {
+    if (_findResults.isEmpty) return;
+    if (_findIndex < 0) {
+      _selectFindResult();
+      return;
+    }
+    final range = _findResults[_findIndex].range;
+    final start = _snapshot.offsetAtPosition(range.getStartPosition());
+    final end = _snapshot.offsetAtPosition(range.getEndPosition());
+    if (_editingValue.selection.start != start ||
+        _editingValue.selection.end != end) {
+      _selectOffsets(start, end);
+      return;
+    }
+    final matches = widget.active.model.findMatches(
+      _searchParams,
+      captureMatches: _findRegex,
+      limitResultCount: _findIndex + 1,
+    );
+    if (_findIndex >= matches.length ||
+        !matches[_findIndex].range.equalsRange(range)) {
+      _refreshFindResults();
+      return;
+    }
+    final replacement = _replacePattern.buildReplaceString(
+      matches[_findIndex].matches,
+    );
+    widget.workspace.applyEdits(widget.active.path, [
+      EditorDocumentEdit(range, replacement),
+    ]);
+    _snapshot = widget.active.model.snapshot;
+    _selectOffsets(start + replacement.length, start + replacement.length);
+    _refreshFindResults();
+  }
+
+  void _replaceAll() {
+    final document = widget.active;
+    final matches = document.model.findMatches(
+      _searchParams,
+      captureMatches: _findRegex,
+      limitResultCount: 0x1fffffffffffff,
+    );
+    if (matches.isEmpty) return;
+    final pattern = _replacePattern;
+    widget.workspace.applyEdits(document.path, [
+      for (final match in matches)
+        EditorDocumentEdit(
+          match.range,
+          pattern.buildReplaceString(match.matches),
+        ),
+    ]);
+    _snapshot = document.model.snapshot;
+    _refreshFindResults();
+  }
+
+  void _selectOffsets(int base, int extent) {
+    if (widget.nativeEditorEnabled) {
+      _nativeController?.select(base, extent);
+      _nativeController?.revealSelection();
+    } else {
+      _controller.selection = TextSelection(
+        baseOffset: base,
+        extentOffset: extent,
+      );
+    }
+  }
+
+  /// Flushes before changing tabs or layouts. The experimental controller edits
+  /// the workspace's model synchronously, so it has no separate text to flush.
+  Future<void> flush() async {
+    if (!_syncing && !widget.nativeEditorEnabled) {
+      widget.workspace.edit(_path, _controller.text);
+    }
+  }
+
+  Future<void> save() async {
+    try {
+      await flush();
+      final session = _language;
+      if (widget.formatOnSave && session != null && session.canFormat()) {
+        await session.format();
+      }
+      final doc = widget.workspace.active;
+      if (doc != null) await widget.workspace.save(doc);
+    } catch (error) {
+      if (mounted) widget.onError(error);
+    }
+  }
+
+  Future<void> closeDocument(IdeDocument doc) async {
+    if (widget.nativeEditorEnabled && identical(doc, widget.active)) {
+      _focusNode.unfocus();
+    }
+    // The workspace owns closing/disposal. Its notification releases the cached
+    // controller only after the document is actually removed from the open set.
+  }
+
+  /// Places the caret at one-based [line] and [column] (clamped to the
+  /// document and line), reveals it and focuses the text.
+  Future<void> revealLine(int line, [int column = 1]) async {
+    if (line < 1) return;
+    final offset = _snapshot.offsetAtPosition(
+      Position(line, column < 1 ? 1 : column),
+    );
+    _selectOffsets(offset, offset);
+    focus();
+  }
+
+  Future<void> retryLanguageServer() async {
+    widget.onLspStatus(_editorStatus);
+  }
+
+  Widget _buildFindWidget() => IdeFindWidget(
+    findController: _findController,
+    replaceController: _replaceController,
+    findFocusNode: _findFocusNode,
+    replaceFocusNode: _replaceFocusNode,
+    replaceVisible: _replaceVisible,
+    matchCase: _findMatchCase,
+    wholeWord: _findWholeWord,
+    regex: _findRegex,
+    matchCount: _findResults.length,
+    currentIndex: _findIndex,
+    onToggleReplace: () => setState(() => _replaceVisible = !_replaceVisible),
+    onToggleMatchCase: () =>
+        _toggleFindOption(() => _findMatchCase = !_findMatchCase),
+    onToggleWholeWord: () =>
+        _toggleFindOption(() => _findWholeWord = !_findWholeWord),
+    onToggleRegex: () => _toggleFindOption(() => _findRegex = !_findRegex),
+    onPrevious: () => _selectFindResult(backwards: true),
+    onNext: _selectFindResult,
+    onClose: closeFind,
+    onReplace: _replaceCurrent,
+    onReplaceAll: _replaceAll,
+    commandIds: editorFindCommandIds,
+    // Lines found across, as upstream's editor does.
+    multiline: true,
+    resolveKey: widget.keyResolver == null
+        ? null
+        : (event) => _resolveKey(event).command,
+    lag: _findLag,
+  );
+
+  TextStyle _editorStyle(WorkbenchColors colors) =>
+      AppFonts.codeStyle(13)
+          .copyWith(color: colors['editor.foreground'], height: 1.45);
+
+  /// The active document's editor; in a diff, the modified side, with
+  /// what the diff gives it ([side]); else with its agent change in it
+  /// ([agent]).
+  Widget _surface(
+    WorkbenchColors colors, {
+    DiffEditorSide? side,
+    ({List<EditorViewZone> zones, List<EditorDecoration> decorations})? agent,
+  }) => EditorSurface(
+    key: _surfaceKey,
+    controller: _nativeController!,
+    focusNode: _focusNode,
+    readOnly: widget.active.readOnly,
+    // A diff's sides keep their lines aligned unwrapped.
+    wrap: side == null && EditorWordWrap.on.value,
+    backgroundColor: colors['editor.background'],
+    selectionColor: colors['editor.selectionBackground'],
+    caretColor: colors['editorCursor.foreground'],
+    theme: EditorViewTheme.fromColors(colors.get),
+    styledLines: _language?.styledLines(_styledLines) ?? _styledLines,
+    decorations: [
+      ...?side?.decorations,
+      ...?agent?.decorations,
+      ...?_language?.decorations,
+      ..._snippetDecorations(_nativeController!, colors),
+      ..._findDecorations,
+      ..._blameDecorations(colors),
+      ..._debugDecorations(),
+      if (side == null) ..._lineChangeDecorations(colors),
+    ],
+    // A diff editor's editors fold nothing and have no minimap; others
+    // have one unless it is turned off (EditorMinimap).
+    viewZones: side?.zones ?? agent?.zones ?? const [],
+    scrollPosition: side?.scrollPosition,
+    // Side by side, the line numbers are by the split: no margin between.
+    glyphMargin: side == null || !side.sideBySide,
+    lineNumbersMinChars:
+        side?.lineNumbersMinChars ?? EditorViewGeometry.lineNumbersMinChars,
+    folding: side == null,
+    hiddenLines: side?.hiddenLines,
+    showMinimap: side == null && EditorMinimap.on.value,
+    // A diff's overview scrolls it.
+    verticalScrollbar: side == null,
+    onKeyEvent: _onEditorKey,
+    keyResolver: widget.keyResolver == null ? null : _resolveTextKey,
+    onHover: _language == null
+        ? null
+        : (offset, _) => _language?.onPointerHover(offset),
+    onContentPointerDown: _language?.onPointerDown,
+    onContextMenu: _showContextMenu,
+    onViewChanged: _viewChanged,
+    onChangeBarTap: side == null ? _lineChangeMarkPressed : null,
+    lineAnnotations: side == null ? _lineAnnotations(colors) : null,
+    contentCursor: _language?.link == null ? null : SystemMouseCursors.click,
+    style: _editorStyle(colors),
+  );
+
+  /// [_blame]'s lines, each after its end (`GitBlameEditorDecoration`).
+  List<EditorDecoration> _blameDecorations(WorkbenchColors colors) {
+    final lines = _blame.lines;
+    if (lines.isEmpty) return const [];
+    final snapshot = widget.active.model.snapshot;
+    final color = colors['git.blame.editorDecorationForeground'];
+    return [
+      for (final line in lines)
+        if (line.lineNumber <= snapshot.lineCount)
+          EditorDecoration(
+            start: snapshot.contentEnds[line.lineNumber - 1],
+            end: snapshot.contentEnds[line.lineNumber - 1],
+            afterText: switch (line.commit) {
+              final commit? => formatGitBlame(
+                ideGitBlameTemplate,
+                commit,
+                l10n: _l10n,
+              ),
+              null => _l10n.gitBlameNotCommittedYet,
+            },
+            afterColor: color,
+            afterMargin: ideGitBlameMargin,
+          ),
+    ];
+  }
+
+  /// Undo and Keep by each part of [agent], the active document's agent
+  /// change; null without one.
+  Widget? _agentHunkActions(IdeAgentDiff? agent) {
+    final changes = agent?.diff.model.mappings;
+    if (agent == null || changes == null || changes.isEmpty) return null;
+    final doc = widget.active;
+    // Placed by the text as laid out this frame.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _viewTick.value++;
+    });
+    return IdeAgentHunkActions(
+      changes: changes,
+      snapshot: doc.model.snapshot,
+      view: () => switch (_surfaceKey.currentState) {
+        final EditorSurfaceView view => view,
+        _ => null,
+      },
+      repaint: _viewTick,
+      onUndo: (change) =>
+          unawaited(_actOnAgentChange(() => agent.undo(change))),
+      onKeep: (change) =>
+          unawaited(_actOnAgentChange(() => agent.keep(change))),
+    );
+  }
+
+  /// A diff tab's editors: the original, read-only, and the document.
+  Widget _diffEditor(WorkbenchColors colors, IdeOriginalDiff diff) {
+    final theme = EditorViewTheme.fromColors(colors.get);
+    final type = getThemeTypeSelector(_themes.colorTheme.type);
+    final options = IdeDiffOptions.instance;
+    return DiffEditor(
+      key: ObjectKey(diff),
+      model: diff.model,
+      scrollPosition: diff.scroll,
+      sideBySide: options.sideBySide,
+      highlight: DiffHighlight.lines,
+      hideUnchanged: options.collapseUnchanged,
+      unchangedLabel: context.l10n.diffUnchangedLines,
+      tabSize: _nativeController?.tabSize ?? 4,
+      style: _editorStyle(colors),
+      theme: theme,
+      colors: DiffEditorColors.from(colors.get),
+      dark:
+          type == ThemeTypeSelector.vsDark || type == ThemeTypeSelector.hcBlack,
+      originalStyledLines: diff.textMate?.styledLines,
+      background: colors['editor.background'],
+      border: colors.get('diffEditor.border'),
+      sashHover: colors.get('sash.hoverBorder'),
+      original: (context, side) {
+        final controller = diff.controller;
+        if (controller == null) return const SizedBox.expand();
+        return EditorSurface(
+          key: ObjectKey(controller),
+          controller: controller,
+          readOnly: true,
+          backgroundColor: colors['editor.background'],
+          selectionColor: colors['editor.selectionBackground'],
+          caretColor: colors['editorCursor.foreground'],
+          theme: theme,
+          styledLines: diff.textMate?.styledLines,
+          decorations: side.decorations,
+          viewZones: side.zones,
+          scrollPosition: side.scrollPosition,
+          lineNumbers: side.lineNumbers,
+          lineNumbersMinChars: side.lineNumbersMinChars,
+          glyphMargin: false,
+          folding: false,
+          hiddenLines: side.hiddenLines,
+          showMinimap: false,
+          verticalScrollbar: false,
+          style: _editorStyle(colors),
+        );
+      },
+      modified: (context, side) => _surface(colors, side: side),
+      overlay: widget.active.readOnly
+          ? null
+          : (context, layout) => _revertArrows(diff, layout),
+    );
+  }
+
+  /// JetBrains' `>>` by each change of a diff tab whose file can be edited
+  /// (side by side, where the change's band leaves the original; at the
+  /// file's left edge inline): the change reverted in the file, unsaved as
+  /// any edit.
+  /// The revert arrows last built: for which changes, in which colors.
+  (List<LineRangeMapping>, Object, Map<LineRangeMapping, Widget>)?
+  _revertArrowWidgets;
+
+  Widget _revertArrows(IdeOriginalDiff diff, DiffEditorLayout layout) =>
+      ListenableBuilder(
+        listenable: _viewTick,
+        builder: (context, _) {
+          final view = switch (_surfaceKey.currentState) {
+            final EditorSurfaceView view => view,
+            _ => null,
+          };
+          final area = view?.textArea;
+          final controller = _nativeController;
+          final mappings = diff.model.mappings;
+          final original = diff.model.originalSnapshot;
+          if (view == null ||
+              area == null ||
+              controller == null ||
+              mappings == null ||
+              original == null) {
+            return const SizedBox.shrink();
+          }
+          final snapshot = controller.document.snapshot;
+          const size = 16.0;
+          // The same arrows as the view scrolls, moved, not built again
+          // each frame: built anew for other changes or colors.
+          final colors = _themes.colors;
+          final arrows = switch (_revertArrowWidgets) {
+            (final changes, final builtIn, final arrows)
+                when identical(changes, mappings) &&
+                    identical(builtIn, colors) =>
+              arrows,
+            _ => <LineRangeMapping, Widget>{},
+          };
+          _revertArrowWidgets = (mappings, colors, arrows);
+          return Stack(
+            children: [
+              for (final change in mappings)
+                if (ideDiffArrowTop(view, snapshot, change, layout, size)
+                    case final top?
+                    when top >= area.top - 2 && top + size <= area.bottom)
+                  Positioned(
+                    key: ObjectKey(change),
+                    left: ideDiffArrowLeft(layout, size),
+                    top: top,
+                    width: size,
+                    height: size,
+                    child: arrows[change] ??= IdeDiffRevertArrow(
+                      added: change.original.isEmpty,
+                      onTap: () {
+                        controller.applyEdits([
+                          ideDiffRevertEdit(
+                            change,
+                            original,
+                            controller.document.snapshot,
+                          ),
+                        ]);
+                        // Shown reverted at once, not after the debounce.
+                        diff.model.refresh();
+                      },
+                    ),
+                  ),
+            ],
+          );
+        },
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final language = p.extension(widget.active.path).toLowerCase();
+    final colors = _themes.colors;
+    final agent =
+        widget.nativeEditorEnabled &&
+            _nativeController != null &&
+            _diffOf(widget.active) == null
+        ? _agentDiffOf(widget.active)
+        : null;
+    // With the app's keybindings, save, find and replace are the
+    // workbench's commands.
+    return Focus(
+      focusNode: _areaFocusNode,
+      onKeyEvent: _onAreaKey,
+      child: CallbackShortcuts(
+        bindings: {
+          if (widget.keyResolver == null) ...{
+            const SingleActivator(LogicalKeyboardKey.keyS, meta: true): () =>
+                unawaited(save()),
+            const SingleActivator(LogicalKeyboardKey.keyS, control: true): () =>
+                unawaited(save()),
+            const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+                openFind,
+            const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+                openFind,
+            // Replace: ⌥⌘F or ⌘H on macOS (where ⌃H deletes), Ctrl+H elsewhere.
+            if (ideUsesMacKeys) ...{
+              const SingleActivator(
+                LogicalKeyboardKey.keyF,
+                meta: true,
+                alt: true,
+              ): openReplace,
+              const SingleActivator(LogicalKeyboardKey.keyH, meta: true):
+                  openReplace,
+            } else
+              const SingleActivator(LogicalKeyboardKey.keyH, control: true):
+                  openReplace,
+          },
+        },
+        child: ColoredBox(
+          color: colors['editor.background'],
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: widget.nativeEditorEnabled
+                    ? _nativeController == null
+                          ? const SizedBox.expand()
+                          : _diffOf(widget.active) == null
+                          ? Builder(
+                              builder: (context) => _surface(
+                                colors,
+                                agent: agent?.parts(
+                                  colors: DiffEditorColors.from(colors.get),
+                                  style: _editorStyle(colors),
+                                  textScaler: MediaQuery.textScalerOf(context),
+                                ),
+                              ),
+                            )
+                          : _diffEditor(colors, _diffOf(widget.active)!)
+                    : TextField(
+                        controller: _controller,
+                        focusNode: _focusNode,
+                        scrollController: _scrollController,
+                        expands: true,
+                        minLines: null,
+                        maxLines: null,
+                        keyboardType: TextInputType.multiline,
+                        textInputAction: TextInputAction.newline,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        cursorColor: colors['editorCursor.foreground'],
+                        onChanged: _changed,
+                        style: AppFonts.codeStyle(13).copyWith(
+                          color: colors['editor.foreground'],
+                          height: 1.45,
+                        ),
+                        decoration: InputDecoration(
+                          border: InputBorder.none,
+                          contentPadding: const EdgeInsets.fromLTRB(
+                            16,
+                            12,
+                            16,
+                            20,
+                          ),
+                          hintText: language.isEmpty
+                              ? context.l10n.editorStartTyping
+                              : context.l10n.editorEditLanguage(language),
+                          hintStyle: TextStyle(
+                            color: colors['editor.placeholder.foreground'],
+                          ),
+                        ),
+                      ),
+              ),
+              if (_debugGlyphMargin() case final margin?)
+                Positioned(left: 0, top: 0, bottom: 0, child: margin),
+              if (_agentHunkActions(agent) case final actions?)
+                Positioned.fill(child: actions),
+              if (_lineChangePopup(colors) case final popup?)
+                Positioned.fill(child: popup),
+              ?_annotationHoverCard(),
+              if (_language case final session?)
+                Positioned.fill(
+                  child: IdeLanguageOverlay(
+                    session: session,
+                    renameHandlesKeys: widget.keyResolver == null,
+                    colorize: _colorizeCode,
+                    language:
+                        _textMateDocuments[widget.active]?.$2.languageId ??
+                        _tokenizedDocuments[widget.active]?.languageId,
+                    view: () => switch (_surfaceKey.currentState) {
+                      final EditorSurfaceView view => view,
+                      _ => null,
+                    },
+                  ),
+                ),
+              if (_findVisible)
+                Positioned.fill(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) => Align(
+                      alignment: Alignment.topRight,
+                      child: Padding(
+                        padding: const EdgeInsets.only(right: 14),
+                        child: SizedBox(
+                          width: math.min(
+                            IdeFindWidget.width,
+                            math.max(240, constraints.maxWidth - 28),
+                          ),
+                          child: _buildFindWidget(),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Retained for the editor-area status bar and future syntax services.
+String languageNameForFile(String path) =>
+    switch (p.extension(path).toLowerCase()) {
+      '.dart' => 'Dart',
+      '.js' || '.jsx' => 'JavaScript',
+      '.ts' || '.tsx' => 'TypeScript',
+      '.py' => 'Python',
+      '.json' => 'JSON',
+      '.md' => 'Markdown',
+      '.yaml' || '.yml' => 'YAML',
+      '.html' => 'HTML',
+      '.css' => 'CSS',
+      '.rs' => 'Rust',
+      '.go' => 'Go',
+      '.java' => 'Java',
+      '.c' || '.h' => 'C',
+      '.cc' || '.cpp' || '.hpp' => 'C++',
+      '.sh' || '.bash' => 'Shell',
+      _ => 'Plain Text',
+    };

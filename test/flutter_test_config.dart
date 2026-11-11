@@ -1,0 +1,119 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agile_editor/monaco/flutter/language_assets.dart';
+import 'package:agile_editor/monaco/vs/workbench/services/themes/common/color_theme_data.dart';
+import 'package:agile_editor/monaco/vs/workbench/services/themes/common/workbench_theme_service.dart';
+import 'package:agile_editor/textmate/textmate_manifest.dart'
+    show textMateAssetRoot;
+import 'package:agile_editor/textmate/textmate_syntax.dart';
+import 'package:agile_editor/textmate/textmate_worker.dart';
+import 'package:agilegeek/chat/user_message_style.dart';
+import 'package:agilegeek/customize/customize_view.dart';
+import 'package:agilegeek/ide/ide_diff_options.dart';
+import 'package:agilegeek/ide/lsp/packs/language_packs.dart';
+import 'package:agilegeek/kernel/claude_code/claude_core_setting.dart';
+import 'package:agilegeek/kernel/kernel_registry.dart';
+import 'package:agilegeek/models/featured_upstreams.dart';
+import 'package:agilegeek/kernel/mock/mock_kernels.dart';
+import 'package:agilegeek/platform/context_menu.dart';
+import 'package:agilegeek/platform/shell_command.dart';
+import 'package:agilegeek/theme/workbench_theme.dart';
+
+import 'semantics_tree.dart';
+
+/// Every test runs on the scripted kernels: none starts a real CLI; and
+/// fails if its semantics updates would break the desktop engines'
+/// accessibility tree. Editors tokenize TextMate grammars in the test's
+/// isolate, on its fake clock. Each test reads assets afresh: the bundle
+/// caches futures, which answer in the zone of the test that made them.
+/// Each test starts in [testColorTheme], from its data as the app keeps
+/// it, without reading assets, and with the user's
+/// messages [UserMessageStyle.sticky], which the chat's tests were written
+/// for, not the app's default. The `code` command and
+/// the context menu are stand-ins, never installed: none looks at the
+/// machine's own. No MCP server is started to see whether it answers, and
+/// the upstreams Settings → Models lists are not got from agilegeek.dev.
+/// Sessions are the CLI's, with Claude Code as set up on the machine to
+/// pick, which the kernel's tests were written for: those of AgileGeek's
+/// own core say so. Diffs show as they do by default.
+Future<void> testExecutable(FutureOr<void> Function() testMain) async {
+  checkDesktopSemantics();
+  KernelRegistry.use(MockKernels.all);
+  textMateWorkerLauncher = () async => TextMateInProcessWorker.create();
+  MonacoLanguageAssets.defaultPacks = () => LanguagePackRegistry.instance;
+  final defaultTheme = await _defaultColorTheme();
+  setUp(() {
+    IdeDiffOptions.instance.reset();
+    rootBundle.clear();
+    ClaudeCore.current = () => ClaudeCore.cli;
+    UserMessageStyle.current.value = UserMessageStyle.sticky;
+    ShellCommand.debugInstaller = _NoShellCommand();
+    ContextMenu.debugInstaller = _NoContextMenu();
+    CustomizeView.mcpProber = null;
+    FeaturedUpstream.loader = () async => const [];
+    FeaturedUpstream.keptLoader = () async => const [];
+    FeaturedUpstream.forget();
+    WorkbenchThemeService.instance = WorkbenchThemeService(
+      initial: ColorThemeData.fromStorageData(defaultTheme)!..isLoaded = true,
+    );
+  });
+  await testMain();
+}
+
+class _NoShellCommand implements ShellCommandInstaller {
+  @override
+  String get location => '/usr/local/bin/code';
+
+  @override
+  Future<ShellCommandStatus> status() async => ShellCommandStatus.notInstalled;
+
+  @override
+  Future<void> install({bool overwrite = false}) async {}
+
+  @override
+  Future<void> uninstall() async {}
+
+  @override
+  Future<void> refresh() async {}
+}
+
+class _NoContextMenu implements ContextMenuInstaller {
+  @override
+  Future<ContextMenuStatus> status() async => ContextMenuStatus.off;
+
+  @override
+  Future<void> install(ContextMenuLabels labels) async {}
+
+  @override
+  Future<void> uninstall() async {}
+
+  @override
+  Future<void> Function()? get openSystemSettings => null;
+}
+
+/// The theme tests start in: upstream's default dark theme, which their
+/// colors were written for, not the app's ([ThemeSettingDefaults]). Not
+/// listed (the Agile themes include its file), so no setting picks it.
+const testColorTheme = 'Dark 2026';
+
+/// [testColorTheme]'s storage data, read from the assets on disk.
+Future<String> _defaultColorTheme() async {
+  Future<String> read(String path) async =>
+      File('$textMateAssetRoot/$path').readAsStringSync();
+  const path = 'themes/theme-defaults/themes/2026-dark.json';
+  final theme = ColorThemeData.fromExtensionTheme(
+    const IThemeExtensionPoint(
+      id: testColorTheme,
+      label: testColorTheme,
+      path: path,
+      uiTheme: 'vs-dark',
+    ),
+    path,
+    extensionId: 'vscode.theme-defaults',
+  );
+  await theme.ensureLoaded(read);
+  return theme.toStorage();
+}

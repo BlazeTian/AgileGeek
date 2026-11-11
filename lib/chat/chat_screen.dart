@@ -1,0 +1,1969 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:agile_editor/textmate/textmate_syntax.dart' show TextMateSyntax;
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+
+import '../base/mouse_navigation.dart';
+import '../channel/channel_setup.dart';
+import '../ide/ide_menu.dart';
+import '../kernel/kernel_types.dart';
+import '../keybindings/chat_keybindings.dart';
+import '../l10n/l10n.dart';
+import '../models/model_welcome.dart';
+import '../remote/remote_location.dart';
+import '../remote/remote_status.dart' show ClaudeInstallBanner, SshHostBanner;
+import '../stash/stash_actions.dart';
+import '../stash/stash_store.dart';
+import '../theme/app_theme.dart';
+import '../theme/codicons.dart';
+import '../workspace/editor_launcher.dart';
+import '../workspace/agent_title.dart' show askedTitles;
+import '../workspace/islands.dart';
+import '../workspace/title_bar_double_click.dart';
+import '../workspace/window_controls.dart';
+import 'agent_view.dart';
+import 'chat_column.dart';
+import 'chat_feed.dart';
+import 'chat_history_view.dart';
+import 'chat_keys.dart';
+import 'chat_models.dart';
+import 'chat_session.dart';
+import 'open_editor.dart';
+import 'resume_after_reset.dart';
+import 'chat_width.dart';
+import 'composer/command_details.dart';
+import 'composer/composer.dart';
+import 'composer/composer_embeds.dart';
+import 'composer/composer_mock_data.dart';
+import 'composer/file_mentions.dart';
+import 'panels/activity_strip.dart';
+import 'panels/health_banner.dart';
+import 'panels/interaction_panel.dart';
+import 'panels/limit_reset_panel.dart';
+import 'panels/context_usage_panel.dart';
+import 'panels/goal_panel.dart';
+import 'panels/queue_panel.dart';
+import 'panels/reset_credits_hint.dart';
+import 'side_panel/file_link.dart';
+import 'side_panel/file_open.dart';
+import 'stop_confirmation.dart';
+import 'widgets/agent_step.dart';
+import 'widgets/chat_minimap.dart';
+import 'widgets/code_citation.dart';
+import 'widgets/hover_scroll_text.dart';
+import 'widgets/context_meter.dart';
+import 'widgets/inline_rename_field.dart';
+import 'widgets/pixel_loader.dart';
+import 'widgets/plan_start.dart';
+
+/// Layout, top to bottom:
+/// - history + live turn: a virtual list that yields height;
+/// - feedback / modal / indicator panels: take the height they need;
+/// - the composer.
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({
+    super.key,
+    this.title = 'Optimize virtual list scrolling',
+    this.session,
+    this.leading,
+    this.trailing,
+    this.cardLeading,
+    this.cardTrailing,
+    this.rowOverCard = true,
+    this.footOnCard = false,
+    this.cardButtonsAtStart = false,
+    this.titleBarInset,
+    this.titleBarEnd = 8,
+    this.onRename,
+    this.onSummarizeTitle,
+    this.subtitle,
+    this.titleTabs,
+    this.titleDragBuilder,
+    this.onTitleDragStart,
+    this.autofocus = false,
+    this.embedded = false,
+    this.windowTitleBar = true,
+    this.titleBar = true,
+    this.focused = true,
+    this.island,
+    this.islandBorder,
+    this.onOpenChange,
+    this.onOpenCode,
+    this.fileLinks,
+    this.onOpenTerminalTask,
+    this.colorizeCode,
+    this.colorizeCodeBlock,
+    this.codeSyntax,
+    this.start,
+    this.startHint,
+    this.below,
+    this.sessions,
+    this.fileMentions,
+    this.commandFile,
+    this.openEditor,
+    this.onSideQuestion,
+    this.onFork,
+    this.asideAt,
+    this.back,
+  });
+
+  final String title;
+  final ChatSession? session;
+
+  /// Before the title, e.g. a button to show the sidebar.
+  final Widget? leading;
+
+  /// At the right of the title bar, e.g. a button to open the project.
+  final Widget? trailing;
+
+  /// The pane's own buttons before its title (its close button): on its
+  /// card ([island]), at the start of the row along its top; else first of
+  /// those at the title bar's right.
+  final Widget? cardLeading;
+
+  /// The conversation's own buttons (its terminal's, its side panel's): on
+  /// its card ([island]), at the right of the row along its top, after the
+  /// title; else before [trailing].
+  final Widget? cardTrailing;
+
+  /// Whether its card ([island]) has a row over it, on the window's color,
+  /// where macOS has its title bar (with [leading] and [trailing]): not a
+  /// pane among others, the window having one row over them all.
+  final bool rowOverCard;
+
+  /// Whether the row under its card ([below], how full the context is) is
+  /// on the card instead, under the composer: a pane among others, which
+  /// leave no row under theirs.
+  final bool footOnCard;
+
+  /// [cardTrailing] at the start of the row along the card's top, before
+  /// [cardLeading]: the side panel at the conversation's left, its rail
+  /// under them.
+  final bool cardButtonsAtStart;
+
+  /// The row along the top of its card, with its title: as high as the
+  /// window's title bar over it (macOS's), and the side panel's tabs
+  /// beside it.
+  static const cardHeaderHeight = AppMetrics.titleBarHeight;
+
+  /// From the card's right to the row's last button, less its padding (2):
+  /// its right edge on the side panel's rail's under it, as far in as that
+  /// (AgentSidePanelArea.railRight, [Islands.inset]).
+  static const cardHeaderEnd = Islands.inset - 2;
+
+  /// Left of the title bar's [leading]: by default clear of the native
+  /// traffic lights, as when this is the whole window. The title and
+  /// [trailing] keep to the conversation's column, clear of both.
+  final double? titleBarInset;
+
+  /// From the title bar's right to [trailing]: less where a gap is already
+  /// between it and the window's edge, for the window's buttons to be
+  /// where the IDE's title bar has its own.
+  final double titleBarEnd;
+
+  /// Given, a double click on the title edits it.
+  final ValueChanged<String>? onRename;
+
+  /// A new title summing the conversation up, offered under the title as
+  /// it is renamed; null when none could be had.
+  final Future<String?> Function()? onSummarizeTitle;
+
+  /// After the title, fainter: e.g. a pane's project, and the host it is
+  /// on.
+  final Widget? subtitle;
+
+  /// In the title bar in place of the title (and [subtitle]), but while
+  /// it is renamed: e.g. a pane's tabs.
+  final Widget? titleTabs;
+
+  /// Wraps the title as a drag source, when not renaming. Its double click
+  /// still renames; the title bar's controls are never part of the source.
+  final Widget Function(Widget title)? titleDragBuilder;
+
+  /// A drag from the title bar's empty area, alongside the title's source.
+  final ValueChanged<PointerMoveEvent>? onTitleDragStart;
+
+  /// Focuses the composer once shown, e.g. for a new agent.
+  final bool autofocus;
+
+  /// When true, omit the window title row so this screen can live in a pane.
+  final bool embedded;
+
+  /// Whether its title bar is in the window's own (at the top, under the
+  /// macOS traffic lights' row): a double click on it does what one on the
+  /// system's does. Not so for a pane below another.
+  final bool windowTitleBar;
+
+  /// Whether it shows its title row: not where the window's header shows
+  /// the title (Windows' narrow window); renaming shows it all the same.
+  final bool titleBar;
+
+  /// Whether it is the conversation focused, of several side by side: the
+  /// others' titles are dimmer.
+  final bool focused;
+
+  /// Given, the conversation and its input are on a card of this color
+  /// (see [Island]), its title bar and [below] on the window's, outside it.
+  final Color? island;
+
+  /// The outline of the card ([island]): [Islands.border] by default.
+  final Color? islandBorder;
+
+  /// Opens a changed file's changes: against [original], its text before
+  /// the agent changed it, or the file alone where that is not known.
+  final void Function(FileChange change, Future<String> Function()? original)?
+  onOpenChange;
+
+  /// Opens a file the agent cited (see [CodeCitationCard]) with lines
+  /// [start] to [end] (from 1) selected.
+  final void Function(String path, int start, int end)? onOpenCode;
+
+  /// Where the files the conversation names open: the files read and
+  /// edited, those its links go to and its inline code names, the code it
+  /// cites and the files it changed (in place of [onOpenCode] and
+  /// [onOpenChange]). None: only those two open.
+  final FileLinkTarget? fileLinks;
+
+  final ValueChanged<KernelTask>? onOpenTerminalTask;
+
+  /// Colors the code the agent cites.
+  final CodeColorizer? colorizeCode;
+
+  /// Colors code blocks by the language their fences name.
+  final CodeBlockColorizer? colorizeCodeBlock;
+
+  /// See [CodeCitationScope.syntax].
+  final TextMateSyntax Function()? codeSyntax;
+
+  /// Over the composer while nothing was sent, e.g. where the agent is to
+  /// work: given, the composer waits in the middle of the screen until then.
+  final Widget? start;
+
+  /// In place of the hint over the composer while nothing was sent (with
+  /// [start]): the setup checklist, say, which builds [hint] when it has
+  /// nothing to show.
+  final Widget Function(BuildContext context, Widget hint)? startHint;
+
+  /// Under the composer, e.g. the branch it works on.
+  final Widget? below;
+
+  /// The other conversations its messages may refer to, which `@` in the
+  /// composer offers (see [ComposerVocabulary.sessions]).
+  final List<Suggestion> Function()? sessions;
+
+  /// Where `@` looks files up, besides the kernel (see [FileMentions]).
+  final FileMentions? fileMentions;
+
+  /// The file of a `/command` (no `/`): a skill's SKILL.md, a command's
+  /// markdown; null for one built in. Its menu and its tags open it, as
+  /// [fileLinks] opens a file (see [CommandDetails]).
+  final Future<String?> Function(String command)? commandFile;
+
+  /// The file open in the editor beside it, where there is one: the agent
+  /// is told of it with the messages sent (see [ChatSession.send]).
+  final OpenEditor? Function()? openEditor;
+
+  /// Given, `/btw …` sent here is not the agent's: what follows it, with
+  /// the message's images and mentions, is asked in a conversation of its
+  /// own beside this one, from all of this one so far.
+  final ValueChanged<ComposerMessage>? onSideQuestion;
+
+  /// Given, `/fork` sent here is not the agent's: the conversation is
+  /// copied into a new one, as the sidebar's Fork, and what follows the
+  /// command (empty for none) is sent there.
+  final ValueChanged<ComposerMessage>? onFork;
+
+  /// What shows under the conversation's item of the id given: the
+  /// conversations asked beside it from there (see [onSideQuestion]).
+  final Widget? Function(String itemId)? asideAt;
+
+  /// Over the conversation, as over a subagent's: the way back to the one
+  /// it was asked beside, [label] that one's title. None for most.
+  final ({String label, VoidCallback onBack})? back;
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+
+  /// Shows or hides the context usage panel of the chat [key] is on, as the
+  /// window's View menu asks (see window_header/), wherever the focus is.
+  static void toggleContextPanel(GlobalKey key) =>
+      (key.currentState as _ChatScreenState?)?._toggleContextPanel();
+
+  /// Focuses the input of the chat [key] is on (e.g. an agent just opened
+  /// by its keybinding).
+  static void focusInput(GlobalKey key) =>
+      (key.currentState as _ChatScreenState?)?._focusInput();
+
+  /// Finds [query] in the conversation of the chat [key] is on (a search's
+  /// hit there), its first match brought into view.
+  /// Whether there was a chat at [key] to find [query] in.
+  static bool find(GlobalKey key, String query) {
+    final state = key.currentState as _ChatScreenState?;
+    state?._findIn(query: query);
+    return state != null;
+  }
+}
+
+class _ChatScreenState extends State<ChatScreen>
+    with TickerProviderStateMixin, ChatKeyTarget {
+  /// As wide as the setting lets the column grow (see [ChatWidth]); in the
+  /// IDE ([ChatScreen.embedded]) across its pane, not in its middle.
+  double get _maxContentWidth =>
+      widget.embedded ? double.infinity : ChatWidth.current.value;
+
+  /// Whether the conversation has a minimap: in the agents' window, not a
+  /// pane of the IDE's, unless turned off (see [ChatMinimap.enabled]).
+  bool get _minimap => !widget.embedded && ChatMinimap.enabled.value;
+
+  void _widthChanged() => setState(() {});
+
+  late final ChatSession _session = widget.session ?? ChatSession();
+  final GlobalKey<ChatComposerState> _composerKey = GlobalKey();
+  final GlobalKey _historyKey = GlobalKey();
+  bool _contextPanelOpen = false;
+  bool _renaming = false;
+
+  /// Nothing was sent yet: the composer is in the middle, under [start].
+  bool get _starting => widget.start != null && _session.itemCount == 0;
+  late bool _wasStarting = _starting;
+
+  /// Lays the screen out anew as the first message moves the composer down
+  /// (the rest of the session's changes are the builders' below).
+  void _checkStarting() {
+    if (_starting != _wasStarting) setState(() => _wasStarting = _starting);
+  }
+
+  /// Around the chat: has the focus while anything in it does, and sees
+  /// the keys it lets through (see [ChatKeys.dispatch]).
+  final FocusNode _keyScope = FocusNode(
+    debugLabel: 'Chat',
+    canRequestFocus: false,
+    skipTraversal: true,
+  );
+
+  /// The subagents opened, one in the other, innermost last: each shows
+  /// over the conversation under it. One going back stays until it is out.
+  final List<_AgentLayer> _layers = [];
+
+  /// The subagent shown, if any (not one on its way out).
+  _AgentLayer? get _agentShown =>
+      _layers.lastOrNull?.leaving == false ? _layers.last : null;
+
+  static const _layerDuration = ConversationLayer.duration;
+
+  /// The subagents left open when this conversation last showed, as they
+  /// were: no way in to play again.
+  void _restoreAgents() {
+    final path = _session.openAgents;
+    for (var depth = 1; depth <= path.length; depth++) {
+      final feed = SubagentFeed(_session, path.sublist(0, depth));
+      // Gone since (its turn rewound): open no further in.
+      if (feed.agent == null) {
+        feed.dispose();
+        _session.openAgents = path.sublist(0, depth - 1);
+        return;
+      }
+      _layers.add(
+        _AgentLayer(
+          feed,
+          AnimationController(vsync: this, duration: _layerDuration, value: 1),
+        ),
+      );
+    }
+    // Where Esc goes back from, as when it was opened.
+    if (_layers.lastOrNull case final top?) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) top.backFocus.requestFocus();
+      });
+    }
+  }
+
+  void _setGoal(String condition) => _session.setGoal(condition);
+
+  /// Opens [agent], a card in the conversation shown; or at [path] (see
+  /// [SubagentFeed.path]), wherever it is.
+  void _openAgent(AgentItem agent, {List<String>? path}) {
+    final id = agent.id;
+    if (id == null) return;
+    path ??= [...?_agentShown?.feed.path, id];
+    // Elsewhere than the way back came from: forward goes nowhere.
+    if (!_startsWith(_leftAgents ?? const [], path)) _leftAgents = null;
+    _enter(SubagentFeed(_session, path));
+  }
+
+  void _enter(SubagentFeed feed) {
+    final layer = _AgentLayer(
+      feed,
+      AnimationController(vsync: this, duration: _layerDuration),
+    );
+    setState(() => _layers.add(layer));
+    _session.openAgents = layer.feed.path;
+    layer.controller.forward();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) layer.backFocus.requestFocus();
+    });
+  }
+
+  /// Goes back to [depth] subagents in (0: the conversation itself); one
+  /// level up without it. The innermost slides out; those between go at once.
+  void _back([int? depth]) {
+    final shown = _layers.where((layer) => !layer.leaving).length;
+    final keep = depth ?? shown - 1;
+    if (keep < 0 || keep >= shown) return;
+    final top = _layers.last;
+    final between = _layers.sublist(keep, _layers.length - 1);
+    if (!_startsWith(_leftAgents ?? const [], top.feed.path)) {
+      _leftAgents = top.feed.path;
+    }
+    setState(() {
+      _layers.removeRange(keep, _layers.length - 1);
+      top.leaving = true;
+    });
+    _session.openAgents = keep == 0 ? const [] : _layers[keep - 1].feed.path;
+    for (final layer in between) {
+      layer.dispose();
+    }
+    top.controller.reverse().whenComplete(() {
+      if (!mounted) return;
+      setState(() => _layers.remove(top));
+      top.dispose();
+    });
+    if (keep == 0) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _composerKey.currentState?.focus();
+      });
+    } else {
+      _layers[keep - 1].backFocus.requestFocus();
+    }
+  }
+
+  /// The subagent gone back from, the innermost of those since: where the
+  /// mouse's forward button goes in again, a level at a time.
+  List<String>? _leftAgents;
+
+  static bool _startsWith(List<String> path, List<String> start) {
+    if (path.length < start.length) return false;
+    for (var i = 0; i < start.length; i++) {
+      if (path[i] != start[i]) return false;
+    }
+    return true;
+  }
+
+  /// The mouse's back button: out of the subagent shown, or of the
+  /// conversation asked beside another ([ChatScreen.back]).
+  bool _mouseBack() {
+    if (_agentShown != null) {
+      _back();
+      return true;
+    }
+    if (widget.back case final back?) {
+      back.onBack();
+      return true;
+    }
+    return false;
+  }
+
+  /// The mouse's forward button: into the subagent gone back from.
+  bool _mouseForward() {
+    final left = _leftAgents;
+    final shown = _agentShown?.feed.path ?? const <String>[];
+    if (left == null || left.length <= shown.length) return false;
+    if (!_startsWith(left, shown)) return false;
+    final feed = SubagentFeed(_session, left.sublist(0, shown.length + 1));
+    // Gone since (its turn rewound).
+    if (feed.agent == null) {
+      feed.dispose();
+      _leftAgents = null;
+      return false;
+    }
+    _enter(feed);
+    return true;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _session.attach();
+    _session.addListener(_checkStarting);
+    _planShown = _session.plan?.seq;
+    _session.addListener(_followPlan);
+    _session.addListener(_welcomeToModels);
+    _restoreAgents();
+    ChatWidth.current.addListener(_widthChanged);
+    ChatMinimap.enabled.addListener(_widthChanged);
+    if (widget.autofocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _composerKey.currentState?.focus();
+      });
+    }
+  }
+
+  @override
+  void didUpdateWidget(ChatScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _wasStarting = _starting;
+  }
+
+  @override
+  void dispose() {
+    _backMinimapRoom.dispose();
+    _session.removeListener(_checkStarting);
+    _session.removeListener(_followPlan);
+    _session.removeListener(_welcomeToModels);
+    ChatWidth.current.removeListener(_widthChanged);
+    ChatMinimap.enabled.removeListener(_widthChanged);
+    _existence?.dispose();
+    _keyScope.dispose();
+    for (final layer in _layers) {
+      layer.dispose();
+    }
+    _session.detach();
+    if (widget.session == null) _session.dispose();
+    super.dispose();
+  }
+
+  void _toggleContextPanel() {
+    setState(() => _contextPanelOpen = !_contextPanelOpen);
+    if (_contextPanelOpen) _session.refreshUsage();
+  }
+
+  void _answer(InteractionAnswer answer) {
+    _session.answer(answer);
+    _composerKey.currentState?.focus();
+  }
+
+  /// The sequence of the plan writing last shown.
+  int? _planShown;
+
+  /// Shows the plan beside the chat as the agent writes it: the file read
+  /// anew each time.
+  void _followPlan() {
+    if (_session.plan case final plan? when plan.seq != _planShown) {
+      _planShown = plan.seq;
+      _openFile(FileOpenRequest(plan.path, plan: true));
+    }
+  }
+
+  /// Whether the welcome to models waits for the channel build's setup.
+  bool _awaitingSetup = false;
+
+  /// No model to run on, the first time for the app: what setting one up
+  /// is, by itself; after that, from the banner and the model's pill. The
+  /// channel build's setup first (lib/channel/).
+  void _welcomeToModels() {
+    // The channel build's model is its account's: no setting one up.
+    if (ChannelSetup.channelBuild) return;
+    if (!_session.health.noModel || ModelWelcome.welcomed) return;
+    if (ChannelSetup.current case final setup? when !setup.done) {
+      if (_awaitingSetup) return;
+      _awaitingSetup = true;
+      // Once its welcome closed, with Get Started.
+      unawaited(
+        setup.started.then((_) {
+          if (mounted) _welcomeToModels();
+        }),
+      );
+      return;
+    }
+    ModelWelcome.welcomed = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(showModelWelcome(context));
+    });
+  }
+
+  // --- Keys ------------------------------------------------------------------
+
+  /// The input, back from the subagents shown (they have none).
+  void _focusInput() {
+    if (_agentShown != null) {
+      _back(0);
+    } else {
+      _composerKey.currentState?.focus();
+    }
+  }
+
+  /// The conversation shown, for its keys to scroll it.
+  void _focusList() =>
+      ChatHistoryView.focus(_agentShown?.historyKey ?? _historyKey);
+
+  /// The find bar over the conversation shown.
+  void _findIn({String? query}) => ChatHistoryView.find(
+    _agentShown?.historyKey ?? _historyKey,
+    query: query,
+  );
+
+  bool get _renames => widget.onRename != null && !widget.embedded;
+
+  @override
+  Object? chatContextKey(String key) => switch (key) {
+    ChatContextKeys.inChat => _keyScope.hasFocus,
+    ChatContextKeys.requestInProgress => _session.isStreaming,
+    ChatContextKeys.hasToolConfirmation =>
+      _session.pendingInteraction is ApprovalRequest,
+    ChatContextKeys.subagentVisible => _agentShown != null,
+    ChatContextKeys.asideVisible => widget.back != null && _agentShown == null,
+    _ => null,
+  };
+
+  @override
+  Map<String, VoidCallback> get chatCommands => {
+    ChatCommandIds.focusInput: _focusInput,
+    ChatCommandIds.focusList: _focusList,
+    ChatCommandIds.find: _findIn,
+    if (_session.isStreaming)
+      ChatCommandIds.cancel: () => stopTurn(context, _session),
+    if (_session.pendingInteraction is ApprovalRequest) ...{
+      ChatCommandIds.acceptTool: () =>
+          _answer(const ApprovalAnswer(ApprovalDecision.allowOnce)),
+      ChatCommandIds.skipTool: () =>
+          _answer(const ApprovalAnswer(ApprovalDecision.deny)),
+    },
+    ChatCommandIds.toggleContextPanel: _toggleContextPanel,
+    if (_renames)
+      ChatCommandIds.renameAgent: () => setState(() => _renaming = true),
+    if (_agentShown != null)
+      ChatCommandIds.closeSubagent: _back
+    else if (widget.back case final back?)
+      ChatCommandIds.closeSubagent: back.onBack,
+  };
+
+  /// The session's title, renamed in place by a double click; its
+  /// [ChatScreen.subtitle] after it, or [ChatScreen.titleTabs] instead.
+  Widget _buildTitle() {
+    final style = TextStyle(
+      color: widget.focused ? AppColors.textMuted : AppColors.textFaint,
+      fontSize: 12.5,
+      fontWeight: FontWeight.w500,
+    );
+    final onRename = widget.onRename;
+    Widget title;
+    if (_renaming && onRename != null) {
+      title = SizedBox(
+        width: 320,
+        child: InlineRenameField(
+          initial: widget.title,
+          style: style.copyWith(color: AppColors.textPrimary),
+          // What was asked, to title it after instead.
+          suggestions: askedTitles(_session),
+          onSummarize: widget.onSummarizeTitle,
+          onDone: (text) {
+            if (text != null) onRename(text);
+            setState(() => _renaming = false);
+          },
+        ),
+      );
+    } else {
+      title = GestureDetector(
+        onDoubleTap: onRename == null
+            ? null
+            : () => setState(() => _renaming = true),
+        // Too long for the bar: scrolled to the rest while hovered.
+        child: HoverScrollText(widget.title, style: style),
+      );
+      // A pane's title drags the pane; the chat's alone, the window, as the
+      // system's title does: a long one leaves little of the bar empty.
+      title =
+          widget.titleDragBuilder?.call(title) ??
+          (widget.windowTitleBar ? TitleBarDragHandle(child: title) : title);
+    }
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: switch (widget.subtitle) {
+        _ when !_renaming && widget.titleTabs != null => widget.titleTabs!,
+        final subtitle? when !_renaming => LayoutBuilder(
+          builder: (context, constraints) => Row(
+            children: [
+              Flexible(child: title),
+              const SizedBox(width: 8),
+              // Its own width, up to some of the bar's: the title has the
+              // rest.
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: math.min(220, constraints.maxWidth * .4),
+                ),
+                child: subtitle,
+              ),
+            ],
+          ),
+        ),
+        _ => title,
+      },
+    );
+  }
+
+  /// The row along the top, on the window's color: the traffic lights'
+  /// (macOS draws a title bar of its own over it; see AppMetrics), with
+  /// [ChatScreen.leading] and [ChatScreen.trailing]; the title too where
+  /// it is not on a card ([title]), and [ChatScreen.cardTrailing] then.
+  Widget _buildTitleBar({required bool title}) {
+    final inset = widget.titleBarInset ?? AppMetrics.trafficLightsWidth + 12;
+    final buttons = [
+      if (title) ...[?widget.cardLeading, ?widget.cardTrailing],
+      ?widget.trailing,
+    ];
+    final trailing = switch (buttons) {
+      [] => null,
+      [final one] => one,
+      _ => Row(mainAxisSize: MainAxisSize.min, children: buttons),
+    };
+    final bar = SizedBox(
+      height: AppMetrics.titleBarHeight,
+      child: CustomMultiChildLayout(
+        delegate: _TitleBarLayout(inset: inset, end: widget.titleBarEnd),
+        children: [
+          if (widget.leading case final leading?)
+            LayoutId(id: _TitleBarSlot.leading, child: leading),
+          LayoutId(
+            id: _TitleBarSlot.title,
+            // The title at the bar's start, as the row macOS draws has it
+            // (Windows draws none of it: see window_header/).
+            child: title ? _buildTitle() : const SizedBox.shrink(),
+          ),
+          if (trailing != null)
+            LayoutId(
+              id: _TitleBarSlot.trailing,
+              child: TitleBarControls(child: trailing),
+            ),
+        ],
+      ),
+    );
+    // Beside the title (a double click renames it) and the buttons, a
+    // double click does what one on the system's title bar does. A pane
+    // drags by its title: from here only where the title is.
+    return TitleBarDoubleClick(
+      windowTitleBar: widget.windowTitleBar,
+      onDragStart: title && !_renaming ? widget.onTitleDragStart : null,
+      // Beside the traffic lights it is the window's, panes side by side or
+      // not: with the sidebar hidden, nothing else along the top is.
+      windowStart: inset >= AppMetrics.trafficLightsWidth ? inset : 0,
+      child: bar,
+    );
+  }
+
+  /// On its card, the row along its top: the title, then
+  /// [ChatScreen.cardTrailing]; where the window draws no title bar of its
+  /// own (under Windows' header), [ChatScreen.leading] before them and
+  /// [ChatScreen.trailing] after, there being no row over the card.
+  Widget _buildCardHeader() {
+    final window = !WindowControls.drawsHeader;
+    final start = widget.cardButtonsAtStart && widget.cardTrailing != null;
+    final leading = [
+      if (!window) ?widget.leading,
+      if (start) ?widget.cardTrailing,
+      ?widget.cardLeading,
+    ];
+    final trailing = [
+      if (!start) ?widget.cardTrailing,
+      if (!window) ?widget.trailing,
+    ];
+    // The title bar's ways all the same: a press drags the window (a
+    // pane's, the pane), a double click does what the system's does.
+    return TitleBarDoubleClick(
+      windowTitleBar: widget.windowTitleBar,
+      onDragStart: _renaming ? null : widget.onTitleDragStart,
+      child: SizedBox(
+        height: ChatScreen.cardHeaderHeight,
+        child: Padding(
+          // Its buttons first, their left edge on the rail's at the left.
+          padding: EdgeInsets.only(
+            left: start && window ? ChatScreen.cardHeaderEnd : Islands.inset,
+            right: ChatScreen.cardHeaderEnd,
+          ),
+          child: Row(
+            children: [
+              if (leading.isNotEmpty) ...[
+                TitleBarControls(
+                  child: Row(mainAxisSize: MainAxisSize.min, children: leading),
+                ),
+                const SizedBox(width: 4),
+              ],
+              Expanded(child: _buildTitle()),
+              if (trailing.isNotEmpty) ...[
+                const SizedBox(width: 6),
+                TitleBarControls(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: trailing,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget? _buildActivityStrip() {
+    final tasks = _session.tasks ?? const [];
+    final changes = _session.fileChanges;
+    if (!ActivityStrip.hasContent(tasks, changes)) return null;
+    final links = widget.fileLinks;
+    final open = links == null
+        ? widget.onOpenChange
+        : (FileChange change, Future<String> Function()? original) => _openFile(
+            FileOpenRequest(
+              change.path,
+              diff: true,
+              change: change,
+              original: original,
+            ),
+          );
+    return ActivityStrip(
+      tasks: tasks,
+      changes: changes,
+      root: _session.root ?? '.',
+      paths: _session.paths,
+      onKeep: _session.keepAllChanges,
+      onUndo: _session.undoAllChanges,
+      onKeepFiles: _session.keepChanges,
+      onUndoFiles: _session.undoChanges,
+      onOpenFile: open == null
+          ? null
+          : (change) => open(change, _session.originalOf(change)),
+      fileActions: _fileActions,
+      onStopTask: _session.stopTask,
+      canOpenTask: (task) => task.kind == KernelTaskKind.command
+          ? widget.onOpenTerminalTask != null
+          : _session.agentOf(task) != null,
+      onOpenTask: (task) {
+        if (task.kind == KernelTaskKind.command) {
+          widget.onOpenTerminalTask?.call(task);
+        } else if (_session.agentOf(task) case (:final agent, :final path)) {
+          // One a subagent started opens where it is, within that one's.
+          _openAgent(agent, path: path);
+        }
+      },
+      // A subagent's last step, as its card has it.
+      detailOf: (task) => switch (_session.agentOf(task)) {
+        (:final agent, path: _) => AgentStep.latest(agent, l10n: context.l10n),
+        null => null,
+      },
+    );
+  }
+
+  /// The kernel's commands as suggestions, kept while its list is the same.
+  List<Suggestion> _commandSuggestions() {
+    final commands = _session.commands;
+    if (!identical(commands, _commandSource)) {
+      _commandSource = commands;
+      final aside = widget.onSideQuestion != null;
+      final fork = widget.onFork != null;
+      _commands = [
+        // Taken here, not by the agent: a conversation beside this one
+        // (see [ChatScreen.onSideQuestion]), in place of the CLI's own.
+        if (aside)
+          Suggestion(
+            kind: SuggestionKind.command,
+            label: _asideCommand,
+            detail: context.l10n.btwCommandDetail,
+            icon: Codicons.commentDiscussion,
+          ),
+        // And a copy of this one (see [ChatScreen.onFork]).
+        if (fork)
+          Suggestion(
+            kind: SuggestionKind.command,
+            label: _forkCommand,
+            detail: context.l10n.forkCommandDetail,
+            icon: Codicons.repoForked,
+          ),
+        for (final command in commands)
+          if ((!aside || command.name != _asideCommand) &&
+              (!fork || command.name != _forkCommand))
+            Suggestion(
+              kind: SuggestionKind.command,
+              label: command.name,
+              detail: command.argumentHint.isEmpty
+                  ? command.description
+                  : '${command.argumentHint}  ${command.description}',
+              icon: command.icon,
+            ),
+      ];
+    }
+    return _commands;
+  }
+
+  static const _asideCommand = 'btw';
+
+  /// Takes `/btw …` for a conversation beside this one: true when it was
+  /// one. What follows, on this line or the next, is asked there with the
+  /// message's images and mentions; `/btw` alone asks nothing.
+  bool _interceptSideQuestion(ComposerMessage message) {
+    final handler = widget.onSideQuestion;
+    if (handler == null) return false;
+    final text = message.text.trimLeft();
+    if (!text.startsWith(RegExp('^/$_asideCommand(\\s|\$)'))) return false;
+    final question = ComposerMessage(
+      text: text.substring(_asideCommand.length + 1).trim(),
+      mentions: message.mentions,
+      images: message.images,
+    );
+    if (!question.isEmpty) handler(question);
+    return true;
+  }
+
+  static const _forkCommand = 'fork';
+
+  /// Takes `/fork …` for a copy of this conversation: true when it was one.
+  /// What follows, with the message's images and mentions, is sent there.
+  bool _interceptFork(ComposerMessage message) {
+    final handler = widget.onFork;
+    if (handler == null) return false;
+    final text = message.text.trimLeft();
+    if (!text.startsWith(RegExp('^/$_forkCommand(\\s|\$)'))) return false;
+    handler(
+      ComposerMessage(
+        text: text.substring(_forkCommand.length + 1).trim(),
+        mentions: message.mentions,
+        images: message.images,
+      ),
+    );
+    return true;
+  }
+
+  bool _intercept(ComposerMessage message) =>
+      _interceptSideQuestion(message) || _interceptFork(message);
+
+  List<KernelCommand>? _commandSource;
+  List<Suggestion> _commands = const [];
+
+  /// [ChatScreen.commandFile]'s answers, asked once each while the
+  /// kernel's commands are the same.
+  final Map<String, Future<String?>> _commandFiles = {};
+  List<KernelCommand>? _commandFilesOf;
+
+  String? _describeCommand(String name) {
+    for (final command in _session.commands) {
+      if (command.name != name) continue;
+      if (command.argumentHint.isEmpty) return command.description;
+      return '${command.argumentHint}  ${command.description}';
+    }
+    return null;
+  }
+
+  Future<String?> _commandFile(String name) {
+    final find = widget.commandFile;
+    if (find == null || widget.fileLinks == null) return Future.value();
+    if (!identical(_session.commands, _commandFilesOf)) {
+      _commandFilesOf = _session.commands;
+      _commandFiles.clear();
+    }
+    return _commandFiles[name] ??= () async {
+      try {
+        return await find(name);
+      } on Object {
+        return null;
+      }
+    }();
+  }
+
+  void _openCommandFile(String path) => _openFile(FileOpenRequest(path));
+
+  /// Which files the conversation's inline code names exist, asked once
+  /// each (see [FileOpenScope]).
+  FileExistence? _existence;
+  FileExistence get _files => _existence ??= FileExistence(
+    (path) => widget.fileLinks?.exists?.call(path) ?? Future.value(false),
+  );
+
+  /// Opens [request] where [ChatScreen.fileLinks] says: a file's changes
+  /// with what the session knows of them.
+  void _openFile(FileOpenRequest request) {
+    final links = widget.fileLinks;
+    if (links == null) return;
+    var opened = request;
+    if (request.diff && request.change == null) {
+      for (final change in _session.fileChanges) {
+        if (change.path == request.path) {
+          opened = request.copyWith(
+            change: change,
+            original: _session.originalOf(change),
+          );
+          break;
+        }
+      }
+    }
+    links.open(opened);
+  }
+
+  void _openCode(String path, int start, int end) =>
+      _openFile(FileOpenRequest(path, range: FileLineRange(start, end)));
+
+  /// What else a changed file's menu offers: the file itself opened, not
+  /// its changes; on this machine, in the browser, its default app or an
+  /// editor, shown in the file manager; its path copied.
+  List<List<IdeMenuEntry>> _fileActions(FileChange change) {
+    final l10n = context.l10n;
+    final path = change.path;
+    final local = switch (_session.kernelContext.cwd) {
+      final cwd? => !RemoteLocation.isRemote(cwd),
+      null => true,
+    };
+    final deleted = change.kind == FileChangeKind.deleted;
+    final extension = _session.paths.extension(path).toLowerCase();
+    final editors = [
+      for (final editor in Editor.availableEditors)
+        if (!editor.builtIn &&
+            editor != Editor.folder &&
+            editor != Editor.terminal)
+          editor,
+    ];
+    return [
+      [
+        if (widget.fileLinks != null && !deleted)
+          IdeMenuAction(
+            l10n.scmOpenFile,
+            onSelected: () => _openFile(FileOpenRequest(path)),
+          ),
+        if (local && !deleted && !kIsWeb) ...[
+          if (extension == '.html' || extension == '.htm')
+            IdeMenuAction(
+              l10n.fileLinkOpenInBrowser,
+              onSelected: () => unawaited(openExternal(path)),
+            ),
+          if (WindowControls.canOpenInDefaultApp)
+            IdeMenuAction(
+              l10n.openInDefaultApp,
+              onSelected: () => unawaited(openExternal(path)),
+            ),
+          IdeMenuAction(
+            l10n.changeOpenWith,
+            submenu: [
+              for (final editor in editors)
+                IdeMenuAction(
+                  editor.localizedPlatformLabel(l10n),
+                  onSelected: () => unawaited(openInEditor(editor, path)),
+                ),
+            ],
+          ),
+        ],
+      ],
+      [
+        IdeMenuAction(
+          l10n.tabCopyPath,
+          onSelected: () =>
+              unawaited(Clipboard.setData(ClipboardData(text: path))),
+        ),
+        if (local && !deleted && WindowControls.canRevealInFileManager)
+          IdeMenuAction(
+            l10n.revealInFileManager,
+            onSelected: () =>
+                unawaited(WindowControls.revealInFileManager(path)),
+          ),
+      ],
+    ];
+  }
+
+  /// The files `@` offers: [ChatScreen.fileMentions]' with the kernel's, or
+  /// the kernel's alone; null when neither looks.
+  Future<List<Suggestion>> Function(String query)? _suggestFiles(String? root) {
+    final kernel = _session.suggestFiles;
+    if (widget.fileMentions case final mentions?) {
+      return (query) => mentions.suggest(query, root: root, kernel: kernel);
+    }
+    if (kernel == null) return null;
+    return (query) async => [...(await kernel(query)).map(fileSuggestion)];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final links = widget.fileLinks;
+    return ListenableBuilder(
+      listenable: _session,
+      builder: (context, child) {
+        final root = _session.root;
+        Widget scoped = CodeCitationScope(
+          root: root,
+          // A method's, the same with every change of the session's: a new
+          // one would build every code block in the conversation again.
+          onOpen: links == null ? widget.onOpenCode : _openCode,
+          colorize: widget.colorizeCode,
+          colorizeBlock: widget.colorizeCodeBlock,
+          syntax: widget.codeSyntax,
+          child: ComposerVocabulary(
+            commands: _commandSuggestions(),
+            suggestFiles: _suggestFiles(root),
+            sessions: widget.sessions,
+            // The stashes, after the files (see docs/stash.md).
+            stashes: switch (StashStore.current) {
+              final store? => () => stashSuggestions(
+                store,
+                context.l10n.stashHeading,
+              ),
+              null => null,
+            },
+            stash: switch (StashStore.current) {
+              final store? => (id) => switch (store.byId(id)) {
+                final note? => stashReferenceOf(store, note),
+                null => null,
+              },
+              null => null,
+            },
+            child: child!,
+          ),
+        );
+        if (links != null && root != null) {
+          scoped = FileOpenScope(
+            root: root,
+            paths: links.paths,
+            onOpen: _openFile,
+            existence: _files,
+            readBytes: links.readBytes,
+            sizeOf: links.sizeOf,
+            inPanel: links.inPanel,
+            onOpenInIde: links.openInIde,
+            onOpenFolder: links.openFolder,
+            roots: links.roots?.call() ?? const [],
+            seen: _session.filesSeen,
+            home: links.home?.call(),
+            local: switch (_session.kernelContext.cwd) {
+              final cwd? => !RemoteLocation.isRemote(cwd),
+              null => true,
+            },
+            host: switch (_session.kernelContext.cwd) {
+              final cwd? => RemoteLocation.hostOf(cwd),
+              null => null,
+            },
+            existsHere: links.existsHere,
+            openOnHost: links.openOnHost,
+            child: scoped,
+          );
+        }
+        scoped = CommandDetails(
+          // Methods: the same each build.
+          describe: _describeCommand,
+          fileOf: _commandFile,
+          open: _openCommandFile,
+          child: scoped,
+        );
+        return PlanStartScope(session: _session, child: scoped);
+      },
+      child: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    // The keys the focus in it lets through: the chat's keybindings.
+    return MouseNavigation(
+      onBack: _mouseBack,
+      onForward: _mouseForward,
+      child: Focus(
+        focusNode: _keyScope,
+        // Never focused itself: nothing for assistive technologies.
+        includeSemantics: false,
+        onKeyEvent: (node, event) =>
+            ChatKeys.dispatch(event) ?? KeyEventResult.ignored,
+        child: _buildScaffold(),
+      ),
+    );
+  }
+
+  /// Whether it shows its title: in a row over it, or along its card's top
+  /// ([_buildCardHeader]).
+  bool get _titled => !widget.embedded && (widget.titleBar || _renaming);
+
+  Widget _buildScaffold() {
+    final island = widget.island;
+    final conversation = _buildConversation();
+    final footer = _footer;
+    final titled = _titled;
+    return Scaffold(
+      // The window's color about the card, or the card's it is on (the
+      // IDE's, a card or not): none of its own.
+      backgroundColor: island == null && !IslandSurface.on(context)
+          ? null
+          : Colors.transparent,
+      body: Column(
+        children: [
+          // The row the window's header leaves it (macOS draws a title bar
+          // of its own over it; see AppMetrics): its title there, but on a
+          // card, which has it along its top. Under Windows' header, none
+          // over a card.
+          if (titled &&
+              (island == null ||
+                  !WindowControls.drawsHeader && widget.rowOverCard))
+            _buildTitleBar(title: island == null),
+          // Its card even with no row under it (the terminal's then).
+          if (island == null && footer == 0)
+            ...conversation
+          else ...[
+            Expanded(
+              child: island == null
+                  ? Column(children: conversation)
+                  : Island(
+                      color: island,
+                      borderColor: widget.islandBorder,
+                      child: Column(
+                        children: [
+                          if (titled) _buildCardHeader(),
+                          ...conversation,
+                        ],
+                      ),
+                    ),
+            ),
+            if (footer > 0)
+              // Under the card, at the composer's width: the row there with
+              // nothing in it too, the card's foot where the side panel's is.
+              // What the place it is in has after it (the IDE's status
+              // bar's right items) is told how wide it is.
+              SizedBox(
+                height: footer,
+                child: _ConversationColumn(
+                  maxWidth: _maxContentWidth,
+                  minimap: false,
+                  inset: Islands.inset,
+                  bottom: 0,
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: IslandFootTrailing.leading(context, _buildFoot()),
+                  ),
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// The row under the card: [ChatScreen.below] (where the agent works),
+  /// and how full the context is, at the row's end; right after the other
+  /// where the row has more after it (the IDE's status bar's items).
+  Widget _buildFoot() {
+    final below = _agentShown == null ? widget.below : null;
+    final meter = _agentShown == null
+        ? ListenableBuilder(
+            listenable: _session,
+            builder: (context, _) => switch (_session.context) {
+              final usage? => ContextMeter(
+                usage: usage,
+                active: _contextPanelOpen,
+                labeled: true,
+                tooltip: ChatKeys.titleWithKey(
+                  context.l10n.composerContextUsage,
+                  ChatCommandIds.toggleContextPanel,
+                  const {ChatContextKeys.inChat: true},
+                ),
+                onTap: _toggleContextPanel,
+              ),
+              null => const SizedBox.shrink(),
+            },
+          )
+        : null;
+    if (IslandFootTrailing.hosts(context)) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (below != null) Flexible(child: below),
+          ?meter,
+        ],
+      );
+    }
+    return Row(
+      children: [
+        Expanded(
+          child: Align(alignment: Alignment.centerLeft, child: below),
+        ),
+        ?meter,
+      ],
+    );
+  }
+
+  /// Whether the context's meter is in the row under the card (or on it,
+  /// [_footOnCard]), not in the composer.
+  bool get _meterInFoot => _footer > 0 || _footOnCard;
+
+  /// Whether the row under the card is on it, under the composer (see
+  /// [ChatScreen.footOnCard]): not where what is around it shows it.
+  bool get _footOnCard =>
+      widget.footOnCard &&
+      widget.island != null &&
+      !IslandFootHosted.of(context);
+
+  /// Whether it is on a card: its own ([ChatScreen.island]), or the one
+  /// it is put on (the IDE's, see [IslandSurface]).
+  bool get _onCard =>
+      widget.island != null || IslandSurface.colorOf(context) != null;
+
+  /// The row under the card, on the window's color: its own card's, or the
+  /// one it is on's (the IDE's), if that leaves one; else 0, [ChatScreen.below]
+  /// under the input.
+  double get _footer => IslandFootHosted.of(context) || _footOnCard
+      ? 0
+      : widget.island != null
+      ? Islands.belowHeight
+      : IslandSurface.footerOf(context);
+
+  /// The history over the panels and the input, as a column's children.
+  List<Widget> _buildConversation() {
+    return [
+      // Esc goes back from a subagent: a keybinding of the chat's
+      // (closeSubagent).
+      Expanded(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            ConversationLayer(
+              entrance: kAlwaysCompleteAnimation,
+              cover: _layers.firstOrNull?.animation,
+              interactive: _agentShown == null,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  _withBack(
+                    ChatHistoryView(
+                      key: _historyKey,
+                      feed: _session,
+                      // Under its card's title, or a subagent's header.
+                      underTitle:
+                          widget.back != null ||
+                          (_titled && widget.island != null),
+                      maxContentWidth: _maxContentWidth,
+                      minimap: _minimap,
+                      minimapRoom: widget.back == null
+                          ? null
+                          : _backMinimapRoom,
+                      onOpenAgent: _openAgent,
+                      onSetGoal: _setGoal,
+                      onFindClosed: () => _composerKey.currentState?.focus(),
+                      after: switch (widget.asideAt) {
+                        final asideAt? => (index) => switch (_session.itemIdAt(
+                          index,
+                        )) {
+                          final id? => asideAt(id),
+                          null => null,
+                        },
+                        null => null,
+                      },
+                    ),
+                  ),
+                  // The start hint, before the first message.
+                  ListenableBuilder(
+                    listenable: _session,
+                    builder: (context, _) => switch (widget.startHint) {
+                      _ when _session.itemCount != 0 => const SizedBox.shrink(),
+                      final build? when _starting => Align(
+                        alignment: Alignment.bottomCenter,
+                        child: SingleChildScrollView(
+                          // No minimap yet: nothing to scroll.
+                          child: _ConversationColumn(
+                            maxWidth: _maxContentWidth,
+                            minimap: false,
+                            child: build(context, const SizedBox.shrink()),
+                          ),
+                        ),
+                      ),
+                      _ => const SizedBox.shrink(),
+                    },
+                  ),
+                  // An earlier conversation still being read (from a
+                  // remote host it may take a while).
+                  ListenableBuilder(
+                    listenable: _session,
+                    builder: (context, _) =>
+                        _session.loadingHistory && _session.itemCount == 0
+                        ? const _HistoryLoading()
+                        : const SizedBox.shrink(),
+                  ),
+                ],
+              ),
+            ),
+            for (final (i, layer) in _layers.indexed)
+              ConversationLayer(
+                key: ObjectKey(layer),
+                entrance: layer.animation,
+                cover: _layers.elementAtOrNull(i + 1)?.animation,
+                interactive: identical(layer, _agentShown),
+                child: _buildAgentPage(i, layer),
+              ),
+          ],
+        ),
+      ),
+      ListenableBuilder(
+        listenable: _session,
+        // In the middle as the history's text is, laid out (not built)
+        // for the width: a pane being resized does not build the
+        // composer anew. The minimap stays beside the history, over
+        // it: no room left for it here.
+        builder: (context, _) => _ConversationColumn(
+          maxWidth: _maxContentWidth,
+          minimap: false,
+          // On a card, as far from its sides as from its foot; the row
+          // under it (the IDE's) closer.
+          inset: _onCard ? Islands.inset : null,
+          bottom: !_onCard
+              ? 12
+              : _footOnCard
+              ? 0
+              : _footer == 0 &&
+                    widget.below != null &&
+                    !IslandFootHosted.of(context)
+              ? 4
+              : Islands.inset,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _PanelSlot(
+                child: HealthBanner.shows(_session.health)
+                    ? HealthBanner(
+                        health: _session.health,
+                        kernelName: _session.kernel.label,
+                        onRetry: _session.restart,
+                        onSetUpModel: () =>
+                            unawaited(showModelWelcome(context)),
+                      )
+                    : null,
+              ),
+              // A remote project's host out of reach: said once, by the
+              // banner above when the agent failed on it.
+              if (!HealthBanner.shows(_session.health))
+                SshHostBanner(location: _session.kernelContext.cwd),
+              // Claude Code being downloaded for this machine, or put on
+              // a remote project's host.
+              ClaudeInstallBanner(location: _session.kernelContext.cwd),
+              // Reset credits of the model's ChatGPT accounts about to
+              // expire: a plan to use them.
+              ResetCreditsHint(model: _session.models?.selected.id),
+              _PanelSlot(
+                child: switch (_session.pendingInteraction) {
+                  final request? => InteractionPanel(
+                    key: ObjectKey(request),
+                    request: request,
+                    onAnswer: _answer,
+                  ),
+                  null => null,
+                },
+              ),
+              if (widget.start case final start? when _starting)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: start,
+                ),
+              // A subagent's conversation takes no messages.
+              _BottomSwitcher(
+                child: _agentShown == null
+                    ? _buildDock()
+                    : const SizedBox.shrink(key: ValueKey('none')),
+              ),
+            ],
+          ),
+        ),
+      ),
+      // As much room under it as over it.
+      if (_wasStarting) const Spacer(),
+    ];
+  }
+
+  /// The subagent [layer], [index] in: the way here, and its conversation.
+  /// Whether the history keeps the minimap's room, for the way back over
+  /// it (see [ChatScreen.back]) to be level with it.
+  final ValueNotifier<bool> _backMinimapRoom = ValueNotifier(false);
+
+  /// [history] under the way back to the conversation this one was asked
+  /// beside, as a subagent's is under its own (see [ChatScreen.back]).
+  Widget _withBack(Widget history) {
+    final back = widget.back;
+    if (back == null) return history;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        ValueListenableBuilder(
+          valueListenable: _backMinimapRoom,
+          builder: (context, room, _) => SubagentHeader(
+            trail: const [],
+            backText: back.label,
+            onBack: (_) => back.onBack(),
+            maxContentWidth: _maxContentWidth,
+            minimap: room,
+          ),
+        ),
+        Expanded(child: history),
+      ],
+    );
+  }
+
+  Widget _buildAgentPage(int index, _AgentLayer layer) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        ListenableBuilder(
+          listenable: Listenable.merge([_session, layer.minimapRoom]),
+          builder: (context, _) => SubagentHeader(
+            trail: [
+              for (final open in _layers.take(index + 1))
+                open.feed.agent?.description ?? context.l10n.chatSubagent,
+            ],
+            onBack: _back,
+            backFocusNode: layer.backFocus,
+            maxContentWidth: _maxContentWidth,
+            // Level with the history's column.
+            minimap: layer.minimapRoom.value,
+          ),
+        ),
+        Expanded(
+          child: ChatHistoryView(
+            key: layer.historyKey,
+            feed: layer.feed,
+            underTitle: true,
+            maxContentWidth: _maxContentWidth,
+            minimap: _minimap,
+            minimapRoom: layer.minimapRoom,
+            onOpenAgent: _openAgent,
+            onSetGoal: _setGoal,
+            onFindClosed: layer.backFocus.requestFocus,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The usage limit the agent stopped at, while it holds and the agent is
+  /// to go on once it resets: when. Nothing with the setting off.
+  Widget? _buildLimitPanel() {
+    final (at, id) = (_session.usageLimitResetsAt, _session.sessionId);
+    if (at == null || id == null) return null;
+    final resumes = ResumeAfterReset.current;
+    if (!resumes.enabled || resumes[id] == null) return null;
+    return LimitResetPanel(key: ValueKey(('limit', id)), resetsAt: at);
+  }
+
+  /// Under the session's own conversation: its panels and the composer.
+  Widget _buildDock() {
+    return Column(
+      key: const ValueKey('dock'),
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Before all: the agent stopped, till the usage limit resets.
+        ListenableBuilder(
+          listenable: ResumeAfterReset.current,
+          builder: (context, _) => _PanelSlot(child: _buildLimitPanel()),
+        ),
+        // First: what all the rest works toward.
+        _PanelSlot(
+          child: switch (_session.goal) {
+            final goal? => GoalPanel(
+              goal: goal,
+              activity: switch (_session) {
+                ChatSession(pendingInteraction: _?) => GoalActivity.needsYou,
+                ChatSession(isStreaming: true) => GoalActivity.working,
+                _ => GoalActivity.waiting,
+              },
+              onSet: _session.canSend ? _setGoal : null,
+              onClear: _session.canSend ? _session.clearGoal : null,
+              onDismiss: _session.dismissGoal,
+            ),
+            null => null,
+          },
+        ),
+        _PanelSlot(
+          child: switch (_session.context) {
+            final usage? when _contextPanelOpen => ContextUsagePanel(
+              usage: usage,
+              stats: _session.stats,
+              onClose: _toggleContextPanel,
+            ),
+            _ => null,
+          },
+        ),
+        // Last over the composer: what is sent next.
+        _PanelSlot(
+          child: switch (_session.queued) {
+            final queued when queued.isNotEmpty => QueuePanel(
+              messages: queued,
+              onMove: _session.moveQueued,
+              onEdit: (id) => unawaited(_session.editQueued(id)),
+              onSendNow: _session.sendQueuedNow,
+              onRemove: _session.cancelQueued,
+            ),
+            _ => null,
+          },
+        ),
+        _PanelSlot(child: _buildActivityStrip()),
+        ChatComposer(
+          key: _composerKey,
+          session: _session,
+          draft: _session.draft,
+          openEditor: widget.openEditor,
+          // A remote project's: this machine's files are copied there.
+          hostFiles: switch (_session.kernelContext.cwd) {
+            final cwd? when RemoteLocation.isRemote(cwd) =>
+              widget.fileMentions?.files,
+            _ => null,
+          },
+          contextPanelOpen: _contextPanelOpen,
+          onToggleContextPanel: _meterInFoot ? null : _toggleContextPanel,
+          onIntercept: widget.onSideQuestion == null && widget.onFork == null
+              ? null
+              : _intercept,
+        ),
+        // On a card, it is under the card (see [_buildScaffold]); a pane's
+        // on it, here, in the row under the card's.
+        if (_footOnCard)
+          SizedBox(height: Islands.belowHeight, child: _buildFoot())
+        else if (_footer == 0 && !IslandFootHosted.of(context))
+          ?widget.below,
+      ],
+    );
+  }
+}
+
+enum _TitleBarSlot { leading, title, trailing }
+
+/// The width of the conversation's column (the history's text, the
+/// composer) in a screen [width] wide: [chatGutter] in from either side, and
+/// no wider than [maxWidth], in the middle. With a [minimap], narrower to
+/// leave it its room where the column can (see [ChatColumn.room]).
+double _columnWidth(double width, double maxWidth, {required bool minimap}) =>
+    math.max(
+      0,
+      math.min(
+        width - 2 * chatGutter(width),
+        RenderChatColumn.roomy(
+          width,
+          maxWidth,
+          room: minimap ? ChatMinimap.room : 0,
+          roomFrom: ChatMinimap.roomFrom,
+        ),
+      ),
+    );
+
+/// The title bar's [_TitleBarSlot.leading] at [inset], clear of the traffic
+/// lights; the title after it, at the bar's left, not the conversation's
+/// column; the buttons ([_TitleBarSlot.trailing]) at the bar's right end,
+/// the window's as the IDE's title bar has them, not the column's.
+class _TitleBarLayout extends MultiChildLayoutDelegate {
+  _TitleBarLayout({required this.inset, required this.end});
+
+  final double inset;
+
+  /// From the right side to the buttons.
+  final double end;
+
+  /// Between the leading and the title.
+  static const _gap = 6.0;
+
+  @override
+  void performLayout(Size size) {
+    var start = inset;
+    if (hasChild(_TitleBarSlot.leading)) {
+      final leading = layoutChild(
+        _TitleBarSlot.leading,
+        BoxConstraints.loose(size),
+      );
+      positionChild(
+        _TitleBarSlot.leading,
+        Offset(inset, (size.height - leading.height) / 2),
+      );
+      start += leading.width + _gap;
+    }
+    var end = this.end;
+    if (hasChild(_TitleBarSlot.trailing)) {
+      final trailing = layoutChild(
+        _TitleBarSlot.trailing,
+        BoxConstraints.loose(size),
+      );
+      positionChild(
+        _TitleBarSlot.trailing,
+        Offset(
+          size.width - this.end - trailing.width,
+          (size.height - trailing.height) / 2,
+        ),
+      );
+      end += trailing.width + _gap;
+    }
+    final width = math.max(0.0, size.width - start - end);
+    layoutChild(
+      _TitleBarSlot.title,
+      BoxConstraints.tightFor(width: width, height: size.height),
+    );
+    positionChild(_TitleBarSlot.title, Offset(start, 0));
+  }
+
+  @override
+  bool shouldRelayout(_TitleBarLayout oldDelegate) =>
+      oldDelegate.inset != inset || oldDelegate.end != end;
+}
+
+/// [child] across the conversation's column (see [_columnWidth]), level
+/// with the history's text, with 12 under it at any width. Worked out as it
+/// is laid out, so a new width only lays [child] out again.
+class _ConversationColumn extends SingleChildRenderObjectWidget {
+  const _ConversationColumn({
+    required this.maxWidth,
+    required this.minimap,
+    this.bottom = 12,
+    this.inset,
+    required super.child,
+  });
+
+  final double maxWidth;
+  final bool minimap;
+
+  /// The room under [child].
+  final double bottom;
+
+  /// [child] wider than the column by as much as the column's gutter is
+  /// past this, at the most this far from the sides: the composer on a
+  /// card, as far from its edges as from its foot.
+  final double? inset;
+
+  @override
+  _RenderConversationColumn createRenderObject(BuildContext context) =>
+      _RenderConversationColumn(maxWidth, minimap, bottom, inset);
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderConversationColumn renderObject,
+  ) {
+    renderObject
+      ..maxWidth = maxWidth
+      ..minimap = minimap
+      ..bottom = bottom
+      ..inset = inset;
+  }
+}
+
+class _RenderConversationColumn extends RenderShiftedBox {
+  _RenderConversationColumn(
+    this._maxWidth,
+    this._minimap,
+    this._bottom,
+    this._inset,
+  ) : super(null);
+
+  double? get inset => _inset;
+  double? _inset;
+  set inset(double? value) {
+    if (value == _inset) return;
+    _inset = value;
+    markNeedsLayout();
+  }
+
+  bool get minimap => _minimap;
+  bool _minimap;
+  set minimap(bool value) {
+    if (value == _minimap) return;
+    _minimap = value;
+    markNeedsLayout();
+  }
+
+  double get maxWidth => _maxWidth;
+  double _maxWidth;
+  set maxWidth(double value) {
+    if (value == _maxWidth) return;
+    _maxWidth = value;
+    markNeedsLayout();
+  }
+
+  double get bottom => _bottom;
+  double _bottom;
+  set bottom(double value) {
+    if (value == _bottom) return;
+    _bottom = value;
+    markNeedsLayout();
+  }
+
+  double _width(double width) {
+    final column = _columnWidth(width, _maxWidth, minimap: _minimap);
+    final inset = _inset;
+    if (inset == null) return column;
+    return math.max(
+      0,
+      math.min(width - 2 * inset, column + 2 * (chatGutter(width) - inset)),
+    );
+  }
+
+  BoxConstraints _childConstraints(BoxConstraints constraints) {
+    return BoxConstraints.tightFor(width: _width(constraints.maxWidth))
+        .copyWith(maxHeight: math.max(0.0, constraints.maxHeight - _bottom));
+  }
+
+  @override
+  Size computeDryLayout(covariant BoxConstraints constraints) {
+    final height =
+        child?.getDryLayout(_childConstraints(constraints)).height ?? 0;
+    return constraints.constrain(Size(constraints.maxWidth, height + _bottom));
+  }
+
+  @override
+  double computeMinIntrinsicHeight(double width) =>
+      (child?.getMinIntrinsicHeight(_width(width)) ?? 0) + _bottom;
+
+  @override
+  double computeMaxIntrinsicHeight(double width) =>
+      (child?.getMaxIntrinsicHeight(_width(width)) ?? 0) + _bottom;
+
+  @override
+  void performLayout() {
+    final width = constraints.maxWidth;
+    final child = this.child;
+    var height = 0.0;
+    if (child != null) {
+      final childConstraints = _childConstraints(constraints);
+      child.layout(childConstraints, parentUsesSize: true);
+      (child.parentData! as BoxParentData).offset = Offset(
+        (width - childConstraints.maxWidth) / 2,
+        0,
+      );
+      height = child.size.height;
+    }
+    size = constraints.constrain(Size(width, height + _bottom));
+  }
+}
+
+/// An open subagent: its conversation, and its way in and out.
+class _AgentLayer {
+  _AgentLayer(this.feed, this.controller)
+    : animation = ConversationLayer.curve(controller);
+
+  final SubagentFeed feed;
+  final AnimationController controller;
+  final CurvedAnimation animation;
+  final FocusNode backFocus = FocusNode(debugLabel: 'Subagent back');
+  final GlobalKey historyKey = GlobalKey();
+
+  /// Whether its history keeps the minimap's room (see
+  /// [ChatHistoryView.minimapRoom]).
+  final ValueNotifier<bool> minimapRoom = ValueNotifier(false);
+
+  /// Going back: sliding out, no longer the one shown.
+  bool leaving = false;
+
+  void dispose() {
+    animation.dispose();
+    controller.dispose();
+    backFocus.dispose();
+    minimapRoom.dispose();
+    feed.dispose();
+  }
+}
+
+/// The composer and its panels, or nothing in their place (a subagent's
+/// conversation): the one shown fades in. The height changes at once, as the panels'
+/// do (see [_PanelSlot]); one at a time, the composer having a global key.
+class _BottomSwitcher extends StatefulWidget {
+  const _BottomSwitcher({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_BottomSwitcher> createState() => _BottomSwitcherState();
+}
+
+class _BottomSwitcherState extends State<_BottomSwitcher> {
+  /// Whether it has shown another child since the first: the one it opens
+  /// with is simply there, with the conversation.
+  bool _switched = false;
+
+  @override
+  void didUpdateWidget(_BottomSwitcher oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.child.key != oldWidget.child.key) _switched = true;
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      _FadeIn(key: widget.child.key, animate: _switched, child: widget.child);
+}
+
+/// Fades and rises into place once, when first built with [animate].
+class _FadeIn extends StatelessWidget {
+  const _FadeIn({super.key, required this.animate, required this.child});
+
+  final bool animate;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: animate ? 0 : 1, end: 1),
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeOutCubic,
+      builder: (context, t, child) => Opacity(
+        opacity: t,
+        child: Transform.translate(
+          offset: Offset(0, (1 - t) * 8),
+          child: child,
+        ),
+      ),
+      child: child,
+    );
+  }
+}
+
+/// The conversation being read, in the middle of where it will show. Only
+/// after [delay]: read at once (from this machine, most often), it would
+/// only flash.
+class _HistoryLoading extends StatefulWidget {
+  const _HistoryLoading();
+
+  static const delay = Duration(milliseconds: 300);
+
+  @override
+  State<_HistoryLoading> createState() => _HistoryLoadingState();
+}
+
+class _HistoryLoadingState extends State<_HistoryLoading> {
+  late final Timer _timer;
+  bool _shown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer(_HistoryLoading.delay, () => setState(() => _shown = true));
+  }
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_shown) return const SizedBox.shrink();
+    return _FadeIn(
+      animate: true,
+      child: Center(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const PixelLoader.agent(),
+            const SizedBox(width: 8),
+            Text(
+              context.l10n.chatLoadingHistory,
+              style: TextStyle(color: AppColors.textMuted, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A panel above the composer, or nothing, a gap under it. It appears and
+/// disappears at once (no size or fade transition): the history above
+/// yields the height.
+class _PanelSlot extends StatelessWidget {
+  const _PanelSlot({required this.child});
+
+  final Widget? child;
+
+  static const gap = 8.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final panel = child;
+    if (panel == null) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: gap),
+      child: panel,
+    );
+  }
+}

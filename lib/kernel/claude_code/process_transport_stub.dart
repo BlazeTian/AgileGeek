@@ -1,0 +1,18 @@
+import 'claude_code_transport.dart';
+
+abstract final class ProcessTransport {
+  static Future<ClaudeCodeTransport> start(ClaudeLaunch launch) async =>
+      throw const ClaudeUnavailable(
+        'Claude Code runs in the desktop app',
+        detail: 'The browser cannot start local processes.',
+      );
+
+  static Future<bool> rejectTooOld(String executable) async => false;
+
+  static Future<String?> usageOffBy() async => null;
+
+  /// No processes to stop on the web.
+  static Future<void> stopAll() async {}
+
+  static Future<void> reapLeftovers() async {}
+}

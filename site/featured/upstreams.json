@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "upstreams": [
+    {
+      "id": "ymeng",
+      "name": "YMeng CC",
+      "url": "https://ymeng.cc/sign-up?aff=qb45",
+      "logo": "ymeng.png",
+      "description": {
+        "en": "Every frontier model, one key",
+        "zh": "Claude、GPT、Gemini、Grok 齐全，一站接入"
+      },
+      "hosts": [
+        "api.ymeng.cc"
+      ]
+    },
+    {
+      "id": "ifruit",
+      "name": "iFruit",
+      "url": "https://ifruit.icu",
+      "logo": "ifruit.png",
+      "description": {
+        "en": "Leading AI models, one API",
+        "zh": "Claude、GPT、Grok、国产模型，一站式 API 接入"
+      },
+      "hosts": [
+        "ifruit.icu"
+      ]
+    }
+  ]
+}

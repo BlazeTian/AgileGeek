@@ -1,0 +1,264 @@
+import 'dart:async';
+
+import 'package:flutter/widgets.dart';
+
+import '../chat/chat_models.dart';
+import '../kernel/kernel_types.dart';
+import '../l10n/l10n.dart';
+import '../workspace/workspace.dart';
+import 'attention_host.dart';
+import 'attention_settings.dart';
+import 'notification_sound.dart';
+
+/// Tells the user when an agent wants them: it stopped on a question or
+/// put a plan to them ([AttentionEvent.needsInput]) or ended its turn
+/// ([AttentionEvent.finished]) — a notification of the system's and a
+/// sound, unless they are looking at it; the Dock's bounce (taskbar's
+/// flash) for a question. Keeps the count on the app's icon (agents
+/// waiting or unread) and the tray icon's menu current.
+class AttentionService {
+  AttentionService({
+    required this.workspace,
+    required this.host,
+    required this.settings,
+    required this.l10n,
+    required this.onOpen,
+    this.settingsChanges,
+    this.shown,
+    bool Function()? focused,
+  }) : _focused = focused ?? _windowFocused;
+
+  final Workspace workspace;
+  final AttentionHost host;
+
+  /// The settings now (settings.json's, read as they change).
+  final AttentionSettings Function() settings;
+
+  /// Notifies when [settings] may have changed.
+  final Listenable? settingsChanges;
+
+  /// Whether an agent shows in the window (in the IDE's chat too); by
+  /// default, whether it is in one of the chat's panes.
+  final bool Function(AgentThread thread)? shown;
+
+  /// The app's language now.
+  final AppLocalizations Function() l10n;
+
+  /// Opens an agent the user picked in a notification or the tray's menu;
+  /// the window is in front already.
+  final void Function(AgentThread thread) onOpen;
+
+  /// Whether the window is in front.
+  final bool Function() _focused;
+
+  static bool _windowFocused() =>
+      switch (WidgetsBinding.instance.lifecycleState) {
+        null || AppLifecycleState.resumed => true,
+        _ => false,
+      };
+
+  /// What each agent was at the last look, to tell what changed.
+  final Map<AgentThread, ThreadStatus> _statuses = {};
+
+  /// Ids the host knows agents by.
+  final Expando<String> _ids = Expando();
+  int _nextId = 0;
+
+  AppLifecycleListener? _lifecycle;
+  int? _badge;
+  TrayState? _tray;
+  bool _trayShown = false;
+  DateTime? _lastSound;
+
+  void start() {
+    host.onOpen = _open;
+    workspace.addListener(_update);
+    settingsChanges?.addListener(_update);
+    _lifecycle = AppLifecycleListener(onStateChange: (_) => _focusChanged());
+    _focusChanged();
+    _update();
+  }
+
+  void dispose() {
+    host.onOpen = null;
+    workspace.removeListener(_update);
+    settingsChanges?.removeListener(_update);
+    _lifecycle?.dispose();
+    _lifecycle = null;
+  }
+
+  /// Brings the badge and the tray up to date, e.g. in a new language.
+  void refresh() {
+    if (_lifecycle != null) _update();
+  }
+
+  void _focusChanged() {
+    // Notifies the workspace's listeners, and so [_update], when what was
+    // in view is seen now.
+    workspace.windowActive = _focused();
+  }
+
+  String _id(AgentThread thread) => _ids[thread] ??= '${_nextId++}';
+
+  void _open(String? id) {
+    if (id == null) return;
+    for (final thread in workspace.threads) {
+      if (_ids[thread] == id) {
+        if (thread.archived) workspace.setArchived(thread, false);
+        onOpen(thread);
+        return;
+      }
+    }
+  }
+
+  void _update() {
+    var badge = 0;
+    var running = 0;
+    final waiting = <AgentThread>[];
+    final threads = workspace.threads;
+    for (final thread in threads) {
+      final status = thread.status;
+      final before = _statuses[thread];
+      _statuses[thread] = status;
+      // A bot's conversation (see Bots) is the phone's, never shown here:
+      // not counted, nor told of.
+      if (thread.archived || workspace.isAppFolder(thread.project.path)) {
+        continue;
+      }
+      switch (status) {
+        case ThreadStatus.needsInput:
+          badge++;
+          waiting.add(thread);
+        case ThreadStatus.unread:
+          badge++;
+        case ThreadStatus.running:
+          running++;
+        case ThreadStatus.idle:
+      }
+      if (before == null || before == status) continue;
+      if (status == ThreadStatus.needsInput) {
+        _notify(thread, AttentionEvent.needsInput);
+      } else if (before == ThreadStatus.running &&
+          (status == ThreadStatus.unread || status == ThreadStatus.idle) &&
+          !thread.session.lastTurnInterrupted) {
+        // What the agent did about a background subagent's report (a
+        // turn it took up on its own): shown, but without a sound.
+        _notify(
+          thread,
+          AttentionEvent.finished,
+          sound: !thread.session.lastTurnUnprompted,
+        );
+      }
+    }
+    if (_statuses.length > threads.length) {
+      _statuses.removeWhere((thread, _) => !threads.contains(thread));
+    }
+    if (badge != _badge) {
+      _badge = badge;
+      unawaited(host.setBadge(badge));
+    }
+    _updateTray(waiting, running);
+  }
+
+  void _updateTray(List<AgentThread> waiting, int running) {
+    if (!settings().tray) {
+      if (_trayShown) unawaited(host.setTray(null));
+      _trayShown = false;
+      _tray = null;
+      return;
+    }
+    final l10n = this.l10n();
+    final tray = TrayState(
+      dot: (_badge ?? 0) > 0,
+      waiting: [
+        for (final thread in waiting)
+          (id: _id(thread), title: thread.localizedTitle(l10n)),
+      ],
+      tooltip: waiting.isEmpty
+          ? 'AgileGeek'
+          : 'AgileGeek · ${l10n.trayWaitingCount(waiting.length)}',
+      labels: {
+        'show': l10n.trayShow,
+        'waiting': l10n.trayWaiting,
+        if (running > 0) 'running': l10n.trayRunning(running),
+        'quit': l10n.trayQuit,
+      },
+    );
+    if (_trayShown && tray == _tray) return;
+    _trayShown = true;
+    _tray = tray;
+    unawaited(host.setTray(tray));
+  }
+
+  /// Whether the user is looking at [thread]: the window in front, the
+  /// agent showing in it.
+  bool _inView(AgentThread thread) =>
+      _focused() &&
+      (shown?.call(thread) ??
+          (workspace.grid.contains(thread) ||
+              identical(workspace.current, thread)));
+
+  void _notify(AgentThread thread, AttentionEvent event, {bool sound = true}) {
+    final settings = this.settings();
+    if (thread.archived || !settings.notifies(event)) return;
+    if (settings.when == NotifyWhen.unfocused && _inView(thread)) return;
+    final l10n = this.l10n();
+    final String body;
+    switch (event) {
+      case AttentionEvent.needsInput:
+        final session = thread.session;
+        if (session.pendingInteraction == null && session.canStartPlan) {
+          // A plan put to the user: what waits on them is their go-ahead,
+          // not a request to answer. Said as such, not as a question.
+          body = l10n.attentionPlanReady;
+        } else {
+          final detail = _request(session.pendingInteraction, l10n);
+          body = detail == null
+              ? l10n.attentionNeedsInput
+              : '${l10n.attentionNeedsInput} · $detail';
+        }
+        unawaited(host.requestAttention());
+      case AttentionEvent.finished:
+        final reply = _lastReply(thread);
+        body = reply == null
+            ? l10n.attentionFinished
+            : '${l10n.attentionFinished} · $reply';
+    }
+    unawaited(
+      host.notify(
+        id: _id(thread),
+        title: thread.localizedTitle(l10n),
+        body: body,
+      ),
+    );
+    if (sound) _sound(settings.sound);
+  }
+
+  /// One sound for news that comes together (several agents at once).
+  void _sound(String sound) {
+    final now = DateTime.now();
+    final last = _lastSound;
+    if (last != null && now.difference(last) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastSound = now;
+    unawaited(NotificationSound.play(host, sound));
+  }
+
+  /// What the agent waits on, in a line.
+  static String? _request(InteractionRequest? request, AppLocalizations l10n) =>
+      switch (request) {
+        QuestionRequest(:final questions) when questions.isNotEmpty =>
+          oneLineExcerpt(questions.first.prompt),
+        InteractionRequest(:final title) when title.trim().isNotEmpty =>
+          oneLineExcerpt(title),
+        _ => null,
+      };
+
+  /// The start of what the agent last said, if it said anything this run.
+  static String? _lastReply(AgentThread thread) =>
+      switch (thread.session.lastReply) {
+        final reply? => oneLineExcerpt(reply),
+        null => null,
+      };
+}

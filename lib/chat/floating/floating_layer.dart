@@ -1,0 +1,376 @@
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+
+import '../../workspace/window_controls.dart';
+import 'floating_placement.dart';
+
+/// A floating element (popover, menu, tooltip) anchored to [child], shown
+/// while [visible].
+///
+/// Positioned at layout time from the anchor's current rect, so it follows
+/// the anchor as it scrolls, and kept inside the window (see
+/// [computeFloatingPosition]): it prefers [placement], flips to the other
+/// side when that does not fit, slides to stay on screen, and is capped to
+/// the room available. With [hideWhenClipped] (the default) it is not shown
+/// while the anchor is clipped out of view by any ancestor (scrolled out of
+/// a list, or not painted at all), and comes back with it.
+///
+/// Opens with a quick fade and scale and closes with a shorter fade; while
+/// closing, the last built content stays so the exit can animate after the
+/// owner's state already says closed.
+///
+/// Its overlay entry is there only while it is open or closing. The
+/// overlay child is grafted under the anchor in the semantics tree, and
+/// the desktop engines' accessibility bridge loses it when the anchor
+/// leaves the tree and comes back (the sidebar hidden and shown): the
+/// framework does not send it again, and the engine's tree stops taking
+/// updates. For the same reason it is hidden while the anchor is out of
+/// view, and shown again once the anchor is back.
+class FloatingLayer extends StatefulWidget {
+  const FloatingLayer({
+    super.key,
+    required this.visible,
+    required this.builder,
+    required this.child,
+    this.placement = (side: FloatingSide.top, align: FloatingAlign.start),
+    this.gap = 6,
+    this.anchorRect,
+    this.hideWhenClipped = true,
+    this.tapRegionGroupId,
+    this.outerTapRegionGroupId,
+    this.onTapOutside,
+    this.enterDuration = defaultEnterDuration,
+    this.exitDuration = defaultExitDuration,
+  });
+
+  final bool visible;
+  final WidgetBuilder builder;
+  final Widget child;
+  final FloatingPlacement placement;
+  final double gap;
+
+  /// The rect to position against, from [child]'s rect (both in overlay
+  /// coordinates), e.g. to anchor at the caret within a text field.
+  final Rect Function(Rect childRect)? anchorRect;
+
+  final bool hideWhenClipped;
+
+  /// Taps in [TapRegion]s of this group (e.g. the button that toggles the
+  /// popover) are not outside taps.
+  final Object? tapRegionGroupId;
+
+  /// A second group the floating element counts as inside of, e.g. that of
+  /// a region around the whole composer it belongs to.
+  final Object? outerTapRegionGroupId;
+  final VoidCallback? onTapOutside;
+
+  final Duration enterDuration;
+  final Duration exitDuration;
+
+  static const defaultEnterDuration = Duration(milliseconds: 140);
+  static const defaultExitDuration = Duration(milliseconds: 100);
+
+  /// Kept clear of the window edges.
+  static const viewportPadding = 8.0;
+
+  /// Where it may show in an overlay of [size]: clear of the window's
+  /// edges, and below the header Windows draws (see
+  /// [WindowControls.headerInset]).
+  static Rect boundsIn(Size size) {
+    final bounds = (Offset.zero & size).deflate(viewportPadding);
+    final top = math.max(bounds.top, WindowControls.headerInset);
+    return Rect.fromLTRB(
+      bounds.left,
+      math.min(top, bounds.bottom),
+      bounds.right,
+      bounds.bottom,
+    );
+  }
+
+  @override
+  State<FloatingLayer> createState() => _FloatingLayerState();
+}
+
+class _FloatingLayerState extends State<FloatingLayer>
+    with SingleTickerProviderStateMixin {
+  OverlayPortalController _portal = OverlayPortalController();
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: widget.enterDuration,
+    reverseDuration: widget.exitDuration,
+  )..addStatusListener(_handleStatus);
+  late final Animation<double> _opacity = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOut,
+    reverseCurve: Curves.easeIn,
+  );
+  late final Animation<double> _scale = Tween<double>(begin: 0.96, end: 1)
+      .animate(
+        CurvedAnimation(
+          parent: _controller,
+          curve: Curves.easeOutCubic,
+          reverseCurve: Curves.easeInCubic,
+        ),
+      );
+
+  /// The content as last built while visible, shown during the exit.
+  Widget? _content;
+
+  bool _hideScheduled = false;
+
+  /// Whether the entry is hidden, open, as the anchor is out of view.
+  bool _clipped = false;
+
+  /// The overlay as last built in view: kept as it is for the frame the
+  /// anchor goes out of view, when the anchor's semantics node goes and
+  /// with it the entry's, so that nothing of the entry is sent then.
+  Widget? _shown;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.visible) {
+      _controller.value = 1;
+      _portal.show();
+    }
+  }
+
+  /// Shows the overlay entry, in the build that opens it: an attached
+  /// controller cannot show then, but one not attached yet can, and the
+  /// portal shows when it takes it.
+  void _showPortal() {
+    _clipped = false;
+    if (_portal.isShowing) return;
+    _portal = OverlayPortalController()..show();
+  }
+
+  /// Hides the entry after this frame, the anchor being out of view, and
+  /// looks after each frame for it to be back.
+  void _hideWhileClipped() {
+    if (_clipped) return;
+    _clipped = true;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_clipped) return;
+      if (_portal.isShowing) _portal.hide();
+      _watchClip();
+    });
+  }
+
+  void _watchClip() {
+    if (!mounted || !_clipped) return;
+    if (!widget.visible) {
+      _clipped = false;
+      return;
+    }
+    if (!_anchorHidden()) {
+      _clipped = false;
+      _portal.show();
+      return;
+    }
+    SchedulerBinding.instance.addPostFrameCallback((_) => _watchClip());
+  }
+
+  bool _anchorHidden() {
+    final anchor = context.findRenderObject();
+    final overlay = Overlay.maybeOf(context)?.context.findRenderObject();
+    if (anchor is! RenderBox ||
+        !anchor.attached ||
+        !anchor.hasSize ||
+        overlay == null) {
+      return true;
+    }
+    final rect = MatrixUtils.transformRect(
+      anchor.getTransformTo(overlay),
+      Offset.zero & anchor.size,
+    );
+    return isAnchorHidden(rect, _clipRect(rect));
+  }
+
+  /// Hides the overlay entry once closed; after the frame when called
+  /// during one's build.
+  void _hidePortal() {
+    if (!mounted || widget.visible || !_controller.isDismissed) return;
+    if (!_portal.isShowing) return;
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      if (_hideScheduled) return;
+      _hideScheduled = true;
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        _hideScheduled = false;
+        _hidePortal();
+      });
+      return;
+    }
+    _portal.hide();
+  }
+
+  @override
+  void didUpdateWidget(FloatingLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _controller
+      ..duration = widget.enterDuration
+      ..reverseDuration = widget.exitDuration;
+    if (widget.visible != oldWidget.visible) {
+      if (widget.visible) {
+        _showPortal();
+        // Part-way in, so the very first frame already shows it: the
+        // transition should not add a frame of latency.
+        _controller.forward(from: math.max(_controller.value, 0.2));
+      } else {
+        _controller.reverse();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _handleStatus(AnimationStatus status) {
+    if (status == AnimationStatus.dismissed) {
+      setState(() => _content = null);
+      _hidePortal();
+    }
+  }
+
+  /// What of the screen the anchor can show in, in overlay coordinates
+  /// (given the anchor's rect there): the intersection of the clips of all
+  /// its ancestors, like floating-ui's clipping ancestors. Null if none clip.
+  Rect? _clipRect(Rect anchorInOverlay) {
+    final anchor = context.findRenderObject();
+    if (anchor is! RenderBox || !anchor.attached || !anchor.hasSize) {
+      return null;
+    }
+    Rect? clip;
+    for (RenderObject child = anchor; child.parent != null;) {
+      final parent = child.parent!;
+      if (parent.describeApproximatePaintClip(child) case final local?) {
+        final global = MatrixUtils.transformRect(
+          parent.getTransformTo(null),
+          local,
+        );
+        clip = clip?.intersect(global) ?? global;
+      }
+      child = parent;
+    }
+    if (clip == null) return null;
+    final overlayOrigin =
+        anchor.localToGlobal(Offset.zero) - anchorInOverlay.topLeft;
+    return clip.shift(-overlayOrigin);
+  }
+
+  Widget _buildOverlay(BuildContext context, OverlayChildLayoutInfo info) {
+    if (widget.visible) {
+      _content = widget.builder(context);
+    } else if (_controller.isDismissed) {
+      _content = null;
+    }
+    final content = _content;
+    if (content == null) return _shown = const SizedBox.shrink();
+
+    final childRect = MatrixUtils.transformRect(
+      info.childPaintTransform,
+      Offset.zero & info.childSize,
+    );
+    if (widget.hideWhenClipped &&
+        isAnchorHidden(childRect, _clipRect(childRect))) {
+      _hideWhileClipped();
+      // Out of sight at once, its semantics as they were.
+      return Opacity(
+        opacity: 0,
+        alwaysIncludeSemantics: true,
+        child: _shown ?? const SizedBox.shrink(),
+      );
+    }
+    return Opacity(
+      opacity: 1,
+      alwaysIncludeSemantics: true,
+      child: _shown = _layout(content, childRect, info),
+    );
+  }
+
+  Widget _layout(Widget content, Rect childRect, OverlayChildLayoutInfo info) {
+    return CustomSingleChildLayout(
+      delegate: _FloatingLayoutDelegate(
+        anchor: widget.anchorRect?.call(childRect) ?? childRect,
+        bounds: FloatingLayer.boundsIn(info.overlaySize),
+        placement: widget.placement,
+        gap: widget.gap,
+      ),
+      child: TapRegion(
+        groupId: widget.outerTapRegionGroupId,
+        child: TapRegion(
+          groupId: widget.tapRegionGroupId,
+          onTapOutside: (_) => widget.onTapOutside?.call(),
+          child: IgnorePointer(
+            // Closing: let clicks through to what is underneath.
+            ignoring: !widget.visible,
+            child: FadeTransition(
+              opacity: _opacity,
+              child: ScaleTransition(scale: _scale, child: content),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return OverlayPortal.overlayChildLayoutBuilder(
+      controller: _portal,
+      overlayChildBuilder: _buildOverlay,
+      child: widget.child,
+    );
+  }
+}
+
+class _FloatingLayoutDelegate extends SingleChildLayoutDelegate {
+  _FloatingLayoutDelegate({
+    required this.anchor,
+    required this.bounds,
+    required this.placement,
+    required this.gap,
+  });
+
+  final Rect anchor;
+  final Rect bounds;
+  final FloatingPlacement placement;
+  final double gap;
+
+  @override
+  BoxConstraints getConstraintsForChild(BoxConstraints constraints) {
+    final room = availableExtent(
+      anchor: anchor,
+      bounds: bounds,
+      side: placement.side,
+      gap: gap,
+    );
+    return BoxConstraints.loose(
+      placement.side.isVertical
+          ? Size(bounds.width, room)
+          : Size(room, bounds.height),
+    );
+  }
+
+  @override
+  Offset getPositionForChild(Size size, Size childSize) =>
+      computeFloatingPosition(
+        anchor: anchor,
+        size: childSize,
+        bounds: bounds,
+        placement: placement,
+        gap: gap,
+      ).offset;
+
+  @override
+  bool shouldRelayout(_FloatingLayoutDelegate oldDelegate) =>
+      anchor != oldDelegate.anchor ||
+      bounds != oldDelegate.bounds ||
+      placement != oldDelegate.placement ||
+      gap != oldDelegate.gap;
+}

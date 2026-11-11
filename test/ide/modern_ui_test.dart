@@ -1,0 +1,351 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:agilegeek/ide/ide_commands.dart';
+import 'package:agilegeek/ide/ide_hover.dart';
+import 'package:agilegeek/ide/ide_modern_ui.dart';
+import 'package:agilegeek/ide/ide_status_bar.dart';
+import 'package:agilegeek/ide/ide_workbench.dart';
+import 'package:agilegeek/ide/lsp_ui/hover_markdown.dart';
+import 'package:agilegeek/keybindings/default_keybindings.dart'
+    show openSettingsCommandId;
+import 'package:agilegeek/theme/app_theme.dart';
+import 'package:agilegeek/theme/codicons.dart';
+import 'package:agilegeek/theme/window_blur.dart';
+import 'package:agilegeek/theme/workbench_theme.dart';
+import 'package:agilegeek/workspace/islands.dart';
+
+import 'workbench/fake_files.dart';
+
+void main() {
+  testWidgets('the shell is the side bar\'s color, opaque on every platform '
+      '(the agents sidebar is a tint over the material, once the windows '
+      'are blurred)', (tester) async {
+    final side = WorkbenchThemeService.instance.colors['sideBar.background'];
+    expect(IdeModernUI.shell, side);
+    expect(IdeModernUI.shell.a, 1);
+    // Off by default: opaque.
+    expect(AppColors.sidebarSurface.a, 1);
+    WindowBlur.enabled.value = true;
+    addTearDown(() => WindowBlur.enabled.value = false);
+    expect(IdeModernUI.shell.a, 1);
+    expect(AppColors.sidebarSurface.a, lessThan(1));
+    expect(AppColors.windowCanvas.a, 0);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+  testWidgets('as before the islands, the parts are flush with a line '
+      'between them; the status bar\'s row as high, the chat\'s branch in '
+      'it', (tester) async {
+    expect(IdeWorkbench.islands, isFalse);
+    await pumpWorkbench(tester, {'a.txt': 'a'});
+    Rect rect(String key) => tester.getRect(find.byKey(ValueKey(key)));
+    IdePart partOf(Finder of) => tester.widget<IdePart>(
+      find.ancestor(of: of, matching: find.byType(IdePart)).first,
+    );
+    HeadedIsland cardOf(String key) => tester.widget<HeadedIsland>(
+      find
+          .descendant(
+            of: find.byKey(ValueKey(key)),
+            matching: find.byType(HeadedIsland),
+          )
+          .first,
+    );
+    final sidebar = rect('ide-sidebar');
+    final editor = rect('ide-editor');
+    final chat = rect('ide-chat');
+    // The activity bar a part of its own, its line beside the side bar.
+    final activityBar = partOf(find.byIcon(Codicons.files));
+    expect(activityBar.color, IdeModernUI.activityBarBackground);
+    expect(activityBar.border, isNotNull);
+    expect(sidebar.left, IdeModernUI.activityBarWidth);
+    // Flush: no gap between them, nor at the window's right.
+    expect(editor.left, sidebar.right);
+    expect(chat.left, editor.right);
+    expect(chat.right, 1400);
+    // The side bar its color, its line at its right; the chat the side
+    // bar's line at its left.
+    final side = tester.widget<IdePart>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('ide-sidebar')),
+            matching: find.byType(IdePart),
+          )
+          .first,
+    );
+    expect(side.color, themeColors['sideBar.background']);
+    expect(side.border!.right.style, BorderStyle.solid);
+    expect(cardOf('ide-chat').border?.left.style, BorderStyle.solid);
+    // The status bar's row under all but the chat, as high as the islands'
+    // and the agents' window's; the chat's branch in line with it.
+    final status = tester.getRect(find.byType(IdeStatusBar));
+    expect(status.height, Islands.belowHeight);
+    expect(status.right, chat.left);
+    expect(sidebar.bottom, status.top);
+    expect(chat.bottom, 800);
+    expect(cardOf('ide-chat').footer, Islands.belowHeight);
+    // The theme's status bar colors, under the chat's row too.
+    final bar = tester.widget<Container>(
+      find
+          .descendant(
+            of: find.byType(IdeStatusBar),
+            matching: find.byType(Container),
+          )
+          .first,
+    );
+    expect(
+      (bar.decoration! as BoxDecoration).color,
+      themeColors['statusBar.background'],
+    );
+    expect(cardOf('ide-chat').footerColor, themeColors['statusBar.background']);
+    // The activity bar's items upstream's: 24px icons, a 4px box.
+    final files = tester.widget<Icon>(find.byIcon(Codicons.files));
+    expect(files.size, IdeModernUI.flatActivityIconSize);
+  });
+
+  testWidgets('the parts are cards a gap apart on the window\'s color, the '
+      'activity bar VS Code\'s beside them', (tester) async {
+    IdeWorkbench.islands = true;
+    addTearDown(() => IdeWorkbench.islands = false);
+    await pumpWorkbench(tester, {'a.txt': 'a'});
+    Rect part(Finder of) => tester.getRect(
+      find.ancestor(of: of, matching: find.byType(IdePart)).first,
+    );
+    final activityBar = part(find.byIcon(Codicons.files));
+    HeadedIsland cardOf(String key) => tester.widget<HeadedIsland>(
+      find
+          .descendant(
+            of: find.byKey(ValueKey(key)),
+            matching: find.byType(HeadedIsland),
+          )
+          .first,
+    );
+    Rect cardIn(String key) => tester.getRect(
+      find
+          .descendant(
+            of: find.byKey(ValueKey(key)),
+            matching: find.byType(HeadedIsland),
+          )
+          .first,
+    );
+    final sidebar = cardIn('ide-sidebar');
+    final editor = cardIn('ide-editor');
+    final chat = cardIn('ide-chat');
+    // Against the window's side, 44px wide, on its color; each card a gap
+    // from the next, and from the window's right; down to the status bar,
+    // the chat's card to the row beside it, its branch's (as in the
+    // agents' window).
+    expect(activityBar.left, 0);
+    expect(activityBar.width, 44);
+    expect(
+      tester
+          .widget<IdePart>(
+            find
+                .ancestor(
+                  of: find.byIcon(Codicons.files),
+                  matching: find.byType(IdePart),
+                )
+                .first,
+          )
+          .color,
+      isNull,
+    );
+    // Against the activity bar, its items as far from either side.
+    expect(sidebar.left, activityBar.right);
+    expect(editor.left - sidebar.right, Islands.gap);
+    expect(chat.left - editor.right, Islands.gap);
+    expect(chat.right, 1400 - Islands.gap);
+    final status = tester.getRect(find.byType(IdeStatusBar));
+    expect(sidebar.bottom, status.top);
+    expect(chat.bottom, 800);
+    expect(cardOf('ide-chat').footer, Islands.belowHeight);
+    expect(status.height, Islands.belowHeight);
+    expect(status.right, chat.left - Islands.gap / 2);
+    // The editor's and the chat's tabs over them, as high as each other;
+    // the side bar's title in its card.
+    expect(cardOf('ide-editor').header, cardOf('ide-chat').header);
+    expect(cardOf('ide-sidebar').header, 0);
+    expect(cardOf('ide-sidebar').color, AppColors.code);
+    expect(cardOf('ide-editor').color, themeColors['editor.background']);
+    // The status bar on the window's color too.
+    final statusBar = tester.widget<Container>(
+      find
+          .descendant(
+            of: find.byType(IdeStatusBar),
+            matching: find.byType(Container),
+          )
+          .first,
+    );
+    expect(statusBar.decoration, isNull);
+
+    // 36px items, 8px apart, the first 4px (half the lane) from the top.
+    Finder inBar(IconData icon) => find.descendant(
+      of: find
+          .ancestor(
+            of: find.byIcon(Codicons.files),
+            matching: find.byType(IdePart),
+          )
+          .first,
+      matching: find.byIcon(icon),
+    );
+    final files = tester.getRect(
+      find
+          .ancestor(
+            of: find.byIcon(Codicons.files),
+            matching: find.byType(SizedBox),
+          )
+          .first,
+    );
+    final search = tester.getRect(
+      find
+          .ancestor(of: inBar(Codicons.search), matching: find.byType(SizedBox))
+          .first,
+    );
+    expect(files.size, const Size.square(36));
+    expect(search.top - files.bottom, 8);
+    expect(files.top - activityBar.top, 4);
+    // Centered across it.
+    expect(files.center.dx, closeTo(activityBar.center.dx, 0.5));
+
+    // The Explorer is showing: its item is on the rounded box, the others
+    // in the inactive color and no box.
+    BoxDecoration box(IconData icon) =>
+        tester
+                .widget<Container>(
+                  find
+                      .ancestor(
+                        of: inBar(icon),
+                        matching: find.byType(Container),
+                      )
+                      .first,
+                )
+                .decoration!
+            as BoxDecoration;
+    expect(box(Codicons.files).color, IdeModernUI.activityActiveBackground);
+    expect(box(Codicons.files).borderRadius, BorderRadius.circular(8));
+    expect(box(Codicons.search).color, isNull);
+    expect(
+      tester.widget<Icon>(inBar(Codicons.search)).color,
+      IdeModernUI.activityForeground,
+    );
+    expect(tester.widget<Icon>(find.byIcon(Codicons.files)).size, 20);
+
+    // Closing the side bar unselects its item.
+    await tester.tap(find.byIcon(Codicons.files));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('ide-sidebar')), findsNothing);
+    expect(box(Codicons.files).color, isNull);
+  });
+
+  testWidgets('settings are at the activity bar\'s foot, as in the chat\'s '
+      'sidebar', (tester) async {
+    var opened = 0;
+    await pumpWorkbench(
+      tester,
+      {'a.txt': 'a'},
+      commands: [
+        IdeCommand(
+          id: openSettingsCommandId,
+          label: 'Open Settings',
+          run: () => opened++,
+        ),
+      ],
+    );
+    final bar = tester.getRect(find.byKey(const ValueKey('ide-activity-bar')));
+    final gear = tester.getRect(
+      find.byKey(const ValueKey('ide.activity.settings')),
+    );
+    // Half the lane from the bottom, as the first item from the top.
+    expect(gear.size, const Size.square(36));
+    expect(bar.bottom - gear.bottom, 4);
+    await tester.tap(find.byIcon(Codicons.settingsGear));
+    await tester.pump();
+    expect(opened, 1);
+  });
+
+  testWidgets('no gear without a way to settings', (tester) async {
+    await pumpWorkbench(tester, {'a.txt': 'a'});
+    expect(find.byKey(const ValueKey('ide.activity.settings')), findsNothing);
+  });
+
+  group('hover markdown', () {
+    Future<void> pump(WidgetTester tester, String markdown) =>
+        tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: IdeHoverMarkdown(
+                markdown,
+                language: 'dart',
+                colorize: _colorize,
+              ),
+            ),
+          ),
+        );
+
+    testWidgets('code is the editor\'s, with no label or box', (tester) async {
+      await pump(tester, '```\nfinal x = 1;\n```\n\n---\n\nUse `x` **now**.');
+      // Plain until colored, then in the editor's colors: the fence names
+      // no language, so it is the editor's.
+      await tester.pump();
+      final code = tester.widget<Text>(find.textContaining('final x'));
+      final keyword = (code.textSpan! as TextSpan).children!.first as TextSpan;
+      expect(keyword.text, 'final');
+      expect(keyword.style!.color, _keyword);
+      expect(_colorized.last, ('dart', 'final x = 1;'));
+      expect(find.text('dart'), findsNothing);
+      expect(code.style!.fontFamily, ideHoverCodeStyle.fontFamily);
+
+      // The rule spans the hover, at half the border's strength.
+      final rule = tester.widget<Container>(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is Container &&
+              widget.constraints?.maxHeight == 1 &&
+              widget.color != null,
+        ),
+      );
+      expect(rule.color, IdeHoverColors.border.withValues(alpha: 0.5));
+      final hoverWidth = tester.getSize(find.byType(IdeHoverMarkdown)).width;
+      expect(tester.getSize(find.byWidget(rule)).width, hoverWidth);
+
+      // Inline code on `textCodeBlock.background`, rounded.
+      final inline = tester.widget<Container>(
+        find.ancestor(of: find.text('x'), matching: find.byType(Container)),
+      );
+      final decoration = inline.decoration! as BoxDecoration;
+      expect(decoration.color, IdeHoverColors.codeBlock);
+      expect(decoration.borderRadius, BorderRadius.circular(3));
+    });
+
+    testWidgets('a fence\'s language is used, and lists are indented', (
+      tester,
+    ) async {
+      await pump(tester, '```ts\nlet y;\n```\n\n- one\n- two');
+      await tester.pump();
+      expect(_colorized.last, ('ts', 'let y;'));
+      expect(find.text('•'), findsNWidgets(2));
+      expect(
+        tester.getTopLeft(find.textContaining('one')).dx -
+            tester.getTopLeft(find.byType(IdeHoverMarkdown)).dx,
+        8 + 20 + 4,
+      );
+    });
+  });
+}
+
+const _keyword = Color(0xFF569CD6);
+
+final _colorized = <(String, String)>[];
+
+/// Colors the first word as a keyword.
+Future<List<List<TextSpan>>?> _colorize(String language, String code) async {
+  _colorized.add((language, code));
+  return [
+    for (final line in code.split('\n'))
+      [
+        TextSpan(
+          text: line.split(' ').first,
+          style: const TextStyle(color: _keyword),
+        ),
+        TextSpan(text: line.substring(line.split(' ').first.length)),
+      ],
+  ];
+}

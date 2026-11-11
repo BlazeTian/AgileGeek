@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_name__",
+  "version": "0.2.0",
+  "description": "__MSG_description__",
+  "default_locale": "en",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArvcocgIAtbsX7v7tHjsO4b1ei/hpgyVSXD4Ks9QXdDNa17mD13onWkVcspyObdZlSMaAD49wb7tWp9WUVRgkC53AW39zul4LcGtWBAaDLhwcDj1KF6u8lKEcIj6Tcz8re8AEyIOUU4ILEy5y7mDWfSxjgHhrZI9Z2N2M56Yx1AvguH8Rwe0So79U9VxBMFHXeNGdzvy+90Xbr0gR/TU0SZLMCJdsQbnx5P6RJuk//R/4Or+5hndFY/XEVzt7vepNe89yFraUZBY/h+1HyOkjtg3eozkkBHftqzgEapKgaWdIcQlvyNSZ6HzM/vAZgUL1l7593ADuiWlaF+GUNKLfKwIDAQAB",
+  "minimum_chrome_version": "125",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "debugger",
+    "activeTab",
+    "tabs",
+    "tabGroups",
+    "alarms"
+  ],
+  "action": {
+    "default_title": "AgileGeek",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

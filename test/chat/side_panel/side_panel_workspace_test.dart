@@ -1,0 +1,430 @@
+// The side panel of a conversation in a multi-folder workspace, as the
+// IDE's: each folder a root of the files page, a repository of the changes
+// page's to pick from; the files the agent names found in its folders.
+
+import 'package:agile_editor/monaco/flutter/editor_surface.dart';
+import 'package:agilegeek/ide/ide_notifications.dart';
+import 'package:agilegeek/theme/code_font.dart';
+import 'package:agilegeek/chat/chat_session.dart';
+import 'package:agilegeek/chat/side_panel/file_link.dart';
+import 'package:agilegeek/chat/side_panel/file_open.dart';
+import 'package:agilegeek/chat/side_panel/side_panel_controller.dart';
+import 'package:agilegeek/chat/side_panel/side_panel_view.dart';
+import 'package:agilegeek/ide/file_service.dart';
+import 'package:agilegeek/ide/git/ide_git_commit_panel.dart';
+import 'package:agilegeek/ide/git/git_repository.dart';
+import 'package:agilegeek/ide/git/repository_scan.dart';
+import 'package:agilegeek/ide/ide_explorer.dart';
+import 'package:agilegeek/ide/ide_list.dart';
+import 'package:agilegeek/kernel/agent_kernel.dart';
+import 'package:agilegeek/theme/app_theme.dart';
+import 'package:agilegeek/theme/codicons.dart';
+import 'package:flutter/gestures.dart' show kSecondaryButton;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
+
+import '../../ide/git/fake_git.dart';
+
+/// Files in memory.
+class _Files implements IdeFileService {
+  _Files(this.texts);
+
+  final Map<String, String> texts;
+
+  @override
+  Future<String> read(String path, {bool force = false}) async =>
+      texts[path] ?? (throw IdeFileNotFoundException(path));
+
+  @override
+  Future<List<IdeFile>> list(String directory) async {
+    final entries = <String, bool>{};
+    for (final path in texts.keys) {
+      if (!p.isWithin(directory, path)) continue;
+      final relative = p.split(p.relative(path, from: directory));
+      entries[p.join(directory, relative.first)] = relative.length > 1;
+    }
+    return [
+      for (final MapEntry(key: path, value: isDirectory) in entries.entries)
+        IdeFile(path, p.basename(path), isDirectory: isDirectory),
+    ];
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError();
+}
+
+const _workspace = '/data/workspaces/w1';
+const _site = '/code/site';
+const _api = '/code/api';
+
+final _files = _Files({
+  '$_site/index.html': '<html>',
+  '$_api/main.go': 'package main',
+  '$_api/new.go': 'package main',
+});
+
+/// A conversation in the workspace `web` of [roots], its side panel shown
+/// at [section].
+Future<({AgentSidePanel panel, ChatSession session})> _pump(
+  WidgetTester tester, {
+  required SidePanelSection section,
+  List<String> roots = const [_site, _api],
+  List<(String, IdeGitRepository)> repositories = const [],
+  String? workspaceName = 'web',
+  IdeGitRepository? git,
+  VoidCallback? onAddFolder,
+  ValueChanged<String>? onRemoveFolder,
+  ValueNotifier<double>? uiScale,
+}) async {
+  tester.view.physicalSize = const Size(1600, 1000);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.reset);
+  final session = ChatSession(
+    kernelContext: const KernelContext(cwd: _workspace),
+    openReview: (root, {session}) async => null,
+  );
+  addTearDown(session.dispose);
+  final panel = AgentSidePanel();
+  addTearDown(panel.dispose);
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: buildAppTheme(),
+      builder: uiScale == null
+          ? null
+          : (context, child) {
+              final media = MediaQuery.of(context);
+              return SystemTextScale(
+                scaler: media.textScaler,
+                child: ValueListenableBuilder<double>(
+                  valueListenable: uiScale,
+                  child: child,
+                  builder: (context, value, child) => MediaQuery(
+                    data: media.copyWith(textScaler: TextScaler.linear(value)),
+                    child: child!,
+                  ),
+                ),
+              );
+            },
+      home: ValueListenableBuilder<double>(
+        valueListenable: CodeFont.size,
+        builder: (context, _, _) => Material(
+          child: AgentSidePanelArea(
+            panel: panel,
+            builder: (context) => AgentSidePanelView(
+              notifications: IdeNotifications(),
+              panel: panel,
+              session: session,
+              files: _files,
+              watchDirectory: (_) => const Stream.empty(),
+              workspaceName: workspaceName,
+              git: git,
+              roots: roots,
+              repositories: repositories,
+              onAddFolder: onAddFolder,
+              onRemoveFolder: onRemoveFolder,
+            ),
+            child: const SizedBox.expand(),
+          ),
+        ),
+      ),
+    ),
+  );
+  panel.showSection(session, section);
+  await tester.pumpAndSettle();
+  return (panel: panel, session: session);
+}
+
+Finder get _list => find.byKey(const ValueKey('side-panel-list'));
+
+Finder _inList(String text) =>
+    find.descendant(of: _list, matching: find.text(text));
+
+/// [text] in the changes page's local changes (the Source Control view's
+/// CHANGES, under the Git log's first row).
+/// A repository's header on the changes page.
+Finder _header(String root) => find.byKey(ValueKey('r:$root'));
+
+Finder _inChanges(String text) => find.descendant(
+  of: find.byType(IdeGitCommitPanel),
+  matching: find.text(text),
+);
+
+void main() {
+  testWidgets('the file tree preview responds to code size and interface '
+      'size', (tester) async {
+    final scale = ValueNotifier(1.0);
+    final originalSize = CodeFont.size.value;
+    addTearDown(scale.dispose);
+    addTearDown(() => CodeFont.size.value = originalSize);
+    await _pump(tester, section: SidePanelSection.files, uiScale: scale);
+    await tester.tap(_inList('main.go'));
+    await tester.pumpAndSettle();
+    final surface = find.byType(EditorSurface);
+    final state = tester.state(surface);
+    final view = state as EditorSurfaceView;
+    final height = view.lineHeight;
+    final width = view.caretRectAt(7)!.left - view.caretRectAt(0)!.left;
+    scale.value = 1.5;
+    await tester.pumpAndSettle();
+    expect(tester.state(surface), same(state));
+    expect(view.lineHeight, greaterThan(height * 1.4));
+    expect(
+      view.caretRectAt(7)!.left - view.caretRectAt(0)!.left,
+      closeTo(width * 1.5, 1),
+    );
+    final zoomed = view.lineHeight;
+    CodeFont.size.value = CodeFont.defaultSize + 6;
+    await tester.pumpAndSettle();
+    expect(view.lineHeight, greaterThan(zoomed * 1.4));
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(milliseconds: 20));
+  });
+
+  testWidgets('the files page has each folder a root, under the '
+      'workspace\'s name; a root is taken out from its menu', (tester) async {
+    final removed = <String>[];
+    final (:panel, :session) = await _pump(
+      tester,
+      section: SidePanelSection.files,
+      onAddFolder: () {},
+      onRemoveFolder: removed.add,
+    );
+    expect(_inList('web (Workspace)'), findsOneWidget);
+    final site = tester.getTopLeft(_inList('site')).dy;
+    final api = tester.getTopLeft(_inList('api')).dy;
+    expect(site, lessThan(api));
+    expect(tester.getTopLeft(_inList('index.html')).dy, greaterThan(site));
+    expect(tester.getTopLeft(_inList('main.go')).dy, greaterThan(api));
+
+    // A file of either opens beside the tree.
+    await tester.tap(_inList('main.go'));
+    await tester.pumpAndSettle();
+    expect(panel.tabsOf(session).active?.path, '$_api/main.go');
+
+    await tester.tap(
+      find.ancestor(of: _inList('api'), matching: find.byType(IdeListRow)),
+      buttons: kSecondaryButton,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Delete'), findsNothing);
+    await tester.tap(find.text('Remove Folder from Workspace'));
+    await tester.pumpAndSettle();
+    expect(removed, [_api]);
+
+    // The workspace takes it out: the tree follows.
+    panel.setRoots(_workspace, [_site]);
+    await tester.pumpAndSettle();
+    expect(_inList('main.go'), findsNothing);
+    expect(
+      find.descendant(of: _list, matching: find.byType(IdeExplorer)),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('the files page has each folder\'s Git status, as the IDE\'s '
+      'explorer', (tester) async {
+    final site = FakeGit(_site)..status = '## main\x00';
+    final api = FakeGit(_api)..status = '## dev\x00 M main.go\x00?? new.go\x00';
+    final repositories = [(_site, site.repository()), (_api, api.repository())];
+    for (final (_, git) in repositories) {
+      addTearDown(git.dispose);
+      await git.refresh();
+    }
+    await _pump(
+      tester,
+      section: SidePanelSection.files,
+      repositories: repositories,
+    );
+    Finder letterOf(String name) => find.descendant(
+      of: find.ancestor(of: _inList(name), matching: find.byType(IdeListRow)),
+      matching: find.byWidgetPredicate(
+        (widget) => widget is Text && widget.data != name,
+      ),
+    );
+    expect(tester.widget<Text>(letterOf('main.go')).data, 'M');
+    expect(tester.widget<Text>(letterOf('new.go')).data, 'U');
+    expect(letterOf('index.html'), findsNothing);
+    // The folder with changes: its dot.
+    expect(
+      find.descendant(
+        of: find.ancestor(
+          of: _inList('api'),
+          matching: find.byType(IdeListRow),
+        ),
+        matching: find.byIcon(Codicons.circleFilled),
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('a workspace with no folders asks for one', (tester) async {
+    var added = 0;
+    await _pump(
+      tester,
+      section: SidePanelSection.files,
+      roots: const [],
+      onAddFolder: () => added++,
+    );
+    expect(_inList('This workspace has no folders yet.'), findsOneWidget);
+    await tester.tap(_inList('Add Folder to Workspace…'));
+    expect(added, 1);
+  });
+
+  testWidgets('the changes page lists each folder\'s repository with its '
+      'changes, counts them all, and shows the one clicked', (tester) async {
+    final site = FakeGit(_site)..status = '## main\x00 M index.html\x00';
+    final api = FakeGit(_api)..status = '## dev\x00 M main.go\x00?? new.go\x00';
+    final repositories = [(_site, site.repository()), (_api, api.repository())];
+    for (final (_, git) in repositories) {
+      addTearDown(git.dispose);
+    }
+    final (:panel, :session) = await _pump(
+      tester,
+      section: SidePanelSection.changes,
+      repositories: repositories,
+    );
+    // Each under its header, with its branch, and all their changes, as
+    // the local changes' details of the Git log.
+    for (final (root, label) in [(_site, 'site  main'), (_api, 'api  dev')]) {
+      expect(
+        find.descendant(
+          of: _header(root),
+          matching: find.text(label, findRichText: true),
+        ),
+        findsOneWidget,
+      );
+    }
+    for (final name in ['index.html', 'main.go', 'new.go']) {
+      expect(_inChanges(name), findsOneWidget, reason: name);
+    }
+    // The page's tab counts every repository's.
+    expect(
+      find.descendant(
+        of: find.byWidgetPredicate(
+          (widget) => widget.runtimeType.toString() == '_SectionBar',
+        ),
+        matching: find.text('3'),
+      ),
+      findsOneWidget,
+    );
+    // A header clicked: its repository the one shown (the log's).
+    await tester.tap(_header(_api));
+    await tester.pumpAndSettle();
+    expect(panel.repositoryOf(session.root!), _api);
+  });
+
+  testWidgets('a repository on the changes page has its menu on a right '
+      'click', (tester) async {
+    final site = FakeGit(_site)..status = '## main\x00 M index.html\x00';
+    final api = FakeGit(_api)..status = '## dev\x00 M main.go\x00';
+    final repositories = [(_site, site.repository()), (_api, api.repository())];
+    for (final (_, git) in repositories) {
+      addTearDown(git.dispose);
+    }
+    final (:panel, :session) = await _pump(
+      tester,
+      section: SidePanelSection.changes,
+      repositories: repositories,
+    );
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    Future<void> menuOf(String name) async {
+      await tester.tap(_header(name), buttons: kSecondaryButton);
+      await tester.pumpAndSettle();
+    }
+
+    await menuOf(_api);
+    expect(find.text('Reveal in Files'), findsOneWidget);
+    expect(find.text('Pull'), findsOneWidget);
+    expect(find.text('Push'), findsOneWidget);
+    await tester.tap(find.text('Copy Path'));
+    await tester.pumpAndSettle();
+    expect(copied, _api);
+
+    await menuOf(_api);
+    await tester.tap(find.text('Fetch From All Remotes'));
+    await tester.pumpAndSettle();
+    expect(api.callsTo('fetch'), isNotEmpty);
+    expect(site.callsTo('fetch'), isEmpty);
+
+    await menuOf(_api);
+    await tester.tap(find.text('Reveal in Files'));
+    await tester.pumpAndSettle();
+    expect(panel.tabsOf(session).section, SidePanelSection.files);
+  });
+
+  testWidgets('a folder\'s project lists the repositories found in its '
+      'subfolders, its own left out once known not to be one', (tester) async {
+    final own = FakeGit(_workspace)..isRepository = false;
+    final nested = FakeGit(_api)..status = '## dev\x00?? new.go\x00';
+    final (ownGit, nestedGit) = (own.repository(), nested.repository());
+    addTearDown(ownGit.dispose);
+    addTearDown(nestedGit.dispose);
+    await ownGit.refresh();
+    await nestedGit.refresh();
+    await _pump(
+      tester,
+      section: SidePanelSection.changes,
+      workspaceName: null,
+      roots: const [],
+      git: ownGit,
+      repositories: ideFolderRepositories(_workspace, ownGit, [
+        (_api, nestedGit),
+      ]),
+    );
+    expect(_inChanges('new.go'), findsOneWidget);
+    expect(find.textContaining('doesn\'t have a Git repository'), findsNothing);
+  });
+
+  group('the files the chat names', () {
+    /// The scope of a conversation in the workspace, the files there as
+    /// [_files] has them.
+    FileOpenScope scope(List<FileOpenRequest> opened) => FileOpenScope(
+      root: _workspace,
+      roots: const [_site, _api],
+      onOpen: opened.add,
+      existence: FileExistence(fileExistsIn(_files)),
+      child: const SizedBox(),
+    );
+
+    test('a relative path is found in the folder that has it', () async {
+      final opened = <FileOpenRequest>[];
+      final files = scope(opened);
+      // Not known yet: the first folder's, while each is asked.
+      expect(files.resolve('main.go'), '$_site/main.go');
+      await pumpEventQueue();
+      expect(files.resolve('main.go'), '$_api/main.go');
+      expect(files.resolve('index.html'), '$_site/index.html');
+      // An absolute path in any folder, or out of them.
+      expect(files.resolve('$_api/new.go'), '$_api/new.go');
+      expect(files.resolve('/elsewhere/a.go'), '/elsewhere/a.go');
+    });
+
+    test('a link opens where it is found, though not known before', () async {
+      final opened = <FileOpenRequest>[];
+      expect(
+        scope(opened).openLink(FileLink('new.go', FileLineRange(3))),
+        isTrue,
+      );
+      await pumpEventQueue();
+      expect(opened.single.path, '$_api/new.go');
+      expect(opened.single.range, FileLineRange(3));
+    });
+  });
+}
