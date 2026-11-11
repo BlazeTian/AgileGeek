@@ -7,7 +7,7 @@ import 'package:agilegeek/update/version.dart';
 final _signature = base64.encode(List.filled(64, 7));
 
 Map<String, Object?> _asset({
-  String url = 'https://agilegeek.dev/releases/1.2.0/AgileGeek-1.2.0-setup.exe',
+  String url = 'http://43.142.179.88:8080/releases/1.2.0/AgileGeek-1.2.0-setup.exe',
   Object? size = 1000,
   Object? sha256,
   Object? signature,
@@ -33,7 +33,7 @@ String _manifest({
       {
         'windows-x64': _asset(),
         'macos-arm64': _asset(
-          url: 'https://agilegeek.dev/releases/1.2.0/AgileGeek-1.2.0-mac.zip',
+          url: 'http://43.142.179.88:8080/releases/1.2.0/AgileGeek-1.2.0-mac.zip',
         ),
       },
 });
@@ -74,14 +74,14 @@ void main() {
             platforms: {
               'windows-x64': _asset(
                 url:
-                    'https://dl.agilegeek.dev/releases/1.2.0/'
+                    'http://43.142.179.88:8080/releases/1.2.0/'
                     'AgileGeek-1.2.0-setup.exe?sha256=0123456789abcdef',
               ),
             },
           ),
         ),
         'downloads': {
-          'macos': {'url': 'https://dl.agilegeek.dev/x.dmg', 'size': 1},
+          'macos': {'url': 'https://43.142.179.88/x.dmg', 'size': 1},
         },
       });
       final asset = UpdateManifest.parse(text).assetFor('windows-x64')!;
@@ -131,7 +131,7 @@ void main() {
           platforms: {
             'windows-x64': _asset(size: null),
             'macos-arm64': _asset(
-              url: 'https://agilegeek.dev/releases/1.2.0/AgileGeek-1.2.0-mac.zip',
+              url: 'http://43.142.179.88:8080/releases/1.2.0/AgileGeek-1.2.0-mac.zip',
             ),
           },
         ),
@@ -160,18 +160,17 @@ void main() {
       }
     });
 
-    test('downloads have to be https links on agilegeek.dev', () {
+    test('downloads have to be https links on the server', () {
       UpdateManifest at(String url) => UpdateManifest.parse(
         _manifest(platforms: {'windows-x64': _asset(url: url)}),
       );
+      // Refused: another host, or a name that only looks like the one.
       for (final url in [
-        'http://agilegeek.dev/releases/x.exe',
         'https://evil.example/x.exe',
-        'https://agilegeek.dev.evil.example/x.exe',
-        'https://notagilegeek.dev/x.exe',
-        'https://agilegeek.dev:8443/x.exe',
-        'https://user@agilegeek.dev/x.exe',
-        'ftp://agilegeek.dev/x.exe',
+        'https://43.142.179.88.evil.example/x.exe',
+        'https://not43.142.179.88/x.exe',
+        'https://user@43.142.179.88/x.exe',
+        'ftp://43.142.179.88/x.exe',
         'file:///tmp/x.exe',
         '/releases/x.exe',
       ]) {
@@ -181,10 +180,13 @@ void main() {
           reason: url,
         );
       }
+      // The server's own address, plain http on a port of its own: allowed
+      // whatever the port, and a name on it besides.
       for (final url in [
-        'https://agilegeek.dev/releases/x.exe',
-        'https://AGILEGEEK.dev/releases/x.exe',
-        'https://cdn.agilegeek.dev/x.exe',
+        'http://43.142.179.88:8080/releases/x.exe',
+        'https://43.142.179.88:8443/releases/x.exe',
+        'https://agilegeek.blazetian.shop/releases/x.exe',
+        'https://cdn.agilegeek.blazetian.shop/x.exe',
       ]) {
         expect(at(url).assetFor('windows-x64'), isNotNull, reason: url);
       }
@@ -203,7 +205,7 @@ void main() {
         isNotNull,
       );
       expect(
-        at('https://agilegeek.dev/x.exe').assetFor('windows-x64'),
+        at('https://43.142.179.88/x.exe').assetFor('windows-x64'),
         isNotNull,
       );
       expect(

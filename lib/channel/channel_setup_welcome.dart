@@ -708,7 +708,7 @@ class _Picture extends StatelessWidget {
 }
 
 /// A window, small: AgileGeek's, its sidebar and its logo; or the browser's,
-/// agilegeek.dev in its address bar, a tick on its page once done.
+/// the site in its address bar, a tick on its page once done.
 class _MiniWindow extends StatelessWidget {
   const _MiniWindow({required this.app, this.done = false});
 
@@ -790,7 +790,7 @@ class _MiniWindow extends StatelessWidget {
                   const SizedBox(width: 3),
                   Flexible(
                     child: Text(
-                      'agilegeek.dev',
+                      'github.com/BlazeTian/AgileGeek',
                       maxLines: 1,
                       overflow: TextOverflow.clip,
                       softWrap: false,

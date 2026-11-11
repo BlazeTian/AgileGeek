@@ -40,7 +40,7 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('去 GitHub 点 Star'), findsOneWidget);
-    expect(find.text('agilegeek.dev'), findsOneWidget);
+    expect(find.text('43.142.179.88'), findsOneWidget);
     expect(find.text('更新日志'), findsOneWidget);
     expect(find.text('反馈问题'), findsOneWidget);
     expect(tester.takeException(), isNull);

@@ -3,17 +3,18 @@
 import 'dart:convert';
 
 import 'version.dart';
+import '../platform/app_services.dart';
 
 /// Where the app looks for its next version: the release manifest
-/// dl.agilegeek.dev serves (docs/auto-update.md has its format).
-const defaultManifestUrl = 'https://dl.agilegeek.dev/releases/latest.json';
+/// the server names (docs/auto-update.md has its format).
+const defaultManifestUrl = agileGeekManifestUrl;
 
 /// The environment variable that points the app at another manifest, to
 /// try a release before it is published (a local server's, say).
 const manifestUrlVariable = 'AGILEGEEK_UPDATE_URL';
 
 /// A manifest that cannot be used: not JSON, a field missing or wrong, a
-/// download not on agilegeek.dev.
+/// download not on a host this build accepts.
 class UpdateManifestException implements Exception {
   const UpdateManifestException(this.message);
 
@@ -23,10 +24,18 @@ class UpdateManifestException implements Exception {
   String toString() => 'Invalid update manifest: $message';
 }
 
-/// Which download links a manifest may give: https on agilegeek.dev (or a
-/// subdomain of it), and [extraOrigins] besides — the origin of a manifest
-/// [manifestUrlVariable] points at, so a release can be tried from where it
-/// is served before it is published.
+/// Which download links a manifest may give.
+///
+/// Two ways in. A hosted name: https, no port, [domain] or a subdomain of
+/// it. And [plainHosts], the addresses this build's own server answers at,
+/// which are plain http over a port of their own (no certificate, and so no
+/// domain to have one for). A link there is no less safe: the signature
+/// covers the version, platform, size and hash of what it points at, so a
+/// manifest altered on the way fails to verify and nothing is installed.
+///
+/// [extraOrigins] besides — the origin of a manifest [manifestUrlVariable]
+/// points at, so a release can be tried from where it is served before it
+/// is published.
 class UpdateUrlPolicy {
   const UpdateUrlPolicy({this.extraOrigins = const {}});
 
@@ -38,7 +47,12 @@ class UpdateUrlPolicy {
       ? const UpdateUrlPolicy()
       : UpdateUrlPolicy(extraOrigins: {manifest.origin});
 
-  static const domain = 'agilegeek.dev';
+  /// The name a release is published under, when one is.
+  static const domain = 'agilegeek.blazetian.shop';
+
+  /// The addresses the app's own server answers at, which need no name and
+  /// no certificate: plain http, a port of their own. See [allows].
+  static const plainHosts = <String>{agileGeekServerHost};
 
   final Set<String> extraOrigins;
 
@@ -50,9 +64,12 @@ class UpdateUrlPolicy {
       return true;
     }
     final host = url.host.toLowerCase();
+    if (url.userInfo.isNotEmpty) return false;
+    if (plainHosts.contains(host)) {
+      return url.scheme == 'http' || url.scheme == 'https';
+    }
     return url.scheme == 'https' &&
         !url.hasPort &&
-        url.userInfo.isEmpty &&
         (host == domain || host.endsWith('.$domain'));
   }
 }

@@ -9,15 +9,18 @@ import '../platform/data_dir.dart';
 import '../workspace/editor_launcher.dart' show openExternal;
 import 'browser_bridge.dart';
 
-/// Where AgileGeek's extension is got. The store's page is the site's to say
-/// (`store` in dl.agilegeek.dev's releases/extension/latest.json, which
-/// .github/workflows/extension.yml writes): fetched once a run, kept in
-/// the cache for when the site does not answer, and before the first
-/// answer the page the extension's id makes.
+/// Where AgileGeek's extension is got. The store's page is the site's to
+/// say (`store` in the releases/extension/latest.json .github/workflows/
+/// extension.yml writes): fetched once a run, kept in the cache for when
+/// the site does not answer, and before the first answer the page the
+/// extension's id makes.
+///
+/// No store listing is published yet, and no site serves the manifest: both
+/// fall back to the project's releases, where the zip is attached. Set
+/// [manifest] to the site's once there is one.
 abstract final class ExtensionStore {
-  static final manifest = Uri.https(
-    'dl.agilegeek.dev',
-    '/releases/extension/latest.json',
+  static final manifest = Uri.parse(
+    'https://github.com/BlazeTian/AgileGeek/releases/latest/download/extension.json',
   );
 
   /// The extension's page, by its id: the store's address for it.
@@ -26,8 +29,11 @@ abstract final class ExtensionStore {
     '/detail/${BrowserBridge.extensionIds.first}',
   );
 
-  /// The zip to load unpacked: agilegeek.dev sends it to the newest.
-  static final zip = Uri.https('agilegeek.dev', '/dl/browser-extension');
+  /// The zip to load unpacked: the newest the project published.
+  static final zip = Uri.parse(
+    'https://github.com/BlazeTian/AgileGeek/releases/latest/download/'
+    'agilegeek-extension.zip',
+  );
 
   /// The store's page as last known: fetched, or kept; [fallback] before.
   static Uri get page => _page ?? fallback;

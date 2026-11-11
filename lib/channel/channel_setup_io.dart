@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../platform/app_services.dart';
 import '../update/version.dart';
 import 'channel_setup.dart';
 
@@ -23,7 +24,7 @@ Future<ChannelAttribution?> lookUpChannel(Uri url) async {
 const channelsUrlVariable = 'AGILEGEEK_CHANNELS_URL';
 
 /// The site's.
-const channelsBase = 'https://agilegeek.dev';
+const channelsBase = agileGeekServer;
 
 /// The channel [id]'s entry as the site lists it (site/channels.json),
 /// its logo with it; null for one not listed. Throws when the site could

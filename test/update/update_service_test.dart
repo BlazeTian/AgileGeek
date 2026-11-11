@@ -70,7 +70,7 @@ void main() {
     test("a wrong entry for this platform is a failed check", () async {
       final backend = FakeBackend(
         manifestOf('1.2.0').replaceFirst(
-          'https://agilegeek.dev/releases/1.2.0/windows-x64.bin',
+          'http://43.142.179.88:8080/releases/1.2.0/windows-x64.bin',
           'https://evil.example/windows-x64.bin',
         ),
       );

@@ -94,8 +94,8 @@ Section: devel
 Priority: optional
 Architecture: ${package_arch}
 Depends: libc6 (>= ${glibc}), libgtk-3-0, libblkid1, liblzma5${webkit}
-Maintainer: AgileGeek <noreply@agilegeek.dev>
-Homepage: https://agilegeek.dev
+Maintainer: AgileGeek <noreply@agilegeek.blazetian.shop>
+Homepage: https://agilegeek.blazetian.shop
 Description: AgileGeek desktop for Linux
  A desktop UI for Claude Code, with a fast IDE built in.
 EOF

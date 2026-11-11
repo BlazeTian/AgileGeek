@@ -5971,8 +5971,8 @@ void main() {
           ClaudeLaunch(cwd: '/p', attribution: attribution);
       expect(flagSettings(launch(CommitAttribution.agilegeek)), {
         'attribution': {
-          'commit': 'Co-Authored-By: AgileGeek <noreply@agilegeek.dev>',
-          'pr': '🤖 Generated with [AgileGeek](https://agilegeek.dev)',
+          'commit': 'Co-Authored-By: AgileGeek <noreply@43.142.179.88>',
+          'pr': '🤖 Generated with [AgileGeek](https://43.142.179.88)',
         },
       });
       expect(flagSettings(launch(CommitAttribution.none)), {

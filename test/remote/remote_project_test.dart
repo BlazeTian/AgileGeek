@@ -272,7 +272,7 @@ void main() {
       connector.failure = const SshConnectException(
         SshFailure.server,
         'The AgileGeek server for Linux x64 could not be downloaded',
-        detail: 'https://dl.agilegeek.dev/x.gz: HTTP 404',
+        detail: 'https://43.142.179.88/x.gz: HTTP 404',
       );
       await tester.runAsync(
         () => hosts['dev'].ready.then((_) {}, onError: (_) {}),
@@ -288,7 +288,7 @@ void main() {
       await tester.tap(find.text('Details'));
       await tester.pump();
       expect(
-        find.text('https://dl.agilegeek.dev/x.gz: HTTP 404'),
+        find.text('https://43.142.179.88/x.gz: HTTP 404'),
         findsOneWidget,
       );
 

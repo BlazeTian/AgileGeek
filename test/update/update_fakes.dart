@@ -19,7 +19,7 @@ String manifestOf(
   'platforms': {
     for (final platform in platforms)
       platform: {
-        'url': 'https://agilegeek.dev/releases/$version/$platform.bin',
+        'url': 'http://43.142.179.88:8080/releases/$version/$platform.bin',
         'size': 100,
         'sha256': 'a' * 64,
         'signature': base64.encode(List.filled(64, 1)),

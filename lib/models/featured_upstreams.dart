@@ -10,7 +10,7 @@ import 'featured_upstreams_stub.dart'
 /// An upstream Settings → Models shows a card of, free of charge, for
 /// adding the one-click import (see docs/upstream-import.md): listed in
 /// site/featured/upstreams.json, by a pull request after its issue, and
-/// read from agilegeek.dev ([feed]): shown as soon as the site is deployed,
+/// read from the server ([feed]): shown as soon as the site is deployed,
 /// with no release of the app.
 @immutable
 class FeaturedUpstream {
@@ -41,7 +41,10 @@ class FeaturedUpstream {
       name: name,
       url: url,
       logo: switch (json['logo']) {
-        final String logo when isLogoName(logo) => '$logoDirectory/$logo',
+        // Forward slashes whatever the platform: a logo's path is read back
+        // by the app's own file reader, which takes them.
+        final String logo when isLogoName(logo) =>
+          logoDirectory.isEmpty ? logo : '$logoDirectory/$logo',
         _ => null,
       },
       description: {
@@ -82,7 +85,7 @@ class FeaturedUpstream {
       description.values.firstOrNull;
 
   /// The list, its logos beside it.
-  static final feed = Uri.parse('https://agilegeek.dev/featured/upstreams.json');
+  static final feed = Uri.parse(agileGeekFeaturedUrl);
 
   /// A logo's name: a file beside the list, never a path.
   static bool isLogoName(String name) =>
@@ -133,7 +136,7 @@ class FeaturedUpstream {
   );
 
   /// [known], from the list kept last time, while there are none: at the
-  /// app's start, with no asking agilegeek.dev.
+  /// app's start, with no asking the server.
   static Future<void> readKept() async {
     if (known.value.isNotEmpty) return;
     try {

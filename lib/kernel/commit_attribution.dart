@@ -20,7 +20,7 @@ enum CommitAttribution {
   /// When the setting is unset, or not one of these.
   static const fallback = agilegeek;
 
-  static const agileGeekCommit = 'Co-Authored-By: AgileGeek <noreply@agilegeek.dev>';
+  static const agileGeekCommit = 'Co-Authored-By: AgileGeek <noreply@users.noreply.github.com>';
   static const agileGeekPullRequest =
       '🤖 Generated with [AgileGeek]($agileGeekWebsite)';
 

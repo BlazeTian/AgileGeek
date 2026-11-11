@@ -1,4 +1,4 @@
-// The upstreams Settings → Models lists, got from agilegeek.dev: kept with
+// The upstreams Settings → Models lists, got from the server: kept with
 // their logos, and what was kept when it does not answer.
 
 import 'dart:convert';
@@ -44,7 +44,7 @@ void main() {
   });
 
   test('a site listed shows at once, its logo downloaded beside the list; '
-      'kept for when agilegeek.dev does not answer', () async {
+      'kept for when the server does not answer', () async {
     list = jsonEncode({
       'upstreams': [
         {'id': 'a', 'name': 'A', 'url': 'https://a.dev', 'logo': 'a.png'},
@@ -60,7 +60,12 @@ void main() {
     await server.close(force: true);
     final kept = await fetchFeaturedUpstreams(feed: feed, cacheDir: cache.path);
     expect(kept.map((u) => u.id), ['a', 'b']);
-    expect(kept.first.logo, p.join(cache.path, 'a.png').replaceAll(r'\', '/'));
+    // A logo's path is kept with forward slashes, the model's own; a
+    // Windows cache folder is the platform's, with backslashes in it.
+    expect(
+      kept.first.logo!.replaceAll(r'\', '/'),
+      p.join(cache.path, 'a.png').replaceAll(r'\', '/'),
+    );
   });
 
   test('none before the first answer', () async {

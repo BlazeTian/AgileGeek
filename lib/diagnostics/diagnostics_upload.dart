@@ -60,7 +60,7 @@ final class DiagnosticsFailed extends DiagnosticsResult {
 }
 
 /// Uploads the logs folder's files and the system's crash reports of the
-/// app ([packDiagnostics]) to stats.agilegeek.dev
+/// app ([packDiagnostics]) to the server
 /// when the user asks to (Settings → Updates → Diagnostic Logs): with
 /// the note they typed, the app's version, the system's and the display
 /// language; nothing that tells who sent it, not the usage statistics'
@@ -108,7 +108,7 @@ class DiagnosticsUploader {
     );
   }
 
-  static const defaultUrl = 'https://stats.agilegeek.dev/v1/diagnostics';
+  static const defaultUrl = agileGeekDiagnosticsUrl;
 
   /// The version of the report's `meta`.
   static const schema = 1;

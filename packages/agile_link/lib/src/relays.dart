@@ -6,11 +6,11 @@
 ///
 /// A relay only passes along what is sealed between the two ends; it
 /// cannot read it.
-const defaultLinkRelays = [
-  'https://relay-us1.agilegeek.dev',
-  'https://relay-hk1.agilegeek.dev',
-  'https://relay-jp1.agilegeek.dev',
-];
+/// None is listed yet: no relay is deployed, so two ends that cannot
+/// reach each other directly do not connect. Direct paths (the same
+/// network, or a public address) still work. A relay of one's own is
+/// added here: https://host[:port], one per line.
+const defaultLinkRelays = <String>[];
 
 /// [text] as a relay URL (`https://host[:port]`, a bare host taken as
 /// https), or null when it is not one.

@@ -11,7 +11,7 @@ import 'package:agilegeek/update/update_service.dart';
 import 'package:agilegeek/update/update_signature.dart';
 import 'package:agilegeek/update/version.dart';
 
-/// A local server, in place of agilegeek.dev: what it serves by path, what it
+/// A local server, in place of 43.142.179.88: what it serves by path, what it
 /// was asked.
 class _Server {
   _Server._(this._server) {

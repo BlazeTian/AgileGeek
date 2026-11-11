@@ -1,5 +1,5 @@
 // Signs a release's installers and writes the manifest the app reads to
-// update itself (https://dl.agilegeek.dev/releases/latest.json; see
+// update itself (https://agilegeek.blazetian.shop/releases/latest.json; see
 // docs/auto-update.md). Run from anywhere in the repository:
 //
 //   dart run tool/release_manifest.dart \
@@ -52,7 +52,7 @@ import 'package:agilegeek/update/version.dart';
 import 'package:crypto/crypto.dart' as crypto;
 
 /// Where the downloads go: `<base>/<1.2.0>/<file>`.
-const _releasesBase = 'https://dl.agilegeek.dev/releases';
+const _releasesBase = 'https://agilegeek.blazetian.shop/releases';
 
 /// [name]'s link, for the file whose SHA-256 is [sha256].
 Uri _link(AppVersion version, String name, String sha256) => Uri.parse(

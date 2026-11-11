@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../platform/app_services.dart';
 import 'update_manifest.dart';
 import 'update_settings.dart';
 import 'version.dart';
@@ -76,7 +77,7 @@ abstract interface class PreparedUpdate {
 class ManualUpdateRequired implements Exception {
   const ManualUpdateRequired(this.reason);
 
-  static final downloadPage = Uri.parse('https://agilegeek.dev/download');
+  static final downloadPage = Uri.parse(agileGeekDownloadPage);
 
   final String reason;
 

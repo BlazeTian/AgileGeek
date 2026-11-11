@@ -270,8 +270,8 @@ void main() {
       await setup.openPage(zh: false);
       await setup.openPage(zh: true);
       expect(opened, [
-        Uri.parse('https://agilegeek.dev/activate#i=$_id'),
-        Uri.parse('https://agilegeek.dev/zh/activate#i=$_id'),
+        Uri.parse('http://43.142.179.88:8080/activate#i=$_id'),
+        Uri.parse('http://43.142.179.88:8080/zh/activate#i=$_id'),
       ]);
       expect(setup.waiting, isTrue);
     });
@@ -379,7 +379,7 @@ void main() {
       addTearDown(setup.dispose);
       for (final link in [
         '',
-        'https://agilegeek.dev/activate#i=$_id',
+        'http://43.142.179.88:8080/activate#i=$_id',
         'agilegeek://provider/import?v=1',
         'agilegeek://activate?i=$_id',
         'agilegeek://activate?i=$_id&s=channel',
@@ -407,7 +407,7 @@ void main() {
       expect(setup.done, isFalse);
       await setup.openPage(zh: false);
       expect(opened, [
-        Uri.parse('https://agilegeek.dev/activate#i=$_id&again=$_again'),
+        Uri.parse('http://43.142.179.88:8080/activate#i=$_id&again=$_again'),
       ]);
       server.kept = const ChannelAttribution('channel', 'aijws');
       await until(() => setup.done);
@@ -419,7 +419,7 @@ void main() {
     test('tells its links from the other agilegeek:// links', () {
       expect(ChannelSetup.isLink('agilegeek://activate?i=x'), isTrue);
       expect(ChannelSetup.isLink('agilegeek://provider/import?v=1'), isFalse);
-      expect(ChannelSetup.isLink('https://agilegeek.dev/activate'), isFalse);
+      expect(ChannelSetup.isLink('http://43.142.179.88:8080/activate'), isFalse);
     });
   });
 
@@ -562,7 +562,7 @@ void main() {
       final shown = await open(tester, setup);
       await tester.tap(find.text('在浏览器中完成设置').last);
       await tester.pump();
-      expect(opened, [Uri.parse('https://agilegeek.dev/zh/activate#i=$_id')]);
+      expect(opened, [Uri.parse('http://43.142.179.88:8080/zh/activate#i=$_id')]);
       expect(find.text('正在等待浏览器完成…'), findsOneWidget);
       expect(find.text('重新打开网页'), findsOneWidget);
 
@@ -667,7 +667,7 @@ void main() {
       await tester.tap(find.text('去浏览器确认'));
       await tester.pump();
       expect(opened, [
-        Uri.parse('https://agilegeek.dev/zh/activate#i=$_id&again=$_again'),
+        Uri.parse('http://43.142.179.88:8080/zh/activate#i=$_id&again=$_again'),
       ]);
       expect(shown.gate.stage, ChannelStage.setup);
       expect(find.text('正在等待浏览器完成…'), findsOneWidget);
@@ -731,7 +731,7 @@ void main() {
       await tester.pump();
       expect(find.text('浏览器没有打开'), findsOneWidget);
       expect(find.text('正在等待浏览器完成…'), findsNothing);
-      final address = 'https://agilegeek.dev/zh/activate#i=$_id';
+      final address = 'http://43.142.179.88:8080/zh/activate#i=$_id';
       expect(find.text(address), findsOneWidget);
       await tester.tap(find.text('复制'));
       await tester.pump();

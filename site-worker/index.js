@@ -1,4 +1,4 @@
-// agilegeek.dev's Worker: site/ is served as static assets, and this runs only
+// agilegeek.blazetian.shop's Worker: site/ is served as static assets, and this runs only
 // for /dl/* (run_worker_first in wrangler.jsonc). /dl/windows,
 // /dl/windows-arm64, /dl/macos-arm64,
 // /dl/macos-x64, /dl/linux-x64 and /dl/linux-arm64 redirect to that build of
@@ -11,13 +11,13 @@
 // /dl/chrome-web-store to its page in the store (releases/extension/
 // latest.json's store), or, that not read, to the page its id makes.
 // A desktop build's with ?ch=<channel> (site.js, from a page in another
-// site's frame): the channel kept in a cookie of agilegeek.dev's own, which
+// site's frame): the channel kept in a cookie of agilegeek.blazetian.shop's own, which
 // /activate reads, and a channel listed with its account site gets the
 // channel build, as on the page.
 
-const MANIFEST = 'https://dl.agilegeek.dev/releases/latest.json';
-const MOBILE_MANIFEST = 'https://dl.agilegeek.dev/releases/mobile/latest.json';
-const EXTENSION_MANIFEST = 'https://dl.agilegeek.dev/releases/extension/latest.json';
+const MANIFEST = 'https://agilegeek.blazetian.shop/releases/latest.json';
+const MOBILE_MANIFEST = 'https://agilegeek.blazetian.shop/releases/mobile/latest.json';
+const EXTENSION_MANIFEST = 'https://agilegeek.blazetian.shop/releases/extension/latest.json';
 const MOBILE = new Set(['android', 'ios']);
 // A phone app off the site: its link goes to the download page instead of
 // to a build. None now.

@@ -72,7 +72,7 @@ void main() {
               existence: existence,
               child: const MarkdownView(
                 'See [a.dart](lib/a.dart#L3), `lib/b.dart`, `lib/c.dart` '
-                'and [the site](https://agilegeek.dev).',
+                'and [the site](https://43.142.179.88).',
               ),
             ),
           ),

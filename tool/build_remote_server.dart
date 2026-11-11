@@ -54,7 +54,7 @@ const _platforms = [
 ];
 
 /// Where the gzipped builds are downloaded from: `<base>/<VERSION>/<file>`.
-const _downloadsBase = 'https://dl.agilegeek.dev/releases/remote';
+const _downloadsBase = 'https://agilegeek.blazetian.shop/releases/remote';
 
 Future<void> main(List<String> arguments) async {
   final root = File.fromUri(Platform.script).parent.parent.absolute;

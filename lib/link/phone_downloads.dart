@@ -6,7 +6,7 @@
 library;
 
 /// The site they are on.
-const phoneDownloadSite = 'https://agilegeek.dev';
+const phoneDownloadSite = 'https://github.com/BlazeTian/AgileGeek/releases';
 
 /// Each phone's link on [phoneDownloadSite], by the download page's card:
 /// Android's APK, iOS's TestFlight beta.

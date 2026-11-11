@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 
+import '../platform/app_services.dart';
 import '../update/version.dart';
 
 /// Sends a report's body; gives the HTTP status. Throws when it could not
@@ -43,7 +44,7 @@ class MemoryTelemetryStore implements TelemetryStore {
 /// back, and on which versions: once a UTC day the app is in front, the
 /// day is reported with a random install id, the app's version, the
 /// system and processor it runs on, and its edition: the channel build's
-/// or not, and where its user came to agilegeek.dev from, as its setup was
+/// or not, and where its user came to the site from, as its setup was
 /// told (lib/channel/). Nothing about the user, their machine, their
 /// projects or what they do in the app.
 ///
@@ -73,7 +74,7 @@ class TelemetryService {
        _inFront = inFront ?? (() => true),
        _newId = newId ?? randomInstallId;
 
-  static const defaultUrl = 'https://stats.agilegeek.dev/v1/ping';
+  static const defaultUrl = agileGeekTelemetryUrl;
 
   /// The version of the report's body.
   static const schema = 1;

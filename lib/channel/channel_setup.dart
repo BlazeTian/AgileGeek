@@ -2,10 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../platform/app_services.dart';
 import '../platform/event_log.dart';
 import '../settings/user_settings.dart';
 
-/// Where the user came to agilegeek.dev from, as the site kept it in their
+/// Where the user came to the site from, as the site kept it in their
 /// browser: a channel's id from the address (`channel`), the site linking
 /// there (`referrer`), neither (`direct`); `none` when the browser the
 /// setup opened had nothing kept.
@@ -286,7 +287,7 @@ enum ChannelLinkResult {
 
 /// The channel build's first start: one build for every channel, which
 /// asks where its user came from of the browser they downloaded it in. It
-/// opens agilegeek.dev/activate with the install's id; the page sends the
+/// opens the site's page with the install's id; the page sends the
 /// stats server what the site kept in that browser, and the app, asking
 /// there, is set up. Should the app not hear of it, the page hands it a
 /// `agilegeek://activate?…` link, opened or pasted.
@@ -313,9 +314,9 @@ class ChannelSetup extends ChangeNotifier {
   static const pendingState = 'pending';
   static const doneState = 'done';
 
-  static const pageUrl = 'https://agilegeek.dev/activate';
-  static const zhPageUrl = 'https://agilegeek.dev/zh/activate';
-  static const lookUpBase = 'https://stats.agilegeek.dev/v1/attribution/';
+  static const pageUrl = '$agileGeekServer/activate';
+  static const zhPageUrl = '$agileGeekServer/zh/activate';
+  static const lookUpBase = '$agileGeekServer/v1/attribution/';
 
   /// The app's, while it is to be set up (main.dart sets it).
   static ChannelSetup? current;

@@ -715,7 +715,7 @@ class GitHubApi extends ForgeApi {
               'type': 'blob',
               'content':
                   'Pictures of the issues opened from AgileGeek\'s '
-                  'Stash (https://agilegeek.dev).\n',
+                  'Stash (https://github.com/BlazeTian/AgileGeek).\n',
             },
           ],
         },
