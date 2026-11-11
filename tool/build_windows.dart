@@ -298,7 +298,7 @@ Future<void> main(List<String> arguments) async {
     stdout
       ..writeln()
       ..writeln('The app downloads the remote server published:')
-      ..writeln('  https://agilegeek.blazetian.shop/releases/remote/$remoteVersion/');
+      ..writeln('  http://43.142.179.88:8080/releases/remote/$remoteVersion/');
   } else {
     stdout
       ..writeln()
@@ -308,7 +308,7 @@ Future<void> main(List<String> arguments) async {
       ..writeln('and package with --remote-release):')
       ..writeln(
         '  ${downloads.path}\\*  ->  '
-        'https://agilegeek.blazetian.shop/releases/remote/$remoteVersion/',
+        'http://43.142.179.88:8080/releases/remote/$remoteVersion/',
       );
   }
   stdout.writeln();
@@ -449,7 +449,8 @@ Future<void> _putOpenSsh(Directory root, Directory bundle, String arch) async {
 }
 
 /// The Inno Setup compiler, 7 or 6: where winget puts it, then where a
-/// manual install does, then a folder named in AGILEGEEK_ISCC.
+/// manual install does, then this machine's own (D:\Inno Setup 7), then a
+/// folder named in AGILEGEEK_ISCC.
 String _findIscc() {
   final local = Platform.environment['LOCALAPPDATA'];
   final candidates = [
@@ -460,7 +461,11 @@ String _findIscc() {
       if (Platform.environment[variable] case final root?)
         for (final version in ['7', '6'])
           '$root\\Inno Setup $version\\ISCC.exe',
-    // A folder of its own, anywhere: D:\Inno Setup 7, say.
+    // Installed off the default places, on a drive of its own.
+    for (final drive in ['D', 'C'])
+      for (final version in ['7', '6'])
+        '$drive:\\Inno Setup $version\\ISCC.exe',
+    // Anywhere else, named.
     if (Platform.environment['AGILEGEEK_ISCC'] case final folder?
         when folder.isNotEmpty)
       '${folder.replaceAll('/', r'\')}\\ISCC.exe',

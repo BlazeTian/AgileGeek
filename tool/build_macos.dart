@@ -318,7 +318,7 @@ Future<void> main(List<String> arguments) async {
   if (servers.isEmpty) {
     stdout
       ..writeln('The app downloads the remote server published:')
-      ..writeln('  https://agilegeek.blazetian.shop/releases/remote/$remoteVersion/');
+      ..writeln('  http://43.142.179.88:8080/releases/remote/$remoteVersion/');
   } else {
     stdout
       ..writeln('Upload the remote server\'s builds, which the app downloads')
@@ -326,7 +326,7 @@ Future<void> main(List<String> arguments) async {
       ..writeln('--remote-release):')
       ..writeln(
         '  ${downloads.path}/*  ->  '
-        'https://agilegeek.blazetian.shop/releases/remote/$remoteVersion/',
+        'http://43.142.179.88:8080/releases/remote/$remoteVersion/',
       );
   }
   stdout

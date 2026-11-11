@@ -1,4 +1,4 @@
-// Takes a remote server build already published at agilegeek.blazetian.shop (by
+// Takes a remote server build already published at the AgileGeek server (by
 // .github/workflows/remote.yml's server-* tags, or with a release) instead
 // of building one: its VERSION and servers.json, all the installers carry.
 // An app packaged with them downloads the builds CI made, not ones only
@@ -14,7 +14,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-const _base = 'https://agilegeek.blazetian.shop/releases/remote';
+const _base = 'http://43.142.179.88:8080/releases/remote';
 
 Future<void> main(List<String> arguments) async {
   final root = File.fromUri(Platform.script).parent.parent.absolute;

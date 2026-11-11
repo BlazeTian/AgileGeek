@@ -1,5 +1,5 @@
 // Writes the site's changelog from the release notes: site/changelog.html
-// (English, agilegeek.blazetian.shop/changelog) and site/zh/changelog.html (Chinese,
+// (English, the site's /changelog) and site/zh/changelog.html (Chinese,
 // agilegeek.blazetian.shop/zh/changelog). Every version with notes in
 // release-notes/<x.y.z>.<en|zh>.md, newest first, each at #v<x.y.z>, which
 // the app's update notification links to (UpdateController.changelogUrl).
@@ -15,6 +15,7 @@
 // not what the notes make.
 import 'dart:io';
 
+import 'package:agilegeek/platform/app_services.dart';
 import 'package:agilegeek/update/version.dart';
 import 'package:markdown/markdown.dart' as md;
 
@@ -139,8 +140,8 @@ String _html(_Page page, List<(AppVersion, String?)> releases) {
 <link rel="icon" href="/icon.png">
 <link rel="stylesheet" href="/style.css">
 <script src="/head.js"></script>
-<link rel="alternate" hreflang="en" href="https://agilegeek.blazetian.shop${_Page.en.url}">
-<link rel="alternate" hreflang="zh" href="https://agilegeek.blazetian.shop${_Page.zh.url}">
+<link rel="alternate" hreflang="en" href="$agileGeekWebsite${_Page.en.url}">
+<link rel="alternate" hreflang="zh" href="$agileGeekWebsite${_Page.zh.url}">
 </head>
 <body>
 <!-- Made by tool/build_changelog.dart from release-notes/: edit those, not this. -->
