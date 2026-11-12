@@ -10901,7 +10901,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get aboutTagline =>
-      'An awesome, easy-to-use desktop UI for Claude Code, with a millisecond-fast IDE built in.';
+      'An agent\'s work, made readable, followable and undoable.';
 
   @override
   String aboutVersion(String version, int build) {
@@ -13948,4 +13948,22 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get generalSettingsRewindKeep => 'Keep the Changes';
+
+  @override
+  String get aboutNameChinese => 'AgileGeek';
+
+  @override
+  String get aboutBuildLabel => 'Build';
+
+  @override
+  String get aboutPlatformLabel => 'Platform';
+
+  @override
+  String get aboutLicenseLabel => 'License';
+
+  @override
+  String get aboutProjectHome => 'Project home';
+
+  @override
+  String get aboutReportIssue => 'Report an issue';
 }

@@ -29,7 +29,6 @@ import '../open_in_editor_button.dart';
 import '../pin_window_button.dart';
 import '../window_controls.dart';
 import '../workspace.dart';
-import 'about_dialog.dart';
 import 'about_popover.dart';
 import 'header_menu.dart';
 import 'header_menu_bar.dart';
@@ -277,9 +276,7 @@ class _WindowHeaderState extends State<WindowHeader> {
         compact: widget.compact,
         // After Help, as the whole bar reads: About opens a panel of its
         // own under its label.
-        about: AboutPopoverButton(
-          onOpenSettings: widget.onOpenSettingsSettings,
-        ),
+        about: const AboutPopoverButton(),
       ),
     );
     final toggle = KeyedSubtree(
@@ -471,7 +468,7 @@ class _WindowHeaderState extends State<WindowHeader> {
       const SizedBox(width: 8),
       KeyedSubtree(
         key: _language,
-        child: LanguagePickerButton(locale: locale),
+        child: LanguagePickerButton(locale: locale, compact: widget.compact),
       ),
     ],
     // The chat's; the IDE is the editor there.
@@ -789,12 +786,6 @@ class _WindowHeaderState extends State<WindowHeader> {
           l10n.menuContextPanel,
           shortcut: _shortcut(ChatCommandIds.toggleContextPanel),
           onSelected: widget.onToggleContextPanel,
-        ),
-      ],
-      HeaderMenu.help => [
-        HeaderMenuItem(
-          l10n.menuAboutAgileGeek,
-          onSelected: () => showAboutAgileGeek(context),
         ),
       ],
     };

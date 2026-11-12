@@ -17836,7 +17836,7 @@ abstract class AppLocalizations {
   /// No description provided for @aboutTagline.
   ///
   /// In en, this message translates to:
-  /// **'An awesome, easy-to-use desktop UI for Claude Code, with a millisecond-fast IDE built in.'**
+  /// **'An agent\'s work, made readable, followable and undoable.'**
   String get aboutTagline;
 
   /// No description provided for @aboutVersion.
@@ -22626,6 +22626,42 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Keep the Changes'**
   String get generalSettingsRewindKeep;
+
+  /// No description provided for @aboutNameChinese.
+  ///
+  /// In en, this message translates to:
+  /// **'AgileGeek'**
+  String get aboutNameChinese;
+
+  /// No description provided for @aboutBuildLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Build'**
+  String get aboutBuildLabel;
+
+  /// No description provided for @aboutPlatformLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Platform'**
+  String get aboutPlatformLabel;
+
+  /// No description provided for @aboutLicenseLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'License'**
+  String get aboutLicenseLabel;
+
+  /// No description provided for @aboutProjectHome.
+  ///
+  /// In en, this message translates to:
+  /// **'Project home'**
+  String get aboutProjectHome;
+
+  /// No description provided for @aboutReportIssue.
+  ///
+  /// In en, this message translates to:
+  /// **'Report an issue'**
+  String get aboutReportIssue;
 }
 
 class _AppLocalizationsDelegate

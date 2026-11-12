@@ -10318,7 +10318,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsSectionAbout => '关于';
 
   @override
-  String get aboutTagline => '好看又好用的 Claude Code 桌面应用，内置毫秒级响应的 IDE。';
+  String get aboutTagline => '把智能体的工作，变成看得清、追得回、撤得掉的东西。';
 
   @override
   String aboutVersion(String version, int build) {
@@ -13160,4 +13160,22 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get generalSettingsRewindKeep => '保留改动';
+
+  @override
+  String get aboutNameChinese => '灵动极客';
+
+  @override
+  String get aboutBuildLabel => '构建';
+
+  @override
+  String get aboutPlatformLabel => '平台';
+
+  @override
+  String get aboutLicenseLabel => '许可';
+
+  @override
+  String get aboutProjectHome => '项目主页';
+
+  @override
+  String get aboutReportIssue => '反馈问题';
 }

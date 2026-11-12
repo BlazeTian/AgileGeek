@@ -2962,7 +2962,7 @@
   "channelAccountFailed": "出错了：{error}",
   "channelAccountBlocked": "{site} 拒绝了这台电脑的连接（{request}），可能是当前网络或代理的 IP 被它的防火墙拦截了。换个网络，或让 {site} 不走代理后再试。",
   "settingsSectionAbout": "关于",
-  "aboutTagline": "好看又好用的 Claude Code 桌面应用，内置毫秒级响应的 IDE。",
+  "aboutTagline": "把智能体的工作，变成看得清、追得回、撤得掉的东西。",
   "aboutVersion": "版本 {version}（{build}）",
   "aboutRepository": "{repository} · 免费开源，GPL-3.0 许可证",
   "aboutWebsite": "官网",
@@ -3767,5 +3767,11 @@
   "generalSettingsRewindFilesDescription": "修改之前的消息并重新发送时，Agent 在那之后改过的文件怎么处理。命令（Bash）做的改动没有记录。仅支持 Claude Code 和 AgileGeek Agent。",
   "generalSettingsRewindAsk": "每次询问",
   "generalSettingsRewindRevert": "撤回改动",
-  "generalSettingsRewindKeep": "保留改动"
+  "generalSettingsRewindKeep": "保留改动",
+  "aboutNameChinese": "灵动极客",
+  "aboutBuildLabel": "构建",
+  "aboutPlatformLabel": "平台",
+  "aboutLicenseLabel": "许可",
+  "aboutProjectHome": "项目主页",
+  "aboutReportIssue": "反馈问题"
 }

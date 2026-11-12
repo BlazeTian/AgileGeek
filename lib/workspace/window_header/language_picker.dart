@@ -9,23 +9,45 @@ import '../../ide/ide_menu.dart';
 import '../../l10n/l10n.dart';
 import '../../settings/app_locale.dart';
 import '../../settings/pages/language_page.dart' show LanguageSettingsPage;
-import '../../theme/app_theme.dart';
 import '../../theme/codicons.dart';
 import '../../theme/workbench_theme.dart' show themeColors;
 
-/// The display language, in the header: a globe that opens the ones the app
-/// is translated into, each named in its own language. Picking one applies
-/// it at once, as the settings page's dropdown does.
+/// The display language, in the header: the language in use, as its own
+/// name, opening a menu of the ones the app is translated into. Picking one
+/// applies it at once, as the settings page's dropdown does.
 class LanguagePickerButton extends StatelessWidget {
-  const LanguagePickerButton({super.key, required this.locale, this.size = 14});
+  const LanguagePickerButton({
+    super.key,
+    required this.locale,
+    this.compact = false,
+  });
 
   final AppLocale locale;
 
-  /// The globe's size, as the pin's icon.
-  final double size;
+  /// In a narrow header: the language's code alone (`ZH`, `EN`), so the
+  /// strip fits the tools beside it.
+  final bool compact;
 
   /// Each language in its own language, as the settings page names them.
   static const names = LanguageSettingsPage.nativeNames;
+
+  /// The language in effect, as it shows on the button: the system's when
+  /// the setting follows it.
+  static String labelOf(BuildContext context, AppLocale locale) {
+    final setting = locale.setting;
+    if (setting != null) return names[setting] ?? setting;
+    final system = AppLocale.systemLocale(
+      View.maybeOf(context)?.platformDispatcher.locales,
+    );
+    final normalized = AppLocale.normalize(system.toLanguageTag());
+    return names[normalized] ?? names.values.first;
+  }
+
+  /// The language's short code, for a narrow header: `ZH` or `EN`.
+  String _codeOf(AppLocale locale) {
+    final setting = locale.setting;
+    return setting == AppLocale.simplifiedChinese ? 'ZH' : 'EN';
+  }
 
   void _open(BuildContext context) {
     final box = context.findRenderObject()! as RenderBox;
@@ -59,12 +81,30 @@ class LanguagePickerButton extends StatelessWidget {
     );
   }
 
+  /// The width below which the full name would crowd the strip: the code
+  /// stands in for it.
+  static const _compactBelow = 240.0;
+
+  /// The width the full name needs beside the other tools.
+  static const _fullWidth = 92.0;
+
   @override
   Widget build(BuildContext context) {
+    // The button names the language in use, so it rebuilds when it changes.
+    return ListenableBuilder(
+      listenable: locale,
+      builder: (context, _) => _build(context),
+    );
+  }
+
+  Widget _build(BuildContext context) {
     final l10n = context.l10n;
     final colors = themeColors;
-    final name = names[locale.setting] ?? names.values.first;
-    final tooltip = l10n.languageSettingsDisplayLanguageLabel(name);
+    final label = labelOf(context, locale);
+    // A narrow strip gets the code; the full name needs the room.
+    final short = compact || (MediaQuery.sizeOf(context).width < 1100);
+    final shown = short ? _codeOf(locale) : label;
+    final tooltip = l10n.languageSettingsDisplayLanguageLabel(label);
     return HoverTooltip(
       placement: (side: FloatingSide.bottom, align: FloatingAlign.end),
       content: (_) => Text(tooltip),
@@ -77,18 +117,33 @@ class LanguagePickerButton extends StatelessWidget {
           builder: (context, hovered) => GestureDetector(
             onTap: () => _open(context),
             child: Container(
-              width: 22,
               height: 22,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
               decoration: BoxDecoration(
                 color: hovered
                     ? colors['toolbar.hoverBackground']
                     : Colors.transparent,
                 borderRadius: BorderRadius.circular(5),
               ),
-              child: Icon(
-                Codicons.globe,
-                size: size,
-                color: hovered ? AppColors.text : AppColors.textMuted,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    shown,
+                    style: TextStyle(
+                      color: hovered
+                          ? colors['menubar.selectionForeground']
+                          : colors['titleBar.activeForeground'],
+                      fontSize: 12.5,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(
+                    Codicons.chevronDown,
+                    size: 11,
+                    color: colors['titleBar.activeForeground'],
+                  ),
+                ],
               ),
             ),
           ),

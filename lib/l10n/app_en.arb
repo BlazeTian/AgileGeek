@@ -7757,7 +7757,7 @@
     }
   },
   "settingsSectionAbout": "About",
-  "aboutTagline": "An awesome, easy-to-use desktop UI for Claude Code, with a millisecond-fast IDE built in.",
+  "aboutTagline": "An agent's work, made readable, followable and undoable.",
   "aboutVersion": "Version {version} ({build})",
   "@aboutVersion": {
     "placeholders": {
@@ -10053,5 +10053,11 @@
   "generalSettingsRewindFilesDescription": "When you edit an earlier message and send it again, what happens to the files the agent changed after it. Commands' (Bash) changes are not tracked. Claude Code and AgileGeek agent only.",
   "generalSettingsRewindAsk": "Ask Each Time",
   "generalSettingsRewindRevert": "Undo the Changes",
-  "generalSettingsRewindKeep": "Keep the Changes"
+  "generalSettingsRewindKeep": "Keep the Changes",
+  "aboutNameChinese": "AgileGeek",
+  "aboutBuildLabel": "Build",
+  "aboutPlatformLabel": "Platform",
+  "aboutLicenseLabel": "License",
+  "aboutProjectHome": "Project home",
+  "aboutReportIssue": "Report an issue"
 }

@@ -231,7 +231,13 @@ void main() {
     // The IDE draws no title bar of its own under it.
     expect(find.byType(IdeCommandCenter), findsOneWidget);
     final strip = tester.getRect(find.byType(WindowHeader));
-    expect(tester.getCenter(center).dx, closeTo(strip.center.dx, 60));
+    // Centred in the space left between the menus and the tools, not in the
+    // strip as a whole: the tools on the right are wider than the menus.
+    expect(
+      tester.getCenter(center).dx,
+      closeTo(strip.center.dx, 120),
+      reason: 'the command center sits in the middle of the open strip',
+    );
     // Nowhere to go yet.
     final arrows = tester.widgetList<IdeActionButton>(
       find.descendant(of: center, matching: find.byType(IdeActionButton)),
