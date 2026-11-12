@@ -1460,7 +1460,7 @@ class AppLocalizationsEn extends AppLocalizations {
   String get menuContextPanel => 'Context Panel';
 
   @override
-  String get menuAboutAgileGeek => 'About AgileGeek';
+  String get menuAboutAgileGeek => 'About';
 
   @override
   String get windowShowSidebar => 'Show sidebar';

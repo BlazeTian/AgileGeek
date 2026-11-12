@@ -60,10 +60,11 @@ enum SettingsCategory {
     SettingsSection.stash,
     SettingsSection.accounts,
     SettingsSection.customize,
-    SettingsSection.language,
+    // Language and About are in the window's header now: the globe beside
+    // Fast Ide, and About beside Help. Their pages stay reachable from
+    // there, so they are not listed here twice.
     SettingsSection.keyboard,
     SettingsSection.updates,
-    SettingsSection.about,
   ]),
   advanced([SettingsSection.dataDirectory]);
 

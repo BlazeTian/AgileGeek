@@ -18,6 +18,8 @@ import '../../keybindings/default_keybindings.dart'
     show openSettingsCommandId, toggleAutoSaveCommandId;
 import '../../keybindings/window_keybindings.dart' show WindowCommandIds;
 import '../../l10n/l10n.dart';
+import '../../settings/app_locale.dart';
+import '../../settings/settings_dialog.dart' show SettingsSection;
 import '../../sidebar/sidebar.dart';
 import '../../theme/codicons.dart';
 import '../../theme/app_theme.dart';
@@ -28,8 +30,10 @@ import '../pin_window_button.dart';
 import '../window_controls.dart';
 import '../workspace.dart';
 import 'about_dialog.dart';
+import 'about_popover.dart';
 import 'header_menu.dart';
 import 'header_menu_bar.dart';
+import 'language_picker.dart';
 import 'window_buttons.dart';
 
 /// The bar the Windows app draws itself, over everything: the menu bar, the
@@ -75,6 +79,8 @@ class WindowHeader extends StatefulWidget {
     this.compact = false,
     this.title,
     this.settingsShown = false,
+    this.locale,
+    this.onOpenSettingsSettings,
   });
 
   final Workspace workspace;
@@ -141,6 +147,13 @@ class WindowHeader extends StatefulWidget {
   /// from its left, the sidebar toggle's place.
   static const settingsToggleLeft = 6.0;
   static const settingsToggleSize = 24.0;
+
+  /// The display language, for the picker beside the way to the IDE; none
+  /// in a window that has no setting for it.
+  final AppLocale? locale;
+
+  /// The About panel's way into the settings page of the same name.
+  final void Function(SettingsSection section)? onOpenSettingsSettings;
 
   /// The window is kept above other apps' windows.
   final bool pinned;
@@ -214,6 +227,7 @@ class _WindowHeaderState extends State<WindowHeader> {
   final _terminal = GlobalKey(debugLabel: 'header terminal');
   final _sidePanel = GlobalKey(debugLabel: 'header side panel');
   final _open = GlobalKey(debugLabel: 'header open in editor');
+  final _language = GlobalKey(debugLabel: 'header language');
   final _back = GlobalKey(debugLabel: 'header back to chat');
   final _center = GlobalKey(debugLabel: 'header command center');
   final _minimize = GlobalKey(debugLabel: 'window minimize');
@@ -258,7 +272,15 @@ class _WindowHeaderState extends State<WindowHeader> {
     // is the top of the conversation.
     final menus = KeyedSubtree(
       key: _menus,
-      child: HeaderMenuBar(items: _items, compact: widget.compact),
+      child: HeaderMenuBar(
+        items: _items,
+        compact: widget.compact,
+        // After Help, as the whole bar reads: About opens a panel of its
+        // own under its label.
+        about: AboutPopoverButton(
+          onOpenSettings: widget.onOpenSettingsSettings,
+        ),
+      ),
     );
     final toggle = KeyedSubtree(
       key: _toggle,
@@ -444,6 +466,14 @@ class _WindowHeaderState extends State<WindowHeader> {
         onChanged: widget.onTogglePin,
       ),
     ),
+    // The display language, before the way to the IDE.
+    if (widget.locale case final locale?) ...[
+      const SizedBox(width: 8),
+      KeyedSubtree(
+        key: _language,
+        child: LanguagePickerButton(locale: locale),
+      ),
+    ],
     // The chat's; the IDE is the editor there.
     if (widget.project case final project? when !ide) ...[
       const SizedBox(width: 8),
@@ -492,6 +522,7 @@ class _WindowHeaderState extends State<WindowHeader> {
         _sidePanel,
         _pin,
         _open,
+        _language,
         _back,
         _center,
       ])

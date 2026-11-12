@@ -1423,7 +1423,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get menuContextPanel => '上下文面板';
 
   @override
-  String get menuAboutAgileGeek => '关于 AgileGeek';
+  String get menuAboutAgileGeek => '关于我们';
 
   @override
   String get windowShowSidebar => '显示侧边栏';

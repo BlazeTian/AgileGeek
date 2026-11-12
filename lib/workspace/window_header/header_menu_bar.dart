@@ -19,13 +19,22 @@ import 'header_menu.dart';
 /// [compact], the labels fold into one button, as an editor's narrow window
 /// has it: its list of the menus, each opening its commands beside it.
 class HeaderMenuBar extends StatefulWidget {
-  const HeaderMenuBar({super.key, required this.items, this.compact = false});
+  const HeaderMenuBar({
+    super.key,
+    required this.items,
+    this.compact = false,
+    this.about,
+  });
 
   /// What a menu holds, asked for when it is opened: what is ticked and the
   /// recent projects are the app's, and change as it does.
   final List<HeaderMenuItem> Function(HeaderMenu menu) items;
 
   final bool compact;
+
+  /// After Help: About, which opens what it draws rather than a menu of
+  /// its own.
+  final Widget? about;
 
   @override
   State<HeaderMenuBar> createState() => _HeaderMenuBarState();
@@ -81,7 +90,13 @@ class _HeaderMenuBarState extends State<HeaderMenuBar> {
     if (widget.compact) return _buildFolded();
     return Row(
       mainAxisSize: MainAxisSize.min,
-      children: [for (final menu in HeaderMenu.values) _buildLabel(menu)],
+      children: [
+        for (final menu in HeaderMenu.values) _buildLabel(menu),
+        if (widget.about case final about?) ...[
+          const SizedBox(width: 2),
+          about,
+        ],
+      ],
     );
   }
 

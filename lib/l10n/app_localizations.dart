@@ -2873,7 +2873,7 @@ abstract class AppLocalizations {
   /// No description provided for @menuAboutAgileGeek.
   ///
   /// In en, this message translates to:
-  /// **'About AgileGeek'**
+  /// **'About'**
   String get menuAboutAgileGeek;
 
   /// Tooltip.
