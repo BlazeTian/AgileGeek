@@ -116,6 +116,14 @@ class Canvas {
     }
   }
 
+  /// Covers the canvas with [pixels] (ARGB, top row first, [size] square),
+  /// as the app icon draws itself: its own alpha is kept, so a rounded or
+  /// transparent edge stays one.
+  void Cover(const std::vector<uint32_t>& pixels) {
+    if (pixels.size() != pixels_.size()) return;
+    pixels_ = pixels;
+  }
+
   // A disc of |rgb| over what is there, its edge smoothed; or, |erase|, a
   // hole of that shape.
   void Disc(double cx, double cy, double radius, uint32_t rgb, bool erase) {
@@ -198,16 +206,6 @@ class Canvas {
  private:
   int size_;
   std::vector<uint32_t> pixels_;
-};
-
-// The logo's cells, in its own 56×42 units (agile.svg; the same as
-// Attention.swift's).
-struct Cell {
-  int x, y, width, height;
-};
-constexpr Cell kLogoCells[] = {
-    {14, 0, 28, 7}, {7, 7, 7, 7},   {42, 7, 7, 7},  {0, 14, 7, 21},
-    {49, 14, 7, 21}, {14, 21, 8, 7}, {35, 21, 8, 7}, {7, 35, 42, 7},
 };
 
 // Digits and a plus, 3×5 pixels each, top row first, a row's bits from the
@@ -489,21 +487,58 @@ void Attention::SetTray(const flutter::EncodableValue* value) {
   ShowIcon();
 }
 
+/// [icon]'s pixels as the canvas holds them: ARGB, top row first, [size]
+/// square. Empty when GDI will not give them.
+std::vector<uint32_t> IconPixels(HICON icon, int size) {
+  HDC screen = ::GetDC(nullptr);
+  if (screen == nullptr) return {};
+  HDC memory = ::CreateCompatibleDC(screen);
+  std::vector<uint32_t> pixels(static_cast<size_t>(size) * size, 0);
+
+  BITMAPV5HEADER header = {};
+  header.bV5Size = sizeof(header);
+  header.bV5Width = size;
+  header.bV5Height = -size;  // Top row first.
+  header.bV5Planes = 1;
+  header.bV5BitCount = 32;
+  header.bV5Compression = BI_BITFIELDS;
+  header.bV5RedMask = 0x00FF0000;
+  header.bV5GreenMask = 0x0000FF00;
+  header.bV5BlueMask = 0x000000FF;
+  header.bV5AlphaMask = 0xFF000000;
+  void* bits = nullptr;
+  HBITMAP bitmap = ::CreateDIBSection(
+      screen, reinterpret_cast<BITMAPINFO*>(&header), DIB_RGB_COLORS, &bits,
+      nullptr, 0);
+  if (bitmap != nullptr && bits != nullptr) {
+    HGDIOBJ previous = ::SelectObject(memory, bitmap);
+    ::DrawIconEx(memory, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL);
+    std::memcpy(pixels.data(), bits, pixels.size() * sizeof(uint32_t));
+    ::SelectObject(memory, previous);
+  }
+  if (bitmap != nullptr) ::DeleteObject(bitmap);
+  ::DeleteDC(memory);
+  ::ReleaseDC(nullptr, screen);
+  return pixels;
+}
+
+/// The runner's own icon (resources/app_icon.ico) at [size], in the app's
+/// colours: the same picture the window and the taskbar use.
+HICON LoadIconAtSize(int size) {
+  return static_cast<HICON>(::LoadImageW(
+      ::GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+      size, size, LR_DEFAULTCOLOR));
+}
+
 HICON Attention::TrayIcon(bool dot) const {
   const int size = ::GetSystemMetrics(SM_CXSMICON);
   Canvas canvas(size);
-  // Whole pixels for each of the logo's 8×6 cells, as large as fit.
-  const int cell = (std::max)(1, size / 8);
-  const double k = cell / 7.0;
-  const int left = (size - 8 * cell) / 2;
-  const int top = (size - 6 * cell) / 2;
-  const uint32_t ink = TaskbarIsLight() ? 0x1F1F1F : 0xFFFFFF;
-  for (const Cell& c : kLogoCells) {
-    canvas.Fill(left + static_cast<int>(std::lround(c.x * k)),
-                top + static_cast<int>(std::lround(c.y * k)),
-                left + static_cast<int>(std::lround((c.x + c.width) * k)),
-                top + static_cast<int>(std::lround((c.y + c.height) * k)),
-                ink);
+  // The app's own icon, at the tray's size: the whole mark, as the window,
+  // the taskbar and the installer show it. Drawn from the .ico the runner
+  // carries (resources/app_icon.ico), not a shape of the code's own.
+  if (HICON fromIcon = LoadIconAtSize(size)) {
+    canvas.Cover(IconPixels(fromIcon, size));
+    ::DestroyIcon(fromIcon);
   }
   if (dot) {
     const double radius = size * 0.17;

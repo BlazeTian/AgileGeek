@@ -270,9 +270,9 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
     NSApp.terminate(nil)
   }
 
-  /// The logo in the menu bar, a template the system draws light or dark
-  /// as the bar is: the 56×42 pixel face of agile.svg, 16pt wide, its cells
-  /// on whole pixels; with [dot], a dot at its top right, cut out of it.
+  /// The mark in the menu bar, a template the system draws light or dark
+  /// as the bar is: the logo's silhouette, 16pt of the 18 the icon has;
+  /// with [dot], a dot at its top right, cut out of it.
   static func trayImage(dot: Bool) -> NSImage {
     let size = NSSize(width: 18, height: 18)
     let image = NSImage(size: size)
@@ -297,35 +297,57 @@ final class Attention: NSObject, UNUserNotificationCenterDelegate, NSSoundDelega
     return image
   }
 
-  /// The logo's cells, in its own 56×42 units (agile.svg).
+  /// The mark's cells: the logo's silhouette on an 18x18 grid, a row
+  /// at a time (x, y, width). A template image, so the system draws it
+  /// light or dark as the menu bar is.
   static let logoCells: [CGRect] = [
-    CGRect(x: 14, y: 0, width: 28, height: 7),
-    CGRect(x: 7, y: 7, width: 7, height: 7),
-    CGRect(x: 42, y: 7, width: 7, height: 7),
-    CGRect(x: 0, y: 14, width: 7, height: 21),
-    CGRect(x: 49, y: 14, width: 7, height: 21),
-    CGRect(x: 14, y: 21, width: 8, height: 7),
-    CGRect(x: 35, y: 21, width: 8, height: 7),
-    CGRect(x: 7, y: 35, width: 42, height: 7),
+    CGRect(x: 8, y: 1, width: 1, height: 1),
+    CGRect(x: 14, y: 1, width: 1, height: 1),
+    CGRect(x: 7, y: 2, width: 3, height: 1),
+    CGRect(x: 6, y: 3, width: 4, height: 1),
+    CGRect(x: 13, y: 3, width: 1, height: 1),
+    CGRect(x: 7, y: 4, width: 3, height: 1),
+    CGRect(x: 12, y: 4, width: 1, height: 1),
+    CGRect(x: 7, y: 5, width: 6, height: 1),
+    CGRect(x: 4, y: 6, width: 8, height: 1),
+    CGRect(x: 15, y: 6, width: 2, height: 1),
+    CGRect(x: 3, y: 7, width: 9, height: 1),
+    CGRect(x: 15, y: 7, width: 2, height: 1),
+    CGRect(x: 3, y: 8, width: 2, height: 1),
+    CGRect(x: 7, y: 8, width: 4, height: 1),
+    CGRect(x: 13, y: 8, width: 3, height: 1),
+    CGRect(x: 3, y: 9, width: 1, height: 1),
+    CGRect(x: 8, y: 9, width: 2, height: 1),
+    CGRect(x: 11, y: 9, width: 3, height: 1),
+    CGRect(x: 7, y: 10, width: 5, height: 1),
+    CGRect(x: 1, y: 11, width: 1, height: 1),
+    CGRect(x: 5, y: 11, width: 5, height: 1),
+    CGRect(x: 1, y: 12, width: 8, height: 1),
+    CGRect(x: 5, y: 13, width: 3, height: 1),
+    CGRect(x: 4, y: 14, width: 3, height: 1),
+    CGRect(x: 3, y: 15, width: 3, height: 1),
   ]
 
-  /// Draws the tray icon into a square of [pixels] (18pt of them), from its
-  /// top left.
+  /// Draws the tray icon into a square of [pixels] (18pt of them), from
+  /// its top left.
   private static func drawTray(in context: CGContext, pixels: CGFloat, dot: Bool) {
     let unit = pixels / 18
     // Flipped, as the logo is drawn: from the top left.
     context.translateBy(x: 0, y: pixels)
     context.scaleBy(x: 1, y: -1)
     context.setFillColor(NSColor.black.cgColor)
-    // 16pt wide from 1pt in, 12pt high from 3pt down: centered, on whole
-    // pixels.
-    let k = 16 * unit / 56
+    // The mark's own 18x18 grid, 16pt of the 18 the icon has: centred,
+    // on whole pixels.
+    let k = 16 * unit / 18
+    let inset = 1 * unit
     for cell in logoCells {
-      let x0 = (unit + cell.minX * k).rounded()
-      let y0 = (3 * unit + cell.minY * k).rounded()
-      let x1 = (unit + cell.maxX * k).rounded()
-      let y1 = (3 * unit + cell.maxY * k).rounded()
-      context.fill(CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0))
+      let x0 = (inset + cell.minX * k).rounded()
+      let y0 = (inset + cell.minY * k).rounded()
+      let x1 = (inset + cell.maxX * k).rounded()
+      let y1 = (inset + cell.maxY * k).rounded()
+      context.fill(CGRect(
+        x: x0, y: y0,
+        width: max(1, x1 - x0), height: max(1, y1 - y0)))
     }
     guard dot else { return }
     let center = CGPoint(x: 15.5 * unit, y: 2.5 * unit)
