@@ -32,6 +32,7 @@ import '../workspace.dart';
 import 'about_popover.dart';
 import 'header_menu.dart';
 import 'header_menu_bar.dart';
+import 'header_search.dart';
 import 'language_picker.dart';
 import 'window_buttons.dart';
 
@@ -80,6 +81,7 @@ class WindowHeader extends StatefulWidget {
     this.settingsShown = false,
     this.locale,
     this.onOpenSettingsSettings,
+    this.onSearch,
   });
 
   final Workspace workspace;
@@ -154,6 +156,10 @@ class WindowHeader extends StatefulWidget {
   /// The About panel's way into the settings page of the same name.
   final void Function(SettingsSection section)? onOpenSettingsSettings;
 
+  /// The search in the middle of the strip: opens the palette. None in a
+  /// window with no sidebar to have searched from.
+  final VoidCallback? onSearch;
+
   /// The window is kept above other apps' windows.
   final bool pinned;
   final ValueChanged<bool> onTogglePin;
@@ -227,6 +233,7 @@ class _WindowHeaderState extends State<WindowHeader> {
   final _sidePanel = GlobalKey(debugLabel: 'header side panel');
   final _open = GlobalKey(debugLabel: 'header open in editor');
   final _language = GlobalKey(debugLabel: 'header language');
+  final _search = GlobalKey(debugLabel: 'header search');
   final _back = GlobalKey(debugLabel: 'header back to chat');
   final _center = GlobalKey(debugLabel: 'header command center');
   final _minimize = GlobalKey(debugLabel: 'window minimize');
@@ -365,6 +372,19 @@ class _WindowHeaderState extends State<WindowHeader> {
               Expanded(
                 child: Center(
                   child: KeyedSubtree(key: _center, child: center),
+                ),
+              )
+            // The search, in the middle of the strip: the palette it opens.
+            else if (widget.onSearch case final search? when !settings)
+              Expanded(
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: KeyedSubtree(
+                      key: _search,
+                      child: HeaderSearch(onTap: search),
+                    ),
+                  ),
                 ),
               )
             else
@@ -522,6 +542,7 @@ class _WindowHeaderState extends State<WindowHeader> {
         _language,
         _back,
         _center,
+        _search,
       ])
         ?_rect(key),
     ];

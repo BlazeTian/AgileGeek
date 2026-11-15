@@ -8660,7 +8660,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsCustomizeKeywords => '技能 子智能体 规则 命令 记忆 钩子 插件 mcp';
 
   @override
-  String get stashTitle => 'Stash';
+  String get stashTitle => '便签';
 
   @override
   String get stashHeading => 'Stash';

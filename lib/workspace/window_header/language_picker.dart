@@ -81,13 +81,6 @@ class LanguagePickerButton extends StatelessWidget {
     );
   }
 
-  /// The width below which the full name would crowd the strip: the code
-  /// stands in for it.
-  static const _compactBelow = 240.0;
-
-  /// The width the full name needs beside the other tools.
-  static const _fullWidth = 92.0;
-
   @override
   Widget build(BuildContext context) {
     // The button names the language in use, so it rebuilds when it changes.

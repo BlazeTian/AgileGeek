@@ -3429,6 +3429,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       onOpenFolder: _openFolder,
       onOpenSettings: () => unawaited(openSettings()),
       onOpenSettingsSettings: (section) => unawaited(openSettings(section)),
+      onSearch: () => unawaited(_openPalette()),
       // The app's own, from the settings the window was given (the
       // scope above the window's navigator does not reach here).
       locale: widget.settings?.locale,

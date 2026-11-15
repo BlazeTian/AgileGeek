@@ -1066,29 +1066,6 @@ class _SidebarState extends State<Sidebar>
               },
             ),
           ),
-          if (switch (_workspace.sidebarHost) {
-                final host? when widget.onOpenFolderOn != null =>
-                  () => widget.onOpenFolderOn!(host),
-                null => widget.onOpenFolder,
-                _ => null,
-              }
-              case final open?)
-            _NavRow(
-              icon: Codicons.folderOpened,
-              label: context.l10n.sidebarOpenProject,
-              onTap: open,
-            ),
-          if (widget.onSearch case final search?)
-            _NavRow(
-              icon: Codicons.search,
-              label: context.l10n.sidebarSearch,
-              hover: ChatKeys.titleWithKey(
-                context.l10n.cmdChatSearch,
-                ChatCommandIds.search,
-                ChatKeys.chatLayout,
-              ),
-              onTap: search,
-            ),
           if (widget.onCustomize case final customize?)
             _NavRow(
               icon: Codicons.plug,
@@ -1116,9 +1093,7 @@ class _SidebarState extends State<Sidebar>
                 onTap: stash,
               ),
             },
-          if (widget.onSearch != null ||
-              widget.onCustomize != null ||
-              widget.onStash != null)
+          if (widget.onCustomize != null || widget.onStash != null)
             const SizedBox(height: 4),
           _buildGroupingBar(),
           Expanded(child: _buildList()),
@@ -1154,6 +1129,15 @@ class _SidebarState extends State<Sidebar>
     );
   }
 
+  /// Opening a folder as a project: the one the "+" beside the agents'
+  /// heading does, and New Chat's first choice.
+  VoidCallback? get _openProject => switch (_workspace.sidebarHost) {
+    final host? when widget.onOpenFolderOn != null =>
+      () => widget.onOpenFolderOn!(host),
+    null => widget.onOpenFolder,
+    _ => null,
+  };
+
   Widget _buildGroupingBar() {
     // Searching, the filter is the whole row.
     if (_speedQuery.isNotEmpty) {
@@ -1181,6 +1165,17 @@ class _SidebarState extends State<Sidebar>
                     child: _buildHostSwitcher(),
                   ),
           ),
+          // A new project, where the projects are: the same as New Chat's
+          // button, a folder picked.
+          if (_openProject case final open?)
+            Padding(
+              padding: const EdgeInsets.only(left: 4),
+              child: SidebarIconButton(
+                icon: Codicons.add,
+                tooltip: context.l10n.sidebarOpenProject,
+                onTap: open,
+              ),
+            ),
           ?_buildCollapseAll(),
           SidebarMenu(
             // `Recent activity` and its check whole.
@@ -2611,7 +2606,6 @@ class _NavRow extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.onTap,
-    this.hover,
     this.selected = false,
     this.badge = 0,
     this.badgeHover,
@@ -2625,9 +2619,6 @@ class _NavRow extends StatelessWidget {
   /// says what they are.
   final int badge;
   final String? badgeHover;
-
-  /// Its hover's text, e.g. with the keys that do the same; none when null.
-  final String? hover;
 
   /// What it opens shows.
   final bool selected;
@@ -2688,7 +2679,7 @@ class _NavRow extends StatelessWidget {
         ),
       ),
     );
-    final message = [?hover, if (badge > 0) ?badgeHover].join('\n');
+    final message = [?badgeHover].join('\n');
     return switch (message.isEmpty ? null : message) {
       final message? => IdeHover(
         message: message,
