@@ -120,6 +120,9 @@ UpdateService serviceOf(
     platform: platform,
     backend: backend,
     installer: installer ?? FakeInstaller(),
+    // One place to read from, the fake's own: the real mirrors would make
+    // a fetch of theirs too, and reach the network.
+    manifestUrl: Uri.parse('https://updates.example/latest.json'),
     mode: () => setting.mode,
     settingsChanges: setting,
     store: store,

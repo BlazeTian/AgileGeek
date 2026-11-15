@@ -137,6 +137,7 @@ import 'remote/ssh_passwords.dart';
 import 'stash/stash_controller.dart';
 import 'stash/stash_thread_view.dart' show sidebarStashes;
 import 'stash/stash_view.dart';
+import 'store/store_view.dart';
 import 'stash/stash_welcome.dart' show showStashWelcome;
 import 'workspace/agent_work_path.dart';
 import 'workspace/aside_card.dart';
@@ -1029,6 +1030,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       ChatCommandIds.search: () => unawaited(_openPalette()),
       if (widget.customizations != null) _customizeCommand: _showCustomize,
       if (StashController.current != null) _stashCommand: _showStash,
+      _storeCommand: _showStore,
       if (current != null) ...{
         ChatCommandIds.openIde: () => _workspace.openInIde(current),
         ..._sidePanelCommands(),
@@ -1305,14 +1307,19 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     setState(() {
       _customizing = true;
       _stashing = false;
+      _storing = false;
       if (kind != null) _customizeKind = kind;
     });
   }
 
   /// The conversations show again, in place of Customize or the stashes.
   void _closeCustomize() {
-    if (_customizing || _stashing) {
-      setState(() => _customizing = _stashing = false);
+    if (_customizing || _stashing || _storing) {
+      setState(() {
+        _customizing = false;
+        _stashing = false;
+        _storing = false;
+      });
     }
   }
 
@@ -1326,8 +1333,25 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
   int? _stashShown;
   final GlobalKey<StashViewState> _stashKey = GlobalKey();
 
+  // --- The store ----------------------------------------------------------
+
+  /// The store's command, for the palette.
+  static const _storeCommand = 'agilegeek.store.show';
+
+  /// The store shows in place of the chat.
+  bool _storing = false;
+
+  void _showStore() {
+    _closeDrawer();
+    setState(() {
+      _storing = true;
+      _customizing = false;
+      _stashing = false;
+    });
+  }
+
   /// Something shows in place of the conversations.
-  bool get _replacingChat => _customizing || _stashing;
+  bool get _replacingChat => _customizing || _stashing || _storing;
 
   /// Shows the stashes, [id]'s if given.
   void _showStash([int? id]) {
@@ -1337,6 +1361,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     setState(() {
       _stashing = true;
       _customizing = false;
+      _storing = false;
       _stashShown = id;
     });
   }
@@ -1449,6 +1474,8 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
         id: id,
         label: id == _customizeCommand
             ? l10n.sidebarCustomize
+            : id == _storeCommand
+            ? l10n.sidebarStore
             : localizedCommandLabel(l10n, id, commandCatalog[id]?.title ?? id),
         icon: icon,
         keybinding: ChatKeys.keyLabel(id, ChatKeys.chatLayout),
@@ -1459,6 +1486,7 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
     return [
       ?action(ChatCommandIds.newChat, Codicons.add),
       ?action(_customizeCommand, Codicons.plug),
+      ?action(_storeCommand, Codicons.extensions),
       ?action(openSettingsCommandId, Codicons.settingsGear),
       ?action(openKeybindingsCommandId, Codicons.keyboard),
       ?action(ideSelectColorThemeCommandId, Codicons.symbolColor),
@@ -3245,6 +3273,10 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
           ? null
           : () => _stashing ? _closeCustomize() : _showStash(),
       stashing: _stashing,
+      onStore: agent != null
+          ? null
+          : () => _storing ? _closeCustomize() : _showStore(),
+      storing: _storing,
       // Opened on the Stash page, which an agent's window has not.
       stashes: switch (StashController.current) {
         final stash? when agent == null => sidebarStashes(stash, _showStash),
@@ -4515,6 +4547,11 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
         null => child,
       };
 
+  /// The store, in place of the conversations.
+  Widget _buildStore({required bool showToggle}) => StoreView(
+    title: context.l10n.sidebarStore,
+  );
+
   Widget _buildGrid({required bool showToggle}) {
     if (_stashing) {
       if (StashController.current case final stash?) {
@@ -4525,6 +4562,9 @@ class _WorkbenchState extends State<Workbench> implements WindowDelegate {
       if (widget.customizations case final store?) {
         return _footless(_buildCustomize(store, showToggle: showToggle));
       }
+    }
+    if (_storing) {
+      return _footless(_buildStore(showToggle: showToggle));
     }
     final grid = _workspace.grid;
     if (grid.isEmpty) return _buildChat(showToggle: showToggle);

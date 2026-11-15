@@ -3773,5 +3773,8 @@
   "aboutPlatformLabel": "平台",
   "aboutLicenseLabel": "许可",
   "aboutProjectHome": "项目主页",
-  "aboutReportIssue": "反馈问题"
+  "aboutReportIssue": "反馈问题",
+  "sidebarStore": "应用商店",
+  "storeSoonTitle": "敬请期待",
+  "storeSoonBody": "商店正在准备中：技能、主题和其他人做的工具，以后在这里一目了然。"
 }

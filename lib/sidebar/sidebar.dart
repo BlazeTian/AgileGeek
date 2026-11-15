@@ -25,7 +25,6 @@ import '../ide/ide_list.dart';
 import '../ide/ide_speed_search.dart';
 import '../ide/ide_spinning.dart';
 import '../kernel/agent_kernel.dart' show KernelChoiceKind;
-import '../keybindings/chat_keybindings.dart';
 import '../keybindings/default_keybindings.dart' show openSettingsCommandId;
 import '../keybindings/keybinding_service.dart';
 import '../l10n/l10n.dart';
@@ -192,6 +191,8 @@ class Sidebar extends StatefulWidget {
     this.customizing = false,
     this.onStash,
     this.stashing = false,
+    this.onStore,
+    this.storing = false,
     this.stashes,
     this.drag,
     this.link,
@@ -279,6 +280,12 @@ class Sidebar extends StatefulWidget {
   /// Shows the stashes in place of the chat (docs/stash.md); no Stash row
   /// without it.
   final VoidCallback? onStash;
+
+  /// Opens the store: applications and add-ons for the app.
+  final VoidCallback? onStore;
+
+  /// Whether the store is what shows.
+  final bool storing;
 
   /// They show: the Stash row is selected.
   final bool stashing;
@@ -446,13 +453,17 @@ class _SidebarState extends State<Sidebar>
     }
     // Customize or the Stash shown: its row is the one picked, not the
     // conversation picked before it.
-    if (_onPage && !(oldWidget.customizing || oldWidget.stashing)) {
+    if (_onPage &&
+        !(oldWidget.customizing ||
+            oldWidget.stashing ||
+            oldWidget.storing)) {
       _listSelection.select(null);
     }
   }
 
   /// Customize or the Stash is shown in place of the chat.
-  bool get _onPage => widget.customizing || widget.stashing;
+  bool get _onPage =>
+      widget.customizing || widget.stashing || widget.storing;
 
   @override
   void dispose() {
@@ -1047,25 +1058,9 @@ class _SidebarState extends State<Sidebar>
           // The toggle lives in the window's header on Windows (see
           // window_header/), which is where this row would have been.
           if (!WindowControls.drawsHeader) _buildTopBar(),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(
-              8,
-              AppMetrics.contentInset,
-              8,
-              6,
-            ),
-            // A new chat picks its folder over its input (see
-            // NewChatFolderBar): a folder first only without any.
-            child: _NewAgentButton(
-              onTap: switch (_workspace.sidebarHost) {
-                final host? when _workspace.sidebarProjectsOn(host).isEmpty =>
-                  () => widget.onOpenFolderOn?.call(host),
-                null when _workspace.sidebarProjectsHere.isEmpty =>
-                  widget.onOpenFolder ?? () {},
-                _ => _create,
-              },
-            ),
-          ),
+          // New Chat is the window's own now (the header's +, and the
+          // New Chat key), so the sidebar no longer repeats it.
+          const SizedBox(height: AppMetrics.contentInset),
           if (widget.onCustomize case final customize?)
             _NavRow(
               icon: Codicons.plug,
@@ -1093,7 +1088,16 @@ class _SidebarState extends State<Sidebar>
                 onTap: stash,
               ),
             },
-          if (widget.onCustomize != null || widget.onStash != null)
+          if (widget.onStore case final store?)
+            _NavRow(
+              icon: Codicons.extensions,
+              label: context.l10n.sidebarStore,
+              selected: widget.storing,
+              onTap: store,
+            ),
+          if (widget.onCustomize != null ||
+              widget.onStash != null ||
+              widget.onStore != null)
             const SizedBox(height: 4),
           _buildGroupingBar(),
           Expanded(child: _buildList()),
@@ -2544,63 +2548,9 @@ class _SidebarState extends State<Sidebar>
   }
 }
 
-class _NewAgentButton extends StatelessWidget {
-  const _NewAgentButton({required this.onTap});
-
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    // The agent sessions window's New Session button, as a little card on
-    // the window's base (the islands' color and outline), hovered as rows
-    // on a card are (the text's color faintly over it): a theme's widget
-    // or toolbar colors are of no part of the window, and can all but
-    // vanish or stand out of place. Its hover with the keys of New Agent,
-    // which does the same (a folder first, without one).
-    final foreground = AppColors.text;
-    final card = AppColors.code;
-    final hover = Color.alphaBlend(AppColors.bubbleHover, card);
-    return IdeHover(
-      message: ChatKeys.titleWithKey(
-        context.l10n.sidebarNewAgent,
-        ChatCommandIds.newChat,
-        ChatKeys.chatLayout,
-      ),
-      excludeFromSemantics: true,
-      child: HoverBuilder(
-        cursor: SystemMouseCursors.click,
-        builder: (context, hovered) => GestureDetector(
-          onTap: onTap,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 120),
-            height: 30,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            decoration: BoxDecoration(
-              color: hovered ? hover : card,
-              borderRadius: BorderRadius.circular(Islands.controlRadius),
-              border: Border.all(color: Islands.border),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.add_rounded, size: 16, color: foreground),
-                SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    context.l10n.sidebarNewAgent,
-                    style: TextStyle(color: foreground, fontSize: 12.5),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// A row under New Agent that opens something of the window's (Search,
-/// Customize): an icon and a label, as Cursor's sidebar has them.
+/// A row under the agents' heading, opening something of the window's
+/// (Customize, the stashes, the store): an icon and a label, as Cursor's
+/// sidebar has them.
 class _NavRow extends StatelessWidget {
   const _NavRow({
     required this.icon,

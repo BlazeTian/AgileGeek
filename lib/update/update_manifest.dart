@@ -54,6 +54,12 @@ class UpdateUrlPolicy {
   /// no certificate: plain http, a port of their own. See [allows].
   static const plainHosts = <String>{agileGeekServerHost};
 
+  /// Where a release's installers may live besides the app's own server:
+  /// the GitHub release page, whose links are https on a host of its own.
+  /// What they point at is checked the same way (size, SHA-256, signature),
+  /// so a file swapped there fails to install.
+  static const githubHost = 'github.com';
+
   final Set<String> extraOrigins;
 
   bool allows(Uri url) {
@@ -67,6 +73,11 @@ class UpdateUrlPolicy {
     if (url.userInfo.isNotEmpty) return false;
     if (plainHosts.contains(host)) {
       return url.scheme == 'http' || url.scheme == 'https';
+    }
+    if (host == githubHost || host.endsWith('.$githubHost')) {
+      // A release's download, https and no port of its own: the path is
+      // what matters, and it is the release page's.
+      return url.scheme == 'https' && !url.hasPort;
     }
     return url.scheme == 'https' &&
         !url.hasPort &&

@@ -13966,4 +13966,14 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get aboutReportIssue => 'Report an issue';
+
+  @override
+  String get sidebarStore => 'Store';
+
+  @override
+  String get storeSoonTitle => 'Coming soon';
+
+  @override
+  String get storeSoonBody =>
+      'The store is being prepared: skills, themes and tools others made, all in one place.';
 }

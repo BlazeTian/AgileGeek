@@ -113,7 +113,7 @@ void main() {
     });
 
     testWidgets(
-      'default: checks 10 seconds after launch, then every 5 minutes',
+      'default: checks 10 seconds after launch, then every 6 hours',
       (tester) async {
         final backend = FakeBackend(manifestOf('1.0.0+1'));
         final service = serviceOf(backend)..start();
@@ -122,11 +122,11 @@ void main() {
         await tester.pump(const Duration(seconds: 1));
         expect(backend.fetches, 1);
         expect(backend.cleanedUp, [AppVersion.parse('1.0.0+1')]);
-        await tester.pump(const Duration(minutes: 4, seconds: 59));
+        await tester.pump(const Duration(hours: 5, minutes: 59));
         expect(backend.fetches, 1);
-        await tester.pump(const Duration(seconds: 1));
+        await tester.pump(const Duration(minutes: 1));
         expect(backend.fetches, 2);
-        await tester.pump(const Duration(minutes: 5));
+        await tester.pump(const Duration(hours: 6));
         expect(backend.fetches, 3);
         service.dispose();
       },
@@ -165,7 +165,7 @@ void main() {
       expect(offers.single.release.version, AppVersion.parse('1.2.0+12'));
 
       // Put off: not offered again this run.
-      await tester.pump(const Duration(minutes: 5));
+      await tester.pump(const Duration(hours: 6));
       await tester.pump();
       expect(backend.fetches, 2);
       expect(offers, hasLength(1));
@@ -186,7 +186,7 @@ void main() {
 
       // A newer one is.
       backend.manifest = manifestOf('1.3.0');
-      await tester.pump(const Duration(minutes: 5));
+      await tester.pump(const Duration(hours: 6));
       await tester.pump();
       expect(offers.single.release.version, AppVersion.parse('1.3.0'));
       service.dispose();
@@ -212,7 +212,7 @@ void main() {
       await tester.pump(const Duration(seconds: 10));
       await tester.pump();
       expect(offers.single.mandatory, isTrue);
-      await tester.pump(const Duration(minutes: 5));
+      await tester.pump(const Duration(hours: 6));
       await tester.pump();
       expect(offers, hasLength(2));
       service.dispose();

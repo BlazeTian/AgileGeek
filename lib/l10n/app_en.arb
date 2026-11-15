@@ -10059,5 +10059,8 @@
   "aboutPlatformLabel": "Platform",
   "aboutLicenseLabel": "License",
   "aboutProjectHome": "Project home",
-  "aboutReportIssue": "Report an issue"
+  "aboutReportIssue": "Report an issue",
+  "sidebarStore": "Store",
+  "storeSoonTitle": "Coming soon",
+  "storeSoonBody": "The store is being prepared: skills, themes and tools others made, all in one place."
 }

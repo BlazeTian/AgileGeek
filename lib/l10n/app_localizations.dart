@@ -22662,6 +22662,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Report an issue'**
   String get aboutReportIssue;
+
+  /// No description provided for @sidebarStore.
+  ///
+  /// In en, this message translates to:
+  /// **'Store'**
+  String get sidebarStore;
+
+  /// No description provided for @storeSoonTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Coming soon'**
+  String get storeSoonTitle;
+
+  /// No description provided for @storeSoonBody.
+  ///
+  /// In en, this message translates to:
+  /// **'The store is being prepared: skills, themes and tools others made, all in one place.'**
+  String get storeSoonBody;
 }
 
 class _AppLocalizationsDelegate

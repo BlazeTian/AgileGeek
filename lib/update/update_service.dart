@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show HttpException;
 
 import 'package:flutter/foundation.dart';
 
@@ -202,13 +203,21 @@ class UpdateService extends ChangeNotifier {
     required this.backend,
     required this.installer,
     Uri? manifestUrl,
+    List<Uri>? manifestMirrors,
     UpdateMode Function()? mode,
     this.settingsChanges,
     UpdateStore? store,
     DateTime Function()? now,
     this.firstCheckDelay = const Duration(seconds: 10),
-    this.checkInterval = const Duration(minutes: 5),
+    this.checkInterval = const Duration(hours: 6),
   }) : manifestUrl = manifestUrl ?? Uri.parse(defaultManifestUrl),
+       manifestMirrors =
+           manifestMirrors ??
+           (manifestUrl != null
+               ? [manifestUrl]
+               : [
+                   for (final url in agileGeekManifestMirrors) Uri.parse(url),
+                 ]),
        _mode = mode ?? (() => UpdateMode.defaultMode),
        store = store ?? MemoryUpdateStore(),
        _now = now ?? DateTime.now;
@@ -221,6 +230,12 @@ class UpdateService extends ChangeNotifier {
   final String? platform;
 
   final Uri manifestUrl;
+
+  /// Where the manifest is read from, in order: the first that answers, or
+  /// whose version is higher, is the one used. All carry the same
+  /// signature, so one altered in the way is refused as the app's own.
+  final List<Uri> manifestMirrors;
+
   final UpdateBackend backend;
   final UpdateInstaller installer;
   final UpdateStore store;
@@ -393,11 +408,29 @@ class UpdateService extends ChangeNotifier {
     _error = null;
     _setStatus(UpdateStatus.checking);
     try {
-      final text = await backend.fetchManifest(manifestUrl);
-      final manifest = UpdateManifest.parse(
-        text,
-        policy: UpdateUrlPolicy.forManifest(manifestUrl),
-      );
+      // Every mirror is asked; the newest manifest that verifies wins. One
+      // that does not answer (blocked, down) is skipped, and the next read:
+      // the app is updated from whichever is reachable.
+      UpdateManifest? manifest;
+      Object? lastError;
+      for (final mirror in manifestMirrors) {
+        try {
+          final text = await backend.fetchManifest(mirror);
+          final found = UpdateManifest.parse(
+            text,
+            policy: UpdateUrlPolicy.forManifest(mirror),
+          );
+          if (manifest == null || found.version > manifest.version) {
+            manifest = found;
+          }
+        } on Object catch (error) {
+          lastError = error;
+          debugPrint('update: $mirror: $error');
+        }
+      }
+      if (manifest == null) {
+        throw lastError ?? const HttpException('no manifest answered');
+      }
       store.lastChecked = _now();
       _installed = manifest.version.marketing == current.marketing
           ? manifest

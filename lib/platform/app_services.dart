@@ -44,6 +44,18 @@ const agileGeekUpdatesEnabled = true;
 /// [agileGeekUpdatesEnabled] is true.
 const agileGeekManifestUrl = '$agileGeekServer/releases/latest.json';
 
+/// The same manifest, published beside the release on GitHub: read first,
+/// because that host is reachable from more places. When it does not
+/// answer (it is blocked, or down), [agileGeekManifestUrl] is read instead.
+///
+/// Both carry the same signature over the same file, so a manifest altered
+/// on either is refused: the one that answers best is the one used, and a
+/// user sees no difference.
+const agileGeekManifestMirrors = [
+  'https://github.com/BlazeTian/AgileGeek/releases/latest/download/latest.json',
+  agileGeekManifestUrl,
+];
+
 /// Whether the daily, anonymous usage report is sent. Off: nothing leaves
 /// the machine.
 const agileGeekTelemetryEnabled = true;

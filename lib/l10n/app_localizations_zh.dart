@@ -13178,4 +13178,13 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get aboutReportIssue => '反馈问题';
+
+  @override
+  String get sidebarStore => '应用商店';
+
+  @override
+  String get storeSoonTitle => '敬请期待';
+
+  @override
+  String get storeSoonBody => '商店正在准备中：技能、主题和其他人做的工具，以后在这里一目了然。';
 }
